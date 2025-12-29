@@ -27,30 +27,10 @@ POLKU is a **lightweight message pipeline** that sits between your internal serv
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## When to Use POLKU
-
-| Scenario | Kafka | POLKU | Direct Call |
-|----------|-------|-------|-------------|
-| Internal agents → backend | Overkill | ✅ | Brittle |
-| Format transformation | ❌ | ✅ | Manual |
-| Buffering during slowdowns | Overkill | ✅ | ❌ |
-| Fan-out to 2-3 services | Overkill | ✅ | Spaghetti |
-| Need replay/persistence | ✅ | ❌ | ❌ |
-| 100+ consumers | ✅ | ❌ | ❌ |
 
 **POLKU is not a message broker.** It's a pipeline for when you need decoupling without the infrastructure tax.
 
 ---
-
-## The Pitch
-
-| Kafka/NATS | POLKU |
-|------------|-------|
-| JVM, 1GB+ RAM | Rust, 10-20MB RAM |
-| Zookeeper/KRaft cluster | Single binary |
-| Persistent storage required | In-memory buffer |
-| Complex operations | Zero ops |
-| Consumer groups, offsets, partitions | Just send it |
 
 ---
 
@@ -190,35 +170,6 @@ polku/
 │       └── middleware/       # Middleware
 └── proto/                    # Proto definitions
 ```
-
----
-
-## Roadmap
-
-| Phase | Status | Description |
-|-------|--------|-------------|
-| 1 | ✅ | gRPC event gateway, basic plugins |
-| 2 | 🚧 | Generic Message, Middleware, Hub builder |
-| 3 | 📋 | REST input, Kafka output |
-| 4 | 📋 | WebSocket, MQTT inputs |
-
----
-
-## Comparison
-
-### vs Envoy/Kong
-They're L7 proxies for routing requests. POLKU is a message pipeline for transforming content. They work together - Envoy routes the connection, POLKU handles the payload.
-
-### vs Kafka/NATS
-They're full pub/sub systems with persistence, consumer groups, replay. POLKU is a lightweight pipeline for internal routing without the ops burden.
-
-### vs OTEL Collector
-It's specifically for telemetry (traces, metrics, logs). POLKU is format-agnostic for any internal messages.
-
-### vs Vector
-It's focused on observability data. POLKU is a general-purpose internal pipeline.
-
----
 
 ## Tech Stack
 
