@@ -1,119 +1,86 @@
 # POLKU
 
-**Lightweight Internal Message Pipeline**
+**Programmatic Protocol Hub**
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.83%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 
-Decouple your internal services without a message broker. For when Kafka is overkill.
+Logic IS code. For when Envoy is overkill.
 
 ---
 
 ## What is POLKU?
 
-POLKU is a **lightweight message pipeline** that sits between your internal services. It transforms, buffers, and routes messages - without the operational overhead of a full pub/sub system.
+POLKU is an **infrastructure library** for internal service communication. You write Rust code to define how messages flow - no YAML, no config files.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                         POLKU                                │
+│                       POLKU HUB                              │
 │                                                              │
-│  Inputs              Pipeline            Outputs             │
-│  ┌──────────┐    ┌───────────┐        ┌──────────┐         │
-│  │ gRPC     │───►│ Transform │───────►│ gRPC     │         │
-│  │ REST     │    │ Buffer    │        │ Kafka    │         │
-│  │ Webhook  │    │ Route     │        │ S3       │         │
-│  │ ...      │    └───────────┘        │ ...      │         │
-│  └──────────┘                         └──────────┘         │
+│  Ingestors           Middleware            Emitters          │
+│  ┌──────────┐       ┌──────────┐        ┌──────────┐        │
+│  │ gRPC     │──────►│ Transform│───────►│ gRPC     │        │
+│  │ REST     │       │ Filter   │        │ Kafka    │        │
+│  │ Webhook  │       │ Route    │        │ S3       │        │
+│  └──────────┘       └──────────┘        └──────────┘        │
+│                          │                                   │
+│                     ┌────▼────┐                              │
+│                     │ Buffer  │                              │
+│                     │ (Ring)  │                              │
+│                     └─────────┘                              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-
-**POLKU is not a message broker.** It's a pipeline for when you need decoupling without the infrastructure tax.
+**You own `main.rs`.** POLKU provides traits + engine, you wire up your Ingestors/Emitters.
 
 ---
+
+## Why POLKU?
+
+| | Envoy/Istio | Kafka | POLKU |
+|---|---|---|---|
+| Config | 1000s lines YAML | Properties | **Rust code** |
+| Logic | C++ filters | Consumer groups | **Full language** |
+| Ops | Complex | Zookeeper | **Zero** |
+| Memory | 50-100MB+ | JVM GB | **10-20MB** |
 
 ---
 
 ## Quick Start
 
 ```bash
-# Build
 cargo build --release
-
-# Run
 ./target/release/polku-gateway
-
-# Test
-cargo test
 ```
 
-**Environment Variables:**
 ```bash
-POLKU_GRPC_ADDR=0.0.0.0:50051      # gRPC server address
-POLKU_BUFFER_CAPACITY=100000       # Event buffer size
-POLKU_LOG_LEVEL=info               # Logging level
+POLKU_GRPC_ADDR=0.0.0.0:50051
+POLKU_BUFFER_CAPACITY=100000
+POLKU_LOG_LEVEL=info
 ```
 
 ---
 
-## Architecture
+## Triadic Architecture
 
-### Message Flow
-
-```
-1. Input receives data (gRPC stream, REST webhook, etc.)
-   └── Converts to internal Message format
-
-2. Pipeline processes the message
-   ├── Middleware: auth, rate limit, transform
-   └── Buffer: absorb backpressure
-
-3. Outputs receive the message (fan-out)
-   └── Each output sends to its destination
-```
-
-### The Message Envelope
+### Ingestor → Hub → Emitter
 
 ```rust
-pub struct Message {
-    pub id: String,                        // Unique ID (ULID)
-    pub timestamp: i64,                    // Unix nanos
-    pub source: String,                    // Origin identifier
-    pub message_type: String,              // User-defined type
-    pub metadata: HashMap<String, String>, // Headers, context
-    pub payload: Bytes,                    // Opaque payload (zero-copy)
-    pub route_to: Vec<String>,             // Output routing hints
-}
-```
-
-POLKU doesn't interpret your payload - it just carries it. Your Input plugins deserialize, your Output plugins serialize.
-
-### Writing Plugins
-
-**Input Plugin** - receive from a protocol:
-
-```rust
-#[async_trait]
-pub trait Input: Send + Sync {
+// Ingestor: decode protocol → Message
+pub trait Ingestor: Send + Sync {
     fn name(&self) -> &'static str;
-    async fn run(&self, tx: Sender<Message>) -> Result<(), Error>;
+    fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Event>>;
 }
-```
 
-**Output Plugin** - send to a destination:
-
-```rust
+// Emitter: Message → destination
 #[async_trait]
-pub trait Output: Send + Sync {
+pub trait Emitter: Send + Sync {
     fn name(&self) -> &'static str;
-    async fn send(&self, messages: &[Message]) -> Result<(), Error>;
+    async fn emit(&self, events: &[Event]) -> Result<()>;
     async fn health(&self) -> bool;
 }
-```
 
-**Middleware** - transform, filter, route:
-
-```rust
+// Middleware: transform, filter, route
 #[async_trait]
 pub trait Middleware: Send + Sync {
     fn name(&self) -> &'static str;
@@ -121,33 +88,46 @@ pub trait Middleware: Send + Sync {
 }
 ```
 
+### The Message Envelope
+
+```rust
+pub struct Message {
+    pub id: String,                        // ULID
+    pub timestamp: i64,                    // Unix nanos
+    pub source: String,                    // Origin
+    pub message_type: String,              // User-defined
+    pub metadata: HashMap<String, String>, // Headers
+    pub payload: Bytes,                    // Zero-copy
+    pub route_to: Vec<String>,             // Routing hints
+}
+```
+
 ---
 
-## Example: Internal Agent Pipeline
+## Hub Builder
 
+```rust
+use polku_gateway::{Hub, Transform, Filter, StdoutEmitter};
+
+Hub::new()
+    .middleware(Filter::new(|msg| msg.message_type.starts_with("user.")))
+    .middleware(Transform::new(|mut msg| {
+        msg.metadata.insert("processed".into(), "true".into());
+        msg
+    }))
+    .emitter(StdoutEmitter::new())
+    .build()
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                                                               │
-│   Your Edge Agents                Your Backend               │
-│   ┌─────────┐                     ┌─────────┐               │
-│   │ Agent A │──┐                  │ Backend │               │
-│   └─────────┘  │    ┌────────┐    │         │               │
-│   ┌─────────┐  ├───►│ POLKU  │───►│         │               │
-│   │ Agent B │──┤    │        │    └─────────┘               │
-│   └─────────┘  │    │ • buffer during restart               │
-│   ┌─────────┐  │    │ • transform formats                   │
-│   │ Agent C │──┘    │ • fan-out to OTEL                     │
-│   └─────────┘       └────────┘                              │
-│                          │                                   │
-│                          ▼                                   │
-│                     ┌─────────┐                              │
-│                     │  OTEL   │                              │
-│                     └─────────┘                              │
-│                                                               │
-│   No Kafka. No NATS. Just a lightweight internal pipeline.   │
-│                                                               │
-└──────────────────────────────────────────────────────────────┘
-```
+
+---
+
+## Deployment Modes
+
+| Mode | Description |
+|------|-------------|
+| **Library** | Import as crate, zero network hop |
+| **Standalone** | Central gateway for the cluster |
+| **Sidecar** | Per-service proxy (legacy translation) |
 
 ---
 
@@ -155,38 +135,25 @@ pub trait Middleware: Send + Sync {
 
 ```
 polku/
-├── Cargo.toml                # Workspace
-├── CLAUDE.md                 # Development guide
-├── gateway/
-│   ├── Cargo.toml
-│   └── src/
-│       ├── main.rs           # Entry point
-│       ├── lib.rs            # Library exports
-│       ├── message.rs        # Message type
-│       ├── hub.rs            # Hub builder
-│       ├── buffer.rs         # Ring buffer
-│       ├── input/            # Input plugins
-│       ├── output/           # Output plugins
-│       └── middleware/       # Middleware
-└── proto/                    # Proto definitions
+├── gateway/src/
+│   ├── main.rs          # Entry point (you own this)
+│   ├── message.rs       # Message envelope
+│   ├── hub.rs           # Hub builder
+│   ├── buffer.rs        # Ring buffer
+│   ├── ingest/          # Ingestor trait
+│   ├── emit/            # Emitter trait + StdoutEmitter
+│   └── middleware/      # Filter, Transform, etc.
+├── sykli.rs             # CI pipeline
+└── CLAUDE.md            # Dev guide
 ```
-
-## Tech Stack
-
-| Crate | Purpose |
-|-------|---------|
-| `tonic` | gRPC server/client |
-| `axum` | REST server (planned) |
-| `bytes` | Zero-copy buffers |
-| `tokio` | Async runtime |
-| `tracing` | Structured logging |
-| `parking_lot` | Fast mutex |
 
 ---
 
 ## Naming
 
-**Polku** (Finnish: "path") - The path messages take through your system.
+**Polku** (Finnish) = "path"
+
+The path messages take through your system.
 
 ---
 
