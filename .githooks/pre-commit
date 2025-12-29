@@ -1,0 +1,17 @@
+#!/bin/bash
+# Pre-commit hook for POLKU
+# Runs quick checks before allowing commit
+
+set -e
+
+echo "Running pre-commit checks..."
+
+# Format check
+echo "  Checking formatting..."
+cargo fmt --all --check
+
+# Clippy
+echo "  Running clippy..."
+cargo clippy --all-targets -- -D warnings
+
+echo "Pre-commit checks passed!"
