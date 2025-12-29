@@ -260,3 +260,126 @@ fn process_batch_with_registry(
         None => Ok(vec![]),
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::proto::{EventPayload, RawPayload};
+
+    fn make_service() -> GatewayService {
+        let buffer = Arc::new(RingBuffer::new(100));
+        GatewayService::new(buffer)
+    }
+
+    #[test]
+    fn test_process_event_passthrough() {
+        let svc = make_service();
+
+        let event = Event {
+            id: "test-id".into(),
+            timestamp_unix_ns: 123,
+            source: "test".into(),
+            event_type: "test.event".into(),
+            metadata: HashMap::new(),
+            payload: vec![1, 2, 3],
+            route_to: vec![],
+        };
+
+        let ingest = IngestEvent {
+            source: "client".into(),
+            cluster: "prod".into(),
+            format: String::new(),
+            payload: Some(ingest_event::Payload::Event(event.clone())),
+        };
+
+        let result = svc.process_event(&ingest);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().id, "test-id");
+    }
+
+    #[test]
+    fn test_process_event_empty_payload() {
+        let svc = make_service();
+
+        let ingest = IngestEvent {
+            source: "client".into(),
+            cluster: "prod".into(),
+            format: String::new(),
+            payload: None,
+        };
+
+        let result = svc.process_event(&ingest);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_process_batch_passthrough() {
+        let registry = PluginRegistry::new();
+
+        let events = vec![
+            Event {
+                id: "e1".into(),
+                timestamp_unix_ns: 1,
+                source: "test".into(),
+                event_type: "test".into(),
+                metadata: HashMap::new(),
+                payload: vec![],
+                route_to: vec![],
+            },
+            Event {
+                id: "e2".into(),
+                timestamp_unix_ns: 2,
+                source: "test".into(),
+                event_type: "test".into(),
+                metadata: HashMap::new(),
+                payload: vec![],
+                route_to: vec![],
+            },
+        ];
+
+        let batch = IngestBatch {
+            source: "client".into(),
+            cluster: "prod".into(),
+            payload: Some(ingest_batch::Payload::Events(EventPayload {
+                events: events.clone(),
+            })),
+        };
+
+        let result = process_batch_with_registry(&batch, &registry);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_process_batch_empty() {
+        let registry = PluginRegistry::new();
+
+        let batch = IngestBatch {
+            source: "client".into(),
+            cluster: "prod".into(),
+            payload: None,
+        };
+
+        let result = process_batch_with_registry(&batch, &registry);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_process_batch_raw_no_plugin() {
+        let registry = PluginRegistry::new();
+
+        let batch = IngestBatch {
+            source: "unknown-source".into(),
+            cluster: "prod".into(),
+            payload: Some(ingest_batch::Payload::Raw(RawPayload {
+                format: "json".into(),
+                data: b"{}".to_vec(),
+            })),
+        };
+
+        let result = process_batch_with_registry(&batch, &registry);
+        assert!(result.is_err()); // No plugin registered
+    }
+}
