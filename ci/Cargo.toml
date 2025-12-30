@@ -1,0 +1,12 @@
+[package]
+name = "polku-ci"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "sykli"
+path = "src/main.rs"
+
+[dependencies]
+sykli = "0.2"
