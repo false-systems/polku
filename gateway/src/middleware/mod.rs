@@ -202,6 +202,9 @@ where
     }
 }
 
+mod rate_limiter;
+pub use rate_limiter::RateLimiter;
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
