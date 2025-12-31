@@ -36,7 +36,7 @@ fn main() {
         .mount_cache(&cargo_git, "/usr/local/cargo/git")
         .mount_cache(&target_cache, "/src/target")
         .workdir("/src")
-        .run("rustup component add clippy && cargo clippy --all-targets -- -D warnings")
+        .run("apt-get update && apt-get install -y protobuf-compiler && rustup component add clippy && cargo clippy --all-targets -- -D warnings")
         .inputs(&["**/*.rs", "Cargo.toml", "Cargo.lock"])
         .after(&["fmt"]);
 
@@ -49,7 +49,7 @@ fn main() {
         .mount_cache(&cargo_git, "/usr/local/cargo/git")
         .mount_cache(&target_cache, "/src/target")
         .workdir("/src")
-        .run("cargo test --all")
+        .run("apt-get update && apt-get install -y protobuf-compiler && cargo test --all")
         .inputs(&["**/*.rs", "**/*.toml", "Cargo.lock"])
         .after(&["clippy"]);
 
@@ -62,7 +62,7 @@ fn main() {
         .mount_cache(&cargo_git, "/usr/local/cargo/git")
         .mount_cache(&target_cache, "/src/target")
         .workdir("/src")
-        .run("cargo build --release")
+        .run("apt-get update && apt-get install -y protobuf-compiler && cargo build --release")
         .inputs(&["**/*.rs", "**/*.toml", "Cargo.lock"])
         .output("binary", "target/release/polku-gateway")
         .after(&["test"]);
