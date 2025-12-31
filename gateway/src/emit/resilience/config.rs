@@ -1,0 +1,308 @@
+//! ResilientEmitter builder for composing resilience wrappers
+//!
+//! Provides a fluent API for wrapping emitters with retry, circuit breaker, and DLQ.
+
+use super::{
+    BackoffConfig, CircuitBreakerConfig, CircuitBreakerEmitter, DLQConfig, DLQEmitter,
+    DeadLetterQueue, RetryEmitter,
+};
+use crate::emit::Emitter;
+use std::sync::Arc;
+
+/// Builder for composing resilience wrappers around an emitter
+///
+/// # Example
+///
+/// ```ignore
+/// use polku_gateway::emit::resilience::*;
+///
+/// let grpc = GrpcEmitter::new("http://backend:50051").await?;
+/// let dlq = Arc::new(DeadLetterQueue::new(1000));
+///
+/// let resilient = ResilientEmitter::wrap(grpc)
+///     .with_retry(BackoffConfig::default())
+///     .with_circuit_breaker(CircuitBreakerConfig::default())
+///     .with_dlq(dlq.clone(), DLQConfig::default())
+///     .build();
+///
+/// hub.emitter_arc(resilient);
+/// ```
+pub struct ResilientEmitter {
+    inner: Arc<dyn Emitter>,
+    retry_config: Option<BackoffConfig>,
+    circuit_breaker_config: Option<CircuitBreakerConfig>,
+    dlq: Option<(Arc<DeadLetterQueue>, DLQConfig)>,
+}
+
+impl ResilientEmitter {
+    /// Start building a resilient emitter stack
+    pub fn wrap<E: Emitter + 'static>(emitter: E) -> Self {
+        Self {
+            inner: Arc::new(emitter),
+            retry_config: None,
+            circuit_breaker_config: None,
+            dlq: None,
+        }
+    }
+
+    /// Start building from an Arc<dyn Emitter>
+    pub fn wrap_arc(emitter: Arc<dyn Emitter>) -> Self {
+        Self {
+            inner: emitter,
+            retry_config: None,
+            circuit_breaker_config: None,
+            dlq: None,
+        }
+    }
+
+    /// Add retry with exponential backoff
+    pub fn with_retry(mut self, config: BackoffConfig) -> Self {
+        self.retry_config = Some(config);
+        self
+    }
+
+    /// Add retry with default configuration
+    pub fn with_default_retry(self) -> Self {
+        self.with_retry(BackoffConfig::default())
+    }
+
+    /// Add circuit breaker
+    pub fn with_circuit_breaker(mut self, config: CircuitBreakerConfig) -> Self {
+        self.circuit_breaker_config = Some(config);
+        self
+    }
+
+    /// Add circuit breaker with default configuration
+    pub fn with_default_circuit_breaker(self) -> Self {
+        self.with_circuit_breaker(CircuitBreakerConfig::default())
+    }
+
+    /// Add dead letter queue
+    pub fn with_dlq(mut self, dlq: Arc<DeadLetterQueue>, config: DLQConfig) -> Self {
+        self.dlq = Some((dlq, config));
+        self
+    }
+
+    /// Add DLQ with default configuration
+    pub fn with_default_dlq(self, dlq: Arc<DeadLetterQueue>) -> Self {
+        self.with_dlq(dlq, DLQConfig::default())
+    }
+
+    /// Build the resilient emitter stack
+    ///
+    /// Composition order (inside-out):
+    /// 1. Inner emitter (actual destination)
+    /// 2. RetryEmitter (if configured) - handles transient failures
+    /// 3. CircuitBreakerEmitter (if configured) - prevents hammering
+    /// 4. DLQEmitter (if configured) - captures undeliverable events
+    pub fn build(self) -> Arc<dyn Emitter> {
+        let mut current: Arc<dyn Emitter> = self.inner;
+
+        // Apply retry wrapper (innermost)
+        if let Some(config) = self.retry_config {
+            current = Arc::new(RetryEmitter::new(current, config));
+        }
+
+        // Apply circuit breaker
+        if let Some(config) = self.circuit_breaker_config {
+            current = Arc::new(CircuitBreakerEmitter::new(current, config));
+        }
+
+        // Apply DLQ (outermost)
+        if let Some((dlq, config)) = self.dlq {
+            current = Arc::new(DLQEmitter::new(current, dlq, config));
+        }
+
+        current
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::error::PluginError;
+    use crate::proto::Event;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    /// Emitter that fails N times then succeeds
+    struct RecoverableEmitter {
+        fail_count: AtomicU32,
+        max_failures: u32,
+    }
+
+    impl RecoverableEmitter {
+        fn new(max_failures: u32) -> Self {
+            Self {
+                fail_count: AtomicU32::new(0),
+                max_failures,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Emitter for RecoverableEmitter {
+        fn name(&self) -> &'static str {
+            "recoverable"
+        }
+        async fn emit(&self, _: &[Event]) -> Result<(), PluginError> {
+            let count = self.fail_count.fetch_add(1, Ordering::SeqCst);
+            if count < self.max_failures {
+                Err(PluginError::Connection("temporary failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+        async fn health(&self) -> bool {
+            true
+        }
+    }
+
+    /// Always failing emitter
+    struct AlwaysFailingEmitter;
+
+    #[async_trait]
+    impl Emitter for AlwaysFailingEmitter {
+        fn name(&self) -> &'static str {
+            "always_failing"
+        }
+        async fn emit(&self, _: &[Event]) -> Result<(), PluginError> {
+            Err(PluginError::Connection("always fails".into()))
+        }
+        async fn health(&self) -> bool {
+            false
+        }
+    }
+
+    fn make_test_event() -> Event {
+        Event {
+            id: "test-1".to_string(),
+            timestamp_unix_ns: 0,
+            source: "test".to_string(),
+            event_type: "test".to_string(),
+            metadata: std::collections::HashMap::new(),
+            payload: vec![],
+            route_to: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resilient_emitter_with_retry_recovers() {
+        let inner = RecoverableEmitter::new(2); // Fails twice
+        let dlq = Arc::new(DeadLetterQueue::new(100));
+
+        let resilient = ResilientEmitter::wrap(inner)
+            .with_retry(BackoffConfig {
+                max_attempts: 3,
+                initial_delay: Duration::from_millis(1),
+                ..Default::default()
+            })
+            .with_default_dlq(dlq.clone())
+            .build();
+
+        // Should succeed after retries
+        let result = resilient.emit(&[make_test_event()]).await;
+        assert!(result.is_ok());
+        assert!(dlq.is_empty()); // No events in DLQ
+    }
+
+    #[tokio::test]
+    async fn test_resilient_emitter_dlq_captures_after_retries_exhausted() {
+        let inner = AlwaysFailingEmitter;
+        let dlq = Arc::new(DeadLetterQueue::new(100));
+
+        let resilient = ResilientEmitter::wrap(inner)
+            .with_retry(BackoffConfig {
+                max_attempts: 2,
+                initial_delay: Duration::from_millis(1),
+                ..Default::default()
+            })
+            .with_default_dlq(dlq.clone())
+            .build();
+
+        let result = resilient.emit(&[make_test_event()]).await;
+        assert!(result.is_err());
+        assert_eq!(dlq.len(), 1); // Event captured to DLQ
+    }
+
+    #[tokio::test]
+    async fn test_resilient_emitter_circuit_breaker_opens() {
+        let inner = AlwaysFailingEmitter;
+        let dlq = Arc::new(DeadLetterQueue::new(100));
+
+        let resilient = ResilientEmitter::wrap(inner)
+            .with_retry(BackoffConfig {
+                max_attempts: 0, // No retries
+                ..Default::default()
+            })
+            .with_circuit_breaker(CircuitBreakerConfig {
+                failure_threshold: 2,
+                reset_timeout: Duration::from_secs(60),
+                ..Default::default()
+            })
+            .with_default_dlq(dlq.clone())
+            .build();
+
+        // First 2 failures open circuit
+        let _ = resilient.emit(&[make_test_event()]).await;
+        let _ = resilient.emit(&[make_test_event()]).await;
+
+        // Third request should fail fast with NotReady
+        let result = resilient.emit(&[make_test_event()]).await;
+        assert!(matches!(result, Err(PluginError::NotReady)));
+
+        // DLQ should have events from first two failures + circuit open
+        assert!(dlq.len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn test_resilient_emitter_full_stack() {
+        let inner = RecoverableEmitter::new(1); // Fails once
+        let dlq = Arc::new(DeadLetterQueue::new(100));
+
+        let resilient = ResilientEmitter::wrap(inner)
+            .with_retry(BackoffConfig {
+                max_attempts: 2,
+                initial_delay: Duration::from_millis(1),
+                ..Default::default()
+            })
+            .with_circuit_breaker(CircuitBreakerConfig {
+                failure_threshold: 5, // High threshold
+                ..Default::default()
+            })
+            .with_default_dlq(dlq.clone())
+            .build();
+
+        // Should recover after 1 retry
+        let result = resilient.emit(&[make_test_event()]).await;
+        assert!(result.is_ok());
+        assert!(dlq.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_builder_defaults() {
+        let inner = RecoverableEmitter::new(0); // Never fails
+
+        let resilient = ResilientEmitter::wrap(inner)
+            .with_default_retry()
+            .with_default_circuit_breaker()
+            .build();
+
+        let result = resilient.emit(&[make_test_event()]).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_builder_arc_input() {
+        let inner: Arc<dyn Emitter> = Arc::new(RecoverableEmitter::new(0));
+
+        let resilient = ResilientEmitter::wrap_arc(inner)
+            .with_default_retry()
+            .build();
+
+        let result = resilient.emit(&[make_test_event()]).await;
+        assert!(result.is_ok());
+    }
+}

@@ -43,6 +43,10 @@ pub mod proto {
 }
 
 pub use config::Config;
+pub use emit::resilience::{
+    BackoffConfig, CircuitBreakerConfig, CircuitBreakerEmitter, CircuitState, DLQConfig,
+    DLQEmitter, DeadLetterQueue, FailedEvent, ResilientEmitter, RetryEmitter,
+};
 pub use emit::{Emitter, GrpcEmitter, StdoutEmitter, WebhookEmitter};
 pub use error::{PluginError, PolkuError, Result};
 pub use hub::{Hub, HubRunner, MessageSender};
