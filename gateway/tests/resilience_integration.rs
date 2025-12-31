@@ -6,8 +6,8 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use polku_gateway::{
-    BackoffConfig, CircuitBreakerConfig, DLQConfig, DeadLetterQueue, Emitter, Hub, Message,
-    PluginError, ResilientEmitter,
+    BackoffConfig, CircuitBreakerConfig, Emitter, FailureBuffer, FailureCaptureConfig, Hub,
+    Message, PluginError, ResilientEmitter,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -166,7 +166,7 @@ async fn test_circuit_breaker_prevents_retry_storms() {
     // Scenario: Backend is completely down
     // Expected: Circuit opens after threshold, preventing retry storms
     let inner = Arc::new(AlwaysFailEmitter::new());
-    let dlq = Arc::new(DeadLetterQueue::new(100));
+    let buffer = Arc::new(FailureBuffer::new(100));
 
     let resilient = ResilientEmitter::wrap_arc(inner.clone())
         .with_retry(BackoffConfig {
@@ -179,7 +179,7 @@ async fn test_circuit_breaker_prevents_retry_storms() {
             reset_timeout: Duration::from_secs(60),
             ..Default::default()
         })
-        .with_default_dlq(dlq.clone())
+        .with_default_failure_capture(buffer.clone())
         .build();
 
     // First two requests exhaust retries and open circuit
@@ -206,18 +206,18 @@ async fn test_circuit_breaker_prevents_retry_storms() {
         "Should not retry when circuit is open"
     );
 
-    // DLQ should have captured the failures
-    assert!(dlq.len() >= 2, "DLQ should have captured failures");
+    // Buffer should have captured the failures
+    assert!(buffer.len() >= 2, "Buffer should have captured failures");
 }
 
 // ============================================================================
-// Integration Tests: Retry + DLQ
+// Integration Tests: Retry + Failure Capture
 // ============================================================================
 
 #[tokio::test]
-async fn test_dlq_captures_after_all_retries_exhausted() {
+async fn test_failure_capture_after_all_retries_exhausted() {
     let inner = Arc::new(AlwaysFailEmitter::new());
-    let dlq = Arc::new(DeadLetterQueue::new(100));
+    let buffer = Arc::new(FailureBuffer::new(100));
 
     let resilient = ResilientEmitter::wrap_arc(inner.clone())
         .with_retry(BackoffConfig {
@@ -225,7 +225,7 @@ async fn test_dlq_captures_after_all_retries_exhausted() {
             initial_delay: Duration::from_millis(1),
             ..Default::default()
         })
-        .with_default_dlq(dlq.clone())
+        .with_default_failure_capture(buffer.clone())
         .build();
 
     let events = vec![make_test_event("evt-1"), make_test_event("evt-2")];
@@ -236,19 +236,19 @@ async fn test_dlq_captures_after_all_retries_exhausted() {
     // Retry should have tried 4 times (1 initial + 3 retries)
     assert_eq!(inner.emit_count(), 4);
 
-    // DLQ should have both events
-    assert_eq!(dlq.len(), 2);
+    // Buffer should have both events
+    assert_eq!(buffer.len(), 2);
 
-    let failed = dlq.drain(10);
+    let failed = buffer.drain(10);
     assert_eq!(failed[0].event.id, "evt-1");
     assert_eq!(failed[1].event.id, "evt-2");
-    assert_eq!(failed[0].attempts, 1); // DLQ sees it as first attempt from its perspective
+    assert_eq!(failed[0].attempts, 1); // Buffer sees it as first attempt from its perspective
 }
 
 #[tokio::test]
-async fn test_successful_retry_means_no_dlq() {
+async fn test_successful_retry_means_no_capture() {
     let inner = Arc::new(FailNTimesEmitter::new(2)); // Fails twice, succeeds on third
-    let dlq = Arc::new(DeadLetterQueue::new(100));
+    let buffer = Arc::new(FailureBuffer::new(100));
 
     let resilient = ResilientEmitter::wrap_arc(inner.clone())
         .with_retry(BackoffConfig {
@@ -256,13 +256,13 @@ async fn test_successful_retry_means_no_dlq() {
             initial_delay: Duration::from_millis(1),
             ..Default::default()
         })
-        .with_default_dlq(dlq.clone())
+        .with_default_failure_capture(buffer.clone())
         .build();
 
     let result = resilient.emit(&[make_test_event("evt-1")]).await;
 
     assert!(result.is_ok());
-    assert!(dlq.is_empty(), "DLQ should be empty on success");
+    assert!(buffer.is_empty(), "Buffer should be empty on success");
 }
 
 // ============================================================================
@@ -276,7 +276,7 @@ async fn test_full_resilience_stack_recovery_scenario() {
     // we need 3 failed emissions (6 total calls) to open circuit.
     // So inner must fail at least 6 times.
     let inner = Arc::new(FailNTimesEmitter::new(8));
-    let dlq = Arc::new(DeadLetterQueue::new(100));
+    let buffer = Arc::new(FailureBuffer::new(100));
 
     let resilient = ResilientEmitter::wrap_arc(inner.clone())
         .with_retry(BackoffConfig {
@@ -290,7 +290,7 @@ async fn test_full_resilience_stack_recovery_scenario() {
             reset_timeout: Duration::from_millis(10),
             half_open_max_requests: 1,
         })
-        .with_default_dlq(dlq.clone())
+        .with_default_failure_capture(buffer.clone())
         .build();
 
     // First 3 emissions fail (each tries 2x), opening circuit
@@ -330,7 +330,7 @@ async fn test_full_resilience_stack_recovery_scenario() {
 #[tokio::test]
 async fn test_concurrent_emissions_with_resilience() {
     let inner = Arc::new(FailNTimesEmitter::new(10));
-    let dlq = Arc::new(DeadLetterQueue::new(1000));
+    let buffer = Arc::new(FailureBuffer::new(1000));
 
     let resilient = Arc::new(
         ResilientEmitter::wrap_arc(inner.clone())
@@ -343,7 +343,7 @@ async fn test_concurrent_emissions_with_resilience() {
                 failure_threshold: 20, // High threshold to not trigger
                 ..Default::default()
             })
-            .with_default_dlq(dlq.clone())
+            .with_default_failure_capture(buffer.clone())
             .build(),
     );
 
@@ -372,9 +372,9 @@ async fn test_concurrent_emissions_with_resilience() {
     // We expect most to eventually succeed due to retries
     assert!(successes > 0, "Some requests should succeed");
 
-    // Any failures should be in DLQ
+    // Any failures should be captured in buffer
     if failures > 0 {
-        assert!(!dlq.is_empty(), "Failures should be captured in DLQ");
+        assert!(!buffer.is_empty(), "Failures should be captured in buffer");
     }
 }
 
@@ -385,11 +385,11 @@ async fn test_concurrent_emissions_with_resilience() {
 #[tokio::test]
 async fn test_hub_with_resilient_emitter() {
     let inner = Arc::new(TrackingEmitter::new());
-    let dlq = Arc::new(DeadLetterQueue::new(100));
+    let buffer = Arc::new(FailureBuffer::new(100));
 
     let resilient = ResilientEmitter::wrap_arc(inner.clone())
         .with_default_retry()
-        .with_default_dlq(dlq.clone())
+        .with_default_failure_capture(buffer.clone())
         .build();
 
     let hub = Hub::new().buffer_capacity(100).emitter_arc(resilient);
@@ -418,13 +418,13 @@ async fn test_hub_with_resilient_emitter() {
 
     // Verify events were emitted
     assert!(inner.event_count() > 0, "Events should have been emitted");
-    assert!(dlq.is_empty(), "DLQ should be empty (no failures)");
+    assert!(buffer.is_empty(), "Buffer should be empty (no failures)");
 }
 
 #[tokio::test]
 async fn test_hub_with_failing_resilient_emitter() {
     let inner = Arc::new(AlwaysFailEmitter::new());
-    let dlq = Arc::new(DeadLetterQueue::new(100));
+    let buffer = Arc::new(FailureBuffer::new(100));
 
     let resilient = ResilientEmitter::wrap_arc(inner.clone())
         .with_retry(BackoffConfig {
@@ -437,7 +437,7 @@ async fn test_hub_with_failing_resilient_emitter() {
             reset_timeout: Duration::from_secs(60),
             ..Default::default()
         })
-        .with_default_dlq(dlq.clone())
+        .with_default_failure_capture(buffer.clone())
         .build();
 
     let hub = Hub::new().buffer_capacity(100).emitter_arc(resilient);
@@ -460,11 +460,11 @@ async fn test_hub_with_failing_resilient_emitter() {
     drop(sender);
     runner_handle.await.ok();
 
-    // Events should be in DLQ due to failures
+    // Events should be captured due to failures
     // Note: exact count depends on batching behavior
     assert!(
-        dlq.total_captured() > 0,
-        "DLQ should have captured failures"
+        buffer.total_captured() > 0,
+        "Buffer should have captured failures"
     );
 }
 
@@ -473,7 +473,7 @@ async fn test_hub_graceful_degradation() {
     // Two emitters: one always fails, one always succeeds
     let failing = Arc::new(AlwaysFailEmitter::new());
     let tracking = Arc::new(TrackingEmitter::new());
-    let dlq = Arc::new(DeadLetterQueue::new(100));
+    let buffer = Arc::new(FailureBuffer::new(100));
 
     let resilient_failing = ResilientEmitter::wrap_arc(failing.clone())
         .with_retry(BackoffConfig {
@@ -481,7 +481,7 @@ async fn test_hub_graceful_degradation() {
             initial_delay: Duration::from_millis(1),
             ..Default::default()
         })
-        .with_default_dlq(dlq.clone())
+        .with_default_failure_capture(buffer.clone())
         .build();
 
     let hub = Hub::new()
@@ -513,8 +513,8 @@ async fn test_hub_graceful_degradation() {
         "Working emitter should receive events even when other fails"
     );
 
-    // Failures should be in DLQ
-    assert!(dlq.total_captured() > 0, "Failures should be captured");
+    // Failures should be captured
+    assert!(buffer.total_captured() > 0, "Failures should be captured");
 }
 
 // ============================================================================
@@ -562,7 +562,7 @@ async fn test_high_load_with_intermittent_failures() {
     }
 
     let inner = Arc::new(IntermittentEmitter::new());
-    let dlq = Arc::new(DeadLetterQueue::new(10000));
+    let buffer = Arc::new(FailureBuffer::new(10000));
 
     let resilient = ResilientEmitter::wrap_arc(inner.clone())
         .with_retry(BackoffConfig {
@@ -571,7 +571,7 @@ async fn test_high_load_with_intermittent_failures() {
             max_delay: Duration::from_millis(1),
             ..Default::default()
         })
-        .with_default_dlq(dlq.clone())
+        .with_default_failure_capture(buffer.clone())
         .build();
 
     // Send 100 emissions
@@ -594,25 +594,25 @@ async fn test_high_load_with_intermittent_failures() {
         "With retries, successes ({success_count}) should exceed failures ({fail_count})"
     );
 
-    // Any failures should be in DLQ
+    // Any failures should be in buffer
     if fail_count > 0 {
-        assert!(dlq.len() > 0);
+        assert!(buffer.len() > 0);
     }
 }
 
 #[tokio::test]
-async fn test_dlq_capacity_under_sustained_failure() {
+async fn test_buffer_capacity_under_sustained_failure() {
     let inner = Arc::new(AlwaysFailEmitter::new());
-    let dlq = Arc::new(DeadLetterQueue::new(50)); // Small capacity
+    let buffer = Arc::new(FailureBuffer::new(50)); // Small capacity
 
     let resilient = ResilientEmitter::wrap_arc(inner)
         .with_retry(BackoffConfig {
             max_attempts: 0, // No retries, fail immediately
             ..Default::default()
         })
-        .with_dlq(
-            dlq.clone(),
-            DLQConfig {
+        .with_failure_capture(
+            buffer.clone(),
+            FailureCaptureConfig {
                 capacity: 50,
                 store_full_batch: true,
             },
@@ -626,18 +626,18 @@ async fn test_dlq_capacity_under_sustained_failure() {
             .await;
     }
 
-    // DLQ should be at capacity
-    assert_eq!(dlq.len(), 50, "DLQ should be at capacity");
+    // Buffer should be at capacity
+    assert_eq!(buffer.len(), 50, "Buffer should be at capacity");
 
     // Oldest should have been dropped
     assert_eq!(
-        dlq.total_dropped(),
+        buffer.total_dropped(),
         50,
         "50 events should have been dropped"
     );
 
     // Verify we have the newest events
-    let events = dlq.drain(100);
+    let events = buffer.drain(100);
     assert!(events[0].event.id.starts_with("overflow-5")); // 50+ onwards
 }
 

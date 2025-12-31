@@ -44,8 +44,8 @@ pub mod proto {
 
 pub use config::Config;
 pub use emit::resilience::{
-    BackoffConfig, CircuitBreakerConfig, CircuitBreakerEmitter, CircuitState, DLQConfig,
-    DLQEmitter, DeadLetterQueue, FailedEvent, ResilientEmitter, RetryEmitter,
+    BackoffConfig, CircuitBreakerConfig, CircuitBreakerEmitter, CircuitState, FailedEvent,
+    FailureBuffer, FailureCaptureConfig, FailureCaptureEmitter, ResilientEmitter, RetryEmitter,
 };
 pub use emit::{Emitter, GrpcEmitter, StdoutEmitter, WebhookEmitter};
 pub use error::{PluginError, PolkuError, Result};

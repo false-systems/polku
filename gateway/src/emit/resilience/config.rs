@@ -1,10 +1,10 @@
 //! ResilientEmitter builder for composing resilience wrappers
 //!
-//! Provides a fluent API for wrapping emitters with retry, circuit breaker, and DLQ.
+//! Provides a fluent API for wrapping emitters with retry, circuit breaker, and failure capture.
 
 use super::{
-    BackoffConfig, CircuitBreakerConfig, CircuitBreakerEmitter, DLQConfig, DLQEmitter,
-    DeadLetterQueue, RetryEmitter,
+    BackoffConfig, CircuitBreakerConfig, CircuitBreakerEmitter, FailureBuffer,
+    FailureCaptureConfig, FailureCaptureEmitter, RetryEmitter,
 };
 use crate::emit::Emitter;
 use std::sync::Arc;
@@ -17,12 +17,12 @@ use std::sync::Arc;
 /// use polku_gateway::emit::resilience::*;
 ///
 /// let grpc = GrpcEmitter::new("http://backend:50051").await?;
-/// let dlq = Arc::new(DeadLetterQueue::new(1000));
+/// let buffer = Arc::new(FailureBuffer::new(1000));
 ///
 /// let resilient = ResilientEmitter::wrap(grpc)
 ///     .with_retry(BackoffConfig::default())
 ///     .with_circuit_breaker(CircuitBreakerConfig::default())
-///     .with_dlq(dlq.clone(), DLQConfig::default())
+///     .with_failure_capture(buffer.clone(), FailureCaptureConfig::default())
 ///     .build();
 ///
 /// hub.emitter_arc(resilient);
@@ -31,7 +31,7 @@ pub struct ResilientEmitter {
     inner: Arc<dyn Emitter>,
     retry_config: Option<BackoffConfig>,
     circuit_breaker_config: Option<CircuitBreakerConfig>,
-    dlq: Option<(Arc<DeadLetterQueue>, DLQConfig)>,
+    failure_capture: Option<(Arc<FailureBuffer>, FailureCaptureConfig)>,
 }
 
 impl ResilientEmitter {
@@ -41,7 +41,7 @@ impl ResilientEmitter {
             inner: Arc::new(emitter),
             retry_config: None,
             circuit_breaker_config: None,
-            dlq: None,
+            failure_capture: None,
         }
     }
 
@@ -51,7 +51,7 @@ impl ResilientEmitter {
             inner: emitter,
             retry_config: None,
             circuit_breaker_config: None,
-            dlq: None,
+            failure_capture: None,
         }
     }
 
@@ -77,15 +77,19 @@ impl ResilientEmitter {
         self.with_circuit_breaker(CircuitBreakerConfig::default())
     }
 
-    /// Add dead letter queue
-    pub fn with_dlq(mut self, dlq: Arc<DeadLetterQueue>, config: DLQConfig) -> Self {
-        self.dlq = Some((dlq, config));
+    /// Add failure capture buffer (in-memory, for debugging)
+    pub fn with_failure_capture(
+        mut self,
+        buffer: Arc<FailureBuffer>,
+        config: FailureCaptureConfig,
+    ) -> Self {
+        self.failure_capture = Some((buffer, config));
         self
     }
 
-    /// Add DLQ with default configuration
-    pub fn with_default_dlq(self, dlq: Arc<DeadLetterQueue>) -> Self {
-        self.with_dlq(dlq, DLQConfig::default())
+    /// Add failure capture with default configuration
+    pub fn with_default_failure_capture(self, buffer: Arc<FailureBuffer>) -> Self {
+        self.with_failure_capture(buffer, FailureCaptureConfig::default())
     }
 
     /// Build the resilient emitter stack
@@ -94,7 +98,7 @@ impl ResilientEmitter {
     /// 1. Inner emitter (actual destination)
     /// 2. RetryEmitter (if configured) - handles transient failures
     /// 3. CircuitBreakerEmitter (if configured) - prevents hammering
-    /// 4. DLQEmitter (if configured) - captures undeliverable events
+    /// 4. FailureCaptureEmitter (if configured) - captures failed events for debugging
     pub fn build(self) -> Arc<dyn Emitter> {
         let mut current: Arc<dyn Emitter> = self.inner;
 
@@ -108,9 +112,9 @@ impl ResilientEmitter {
             current = Arc::new(CircuitBreakerEmitter::new(current, config));
         }
 
-        // Apply DLQ (outermost)
-        if let Some((dlq, config)) = self.dlq {
-            current = Arc::new(DLQEmitter::new(current, dlq, config));
+        // Apply failure capture (outermost)
+        if let Some((buffer, config)) = self.failure_capture {
+            current = Arc::new(FailureCaptureEmitter::new(current, buffer, config));
         }
 
         current
@@ -191,7 +195,7 @@ mod tests {
     #[tokio::test]
     async fn test_resilient_emitter_with_retry_recovers() {
         let inner = RecoverableEmitter::new(2); // Fails twice
-        let dlq = Arc::new(DeadLetterQueue::new(100));
+        let buffer = Arc::new(FailureBuffer::new(100));
 
         let resilient = ResilientEmitter::wrap(inner)
             .with_retry(BackoffConfig {
@@ -199,19 +203,19 @@ mod tests {
                 initial_delay: Duration::from_millis(1),
                 ..Default::default()
             })
-            .with_default_dlq(dlq.clone())
+            .with_default_failure_capture(buffer.clone())
             .build();
 
         // Should succeed after retries
         let result = resilient.emit(&[make_test_event()]).await;
         assert!(result.is_ok());
-        assert!(dlq.is_empty()); // No events in DLQ
+        assert!(buffer.is_empty()); // No events captured
     }
 
     #[tokio::test]
-    async fn test_resilient_emitter_dlq_captures_after_retries_exhausted() {
+    async fn test_resilient_emitter_captures_after_retries_exhausted() {
         let inner = AlwaysFailingEmitter;
-        let dlq = Arc::new(DeadLetterQueue::new(100));
+        let buffer = Arc::new(FailureBuffer::new(100));
 
         let resilient = ResilientEmitter::wrap(inner)
             .with_retry(BackoffConfig {
@@ -219,18 +223,18 @@ mod tests {
                 initial_delay: Duration::from_millis(1),
                 ..Default::default()
             })
-            .with_default_dlq(dlq.clone())
+            .with_default_failure_capture(buffer.clone())
             .build();
 
         let result = resilient.emit(&[make_test_event()]).await;
         assert!(result.is_err());
-        assert_eq!(dlq.len(), 1); // Event captured to DLQ
+        assert_eq!(buffer.len(), 1); // Event captured to buffer
     }
 
     #[tokio::test]
     async fn test_resilient_emitter_circuit_breaker_opens() {
         let inner = AlwaysFailingEmitter;
-        let dlq = Arc::new(DeadLetterQueue::new(100));
+        let buffer = Arc::new(FailureBuffer::new(100));
 
         let resilient = ResilientEmitter::wrap(inner)
             .with_retry(BackoffConfig {
@@ -242,7 +246,7 @@ mod tests {
                 reset_timeout: Duration::from_secs(60),
                 ..Default::default()
             })
-            .with_default_dlq(dlq.clone())
+            .with_default_failure_capture(buffer.clone())
             .build();
 
         // First 2 failures open circuit
@@ -253,14 +257,14 @@ mod tests {
         let result = resilient.emit(&[make_test_event()]).await;
         assert!(matches!(result, Err(PluginError::NotReady)));
 
-        // DLQ should have events from first two failures + circuit open
-        assert!(dlq.len() >= 2);
+        // Buffer should have events from first two failures + circuit open
+        assert!(buffer.len() >= 2);
     }
 
     #[tokio::test]
     async fn test_resilient_emitter_full_stack() {
         let inner = RecoverableEmitter::new(1); // Fails once
-        let dlq = Arc::new(DeadLetterQueue::new(100));
+        let buffer = Arc::new(FailureBuffer::new(100));
 
         let resilient = ResilientEmitter::wrap(inner)
             .with_retry(BackoffConfig {
@@ -272,13 +276,13 @@ mod tests {
                 failure_threshold: 5, // High threshold
                 ..Default::default()
             })
-            .with_default_dlq(dlq.clone())
+            .with_default_failure_capture(buffer.clone())
             .build();
 
         // Should recover after 1 retry
         let result = resilient.emit(&[make_test_event()]).await;
         assert!(result.is_ok());
-        assert!(dlq.is_empty());
+        assert!(buffer.is_empty());
     }
 
     #[tokio::test]
