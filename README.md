@@ -16,7 +16,7 @@ POLKU is an **infrastructure library** for internal event routing. Services and 
 - **Event-driven**: Fire-and-forget with buffering, not request/response
 - **Programmable**: Routing logic is Rust code, not config files
 - **Embeddable**: Import as a crate or run standalone
-- **Lightweight**: 10-20MB footprint, zero external dependencies
+- **Lightweight**: 10-20MB footprint, self-contained runtime (no external infrastructure services required)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
