@@ -412,10 +412,10 @@ POLKU provides composable resilience wrappers. Wrap any emitter with retry, circ
 
 ```rust
 use polku_gateway::{
-    ResilientEmitter, RetryEmitter, CircuitBreakerEmitter, FailureCaptureEmitter,
-    BackoffConfig, CircuitBreakerConfig, FailureBuffer, FailureCaptureConfig,
+    ResilientEmitter, BackoffConfig, CircuitBreakerConfig, FailureBuffer, FailureCaptureConfig,
 };
 use std::sync::Arc;
+use std::time::Duration;
 
 // Your base emitter
 let ahti = Arc::new(AhtiEmitter::connect("http://ahti:50051").await?);
@@ -424,18 +424,19 @@ let ahti = Arc::new(AhtiEmitter::connect("http://ahti:50051").await?);
 let failure_buffer = Arc::new(FailureBuffer::new(1000));
 
 // Wrap with resilience (innermost → outermost)
-let resilient = ResilientEmitter::wrap(ahti)
+let resilient = ResilientEmitter::wrap_arc(ahti)
     .with_retry(BackoffConfig {
         max_attempts: 3,
-        initial_delay_ms: 100,
-        max_delay_ms: 30_000,
+        initial_delay: Duration::from_millis(100),
+        max_delay: Duration::from_secs(30),
         multiplier: 2.0,
-        jitter_percent: 25,
+        jitter_factor: 0.25,
     })
     .with_circuit_breaker(CircuitBreakerConfig {
         failure_threshold: 5,
         success_threshold: 2,
-        half_open_timeout_ms: 30_000,
+        reset_timeout: Duration::from_secs(30),
+        half_open_max_requests: 3,
     })
     .with_failure_capture(failure_buffer.clone(), FailureCaptureConfig::default())
     .build();
