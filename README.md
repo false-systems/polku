@@ -35,14 +35,6 @@ POLKU is an **infrastructure library** for internal service communication. You w
 
 ---
 
-## Why POLKU?
-
-| | Envoy/Istio | Kafka | POLKU |
-|---|---|---|---|
-| Config | 1000s lines YAML | Properties | **Rust code** |
-| Logic | C++ filters | Consumer groups | **Full language** |
-| Ops | Complex | Zookeeper | **Zero** |
-| Memory | 50-100MB+ | JVM GB | **10-20MB** |
 
 ---
 
