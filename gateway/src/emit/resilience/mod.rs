@@ -14,7 +14,7 @@
 //! let resilient = ResilientEmitter::wrap(grpc_emitter)
 //!     .with_default_retry()
 //!     .with_default_circuit_breaker()
-//!     .with_failure_capture(buffer)
+//!     .with_default_failure_capture(buffer)
 //!     .build();
 //! ```
 
