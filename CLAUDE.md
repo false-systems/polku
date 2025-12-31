@@ -1,6 +1,6 @@
 # POLKU: Programmatic Protocol Hub
 
-**Infrastructure Library for internal service communication**
+**Infrastructure Library for internal event routing**
 
 ---
 
@@ -8,26 +8,25 @@
 
 **POLKU IS AN INFRASTRUCTURE LIBRARY, NOT A FRAMEWORK**
 
-- **Philosophy**: Logic IS code. You have full Rust power to decide how data flows.
+- **Philosophy**: Logic IS code. You have full Rust power to decide how events flow.
 - **User owns `main.rs`**: POLKU provides traits + engine, you wire up your Ingestors/Emitters.
 - **Language**: 100% Rust
-- **Positioning**: For when Envoy/Istio is mega overkill but direct coupling is brittle.
+- **Use case**: Internal event routing between services/agents. Fan-in from many sources, transform, fan-out to many destinations.
 
 ---
 
-## THE PITCH
+## WHAT POLKU DOES
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                                                              │
-│  Envoy: 1000s of lines of YAML, C++ filter limitations      │
-│  Kafka: Zookeeper, cluster ops, JVM overhead                │
-│                                                              │
 │  POLKU:                                                      │
+│  • Internal event routing (service ↔ service, agent → hub)  │
 │  • Logic IS code (if-statements, loops, custom math)        │
 │  • 10-20MB RAM footprint                                     │
 │  • Zero ops (no cluster, no config files)                   │
 │  • Type-safe plugin architecture                             │
+│  • Fire-and-forget with buffering                            │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -216,12 +215,12 @@ cargo test
 
 ---
 
-## POLKU vs THE STATUS QUO
+## POLKU STRENGTHS
 
-| Aspect | Envoy/Istio | Kafka | POLKU |
-|--------|-------------|-------|-------|
-| Config | 1000s lines YAML | Properties files | **Rust code** |
-| Logic | C++ filters | Consumer groups | **Full language power** |
-| Ops | Complex | Zookeeper cluster | **Zero** |
-| Memory | 50-100MB+ | JVM GB | **10-20MB** |
-| Flexibility | Filter API limits | Topic-based | **Anything you can code** |
+| Aspect | How |
+|--------|-----|
+| **Programmable** | Routing logic is Rust code, not config |
+| **Full language** | if/else, loops, custom transforms |
+| **Zero ops** | No clusters, no external services |
+| **Lightweight** | 10-20MB footprint |
+| **Type-safe** | Compiler catches plugin errors |

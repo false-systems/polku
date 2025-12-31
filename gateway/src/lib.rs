@@ -43,7 +43,7 @@ pub mod proto {
 }
 
 pub use config::Config;
-pub use emit::{Emitter, StdoutEmitter};
+pub use emit::{Emitter, GrpcEmitter, StdoutEmitter, WebhookEmitter};
 pub use error::{PluginError, PolkuError, Result};
 pub use hub::{Hub, HubRunner, MessageSender};
 pub use ingest::{IngestContext, Ingestor};

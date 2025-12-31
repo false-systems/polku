@@ -3,13 +3,17 @@
 //! Emitters send Messages to various destinations (gRPC backends, Kafka, stdout, etc.)
 //! All registered emitters receive messages in a fan-out pattern.
 
+pub mod grpc;
 pub mod stdout;
+pub mod webhook;
 
 use crate::error::PluginError;
 use crate::proto::Event;
 use async_trait::async_trait;
 
+pub use grpc::GrpcEmitter;
 pub use stdout::StdoutEmitter;
+pub use webhook::WebhookEmitter;
 
 /// Emitter trait - sends Events to destinations
 ///
