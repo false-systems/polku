@@ -61,40 +61,59 @@ impl Emitter for GrpcEmitter {
 
         // Clone client and release lock immediately - tonic clients are cheap to clone
         // (just Arc increment) and this allows concurrent emit() calls
-        let mut client = self.client.lock().await.clone();
+        let base_client = self.client.lock().await.clone();
+        let endpoint = self.endpoint.clone();
 
-        for event in events {
-            let request = IngestEvent {
-                source: event.source.clone(),
-                cluster: String::new(),
-                format: String::new(),
-                payload: Some(ingest_event::Payload::Event(event.clone())),
-            };
+        let mut handles = Vec::with_capacity(events.len());
 
-            match client.send_event(request).await {
-                Ok(response) => {
-                    let ack = response.into_inner();
-                    debug!(
-                        event_id = %event.id,
-                        acked = ack.event_ids.len(),
-                        "Event forwarded"
-                    );
+        for event in events.iter().cloned() {
+            let mut client = base_client.clone();
+            let endpoint = endpoint.clone();
+
+            let handle = tokio::spawn(async move {
+                let request = IngestEvent {
+                    source: event.source.clone(),
+                    cluster: String::new(),
+                    format: String::new(),
+                    payload: Some(ingest_event::Payload::Event(event.clone())),
+                };
+
+                match client.send_event(request).await {
+                    Ok(response) => {
+                        let ack = response.into_inner();
+                        debug!(
+                            event_id = %event.id,
+                            acked = ack.event_ids.len(),
+                            "Event forwarded"
+                        );
+                        Ok(())
+                    }
+                    Err(e) => {
+                        error!(
+                            event_id = %event.id,
+                            error = %e,
+                            endpoint = %endpoint,
+                            "Failed to forward event"
+                        );
+                        Err(PluginError::Send(format!(
+                            "Failed to forward event {}: {}",
+                            event.id, e
+                        )))
+                    }
                 }
-                Err(e) => {
-                    error!(
-                        event_id = %event.id,
-                        error = %e,
-                        endpoint = %self.endpoint,
-                        "Failed to forward event"
-                    );
-                    return Err(PluginError::Send(format!(
-                        "Failed to forward event {}: {}",
-                        event.id, e
-                    )));
-                }
-            }
+            });
+
+            handles.push(handle);
         }
 
+        for handle in handles {
+            // If the task panics or is cancelled, map it to a PluginError
+            let result = handle
+                .await
+                .map_err(|e| PluginError::Send(format!("Failed to join send_event task: {}", e)))?;
+            // Propagate any send_event error
+            result?;
+        }
         Ok(())
     }
 
