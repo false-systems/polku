@@ -156,6 +156,7 @@ impl HubRunner {
     /// 2. Apply middleware chain
     /// 3. Buffer messages
     /// 4. Periodically flush to outputs
+    /// 5. On shutdown, drain remaining buffer before exiting
     pub async fn run(mut self) -> Result<(), PluginError> {
         info!(
             emitters = self.emitters.len(),
@@ -168,11 +169,14 @@ impl HubRunner {
             warn!("No emitters registered - messages will be buffered but not delivered");
         }
 
+        // Shutdown signal: when true, flush loop will drain and exit
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
         // Spawn emitter flusher
         let buffer = Arc::clone(&self.buffer);
         let emitters = self.emitters.clone();
         let flush_handle = tokio::spawn(async move {
-            flush_loop(buffer, emitters).await;
+            flush_loop(buffer, emitters, shutdown_rx).await;
         });
 
         // Process incoming messages
@@ -189,9 +193,16 @@ impl HubRunner {
             }
         }
 
-        // Channel closed, wait for flush to complete
-        flush_handle.abort();
-        info!("Hub shutdown");
+        // Channel closed - signal flush loop to drain and stop
+        info!("Hub shutting down, draining buffer...");
+        let _ = shutdown_tx.send(true);
+
+        // Wait for flush loop to complete (it will drain the buffer first)
+        if let Err(e) = flush_handle.await {
+            warn!(error = %e, "Flush task failed during shutdown");
+        }
+
+        info!(remaining = self.buffer.len(), "Hub shutdown complete");
 
         Ok(())
     }
@@ -203,12 +214,31 @@ impl HubRunner {
 }
 
 /// Background flush loop - sends buffered messages to emitters
-async fn flush_loop(buffer: Arc<RingBuffer>, emitters: Vec<Arc<dyn Emitter>>) {
+///
+/// When shutdown is signaled, drains the buffer completely before exiting.
+async fn flush_loop(
+    buffer: Arc<RingBuffer>,
+    emitters: Vec<Arc<dyn Emitter>>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
     const BATCH_SIZE: usize = 100;
     const FLUSH_INTERVAL_MS: u64 = 10;
 
     loop {
-        tokio::time::sleep(tokio::time::Duration::from_millis(FLUSH_INTERVAL_MS)).await;
+        // Check if shutdown requested and buffer is empty
+        if *shutdown_rx.borrow() && buffer.is_empty() {
+            debug!("Flush loop: shutdown complete, buffer drained");
+            break;
+        }
+
+        // Either wait for interval OR shutdown signal
+        tokio::select! {
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(FLUSH_INTERVAL_MS)) => {}
+            _ = shutdown_rx.changed() => {
+                // Shutdown signaled - continue loop to drain buffer
+                debug!("Flush loop: shutdown signaled, draining buffer");
+            }
+        }
 
         let messages = buffer.drain(BATCH_SIZE);
         if messages.is_empty() {
@@ -342,40 +372,124 @@ mod tests {
 
     #[tokio::test]
     async fn test_hub_filter() {
+        use std::sync::atomic::AtomicU64;
+
+        // Emitter that counts events
+        struct CountingEmitter(AtomicU64);
+
+        #[async_trait::async_trait]
+        impl crate::emit::Emitter for CountingEmitter {
+            fn name(&self) -> &'static str {
+                "counter"
+            }
+            async fn emit(
+                &self,
+                events: &[crate::proto::Event],
+            ) -> Result<(), crate::error::PluginError> {
+                self.0.fetch_add(events.len() as u64, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn health(&self) -> bool {
+                true
+            }
+        }
+
+        let counter = Arc::new(CountingEmitter(AtomicU64::new(0)));
         let hub = Hub::new()
             // Only allow messages with type "keep"
-            .middleware(Filter::new(|msg: &Message| msg.message_type == "keep"));
+            .middleware(Filter::new(|msg: &Message| msg.message_type == "keep"))
+            .emitter_arc(counter.clone());
 
         let (sender, runner) = hub.build();
-        let buffer = Arc::clone(runner.buffer());
 
-        // Send messages
-        let sender_handle = tokio::spawn(async move {
-            sender
-                .send(Message::new("test", "keep", Bytes::new()))
-                .await
-                .ok();
-            sender
-                .send(Message::new("test", "drop", Bytes::new()))
-                .await
-                .ok();
-            sender
-                .send(Message::new("test", "keep", Bytes::new()))
-                .await
-                .ok();
-        });
+        // Send messages: 2 "keep", 1 "drop"
+        sender
+            .send(Message::new("test", "keep", Bytes::new()))
+            .await
+            .ok();
+        sender
+            .send(Message::new("test", "drop", Bytes::new()))
+            .await
+            .ok();
+        sender
+            .send(Message::new("test", "keep", Bytes::new()))
+            .await
+            .ok();
 
-        // Run briefly
-        let runner_handle = tokio::spawn(async move {
-            tokio::time::timeout(tokio::time::Duration::from_millis(50), runner.run())
-                .await
-                .ok();
-        });
+        // Drop sender to trigger shutdown
+        drop(sender);
 
-        sender_handle.await.ok();
-        runner_handle.await.ok();
+        // Run to completion
+        runner.run().await.ok();
 
-        // Only 2 messages should be in buffer (the "keep" ones)
-        assert_eq!(buffer.len(), 2);
+        // Only 2 messages should have been emitted (the "keep" ones)
+        assert_eq!(counter.0.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_graceful_shutdown_drains_buffer() {
+        use std::sync::atomic::AtomicU64;
+
+        // Emitter that counts how many events it receives
+        struct CountingEmitter {
+            count: AtomicU64,
+        }
+
+        impl CountingEmitter {
+            fn new() -> Self {
+                Self {
+                    count: AtomicU64::new(0),
+                }
+            }
+
+            fn count(&self) -> u64 {
+                self.count.load(Ordering::SeqCst)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl crate::emit::Emitter for CountingEmitter {
+            fn name(&self) -> &'static str {
+                "counter"
+            }
+
+            async fn emit(
+                &self,
+                events: &[crate::proto::Event],
+            ) -> Result<(), crate::error::PluginError> {
+                self.count.fetch_add(events.len() as u64, Ordering::SeqCst);
+                Ok(())
+            }
+
+            async fn health(&self) -> bool {
+                true
+            }
+        }
+
+        let counter = Arc::new(CountingEmitter::new());
+        let hub = Hub::new()
+            .buffer_capacity(1000)
+            .emitter_arc(counter.clone());
+
+        let (sender, runner) = hub.build();
+
+        // Send 100 messages as fast as possible (will pile up in buffer)
+        for i in 0..100 {
+            let msg = Message::new("test", format!("evt-{i}"), Bytes::new());
+            sender.send(msg).await.expect("send should work");
+        }
+
+        // Drop sender to trigger shutdown
+        drop(sender);
+
+        // Run hub to completion (NOT a timeout - we want graceful shutdown)
+        runner.run().await.expect("hub should shutdown gracefully");
+
+        // ALL 100 messages should have been emitted
+        assert_eq!(
+            counter.count(),
+            100,
+            "Graceful shutdown should drain all buffered messages"
+        );
     }
 }
