@@ -54,6 +54,10 @@ pub use hub::{Hub, HubRunner, MessageSender};
 pub use ingest::{IngestContext, Ingestor};
 pub use message::Message;
 pub use metrics_server::MetricsServer;
-pub use middleware::{Filter, Middleware, MiddlewareChain, PassThrough, Transform};
+pub use middleware::{
+    AggregateStrategy, Aggregator, Deduplicator, Enricher, Filter, InvalidAction, Middleware,
+    MiddlewareChain, PassThrough, RateLimiter, Router, Sampler, Throttle, Transform,
+    ValidationResult, Validator,
+};
 pub use proto::Event;
 pub use registry::PluginRegistry;
