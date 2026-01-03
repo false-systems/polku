@@ -60,3 +60,20 @@ sykli = []
 
 [dev-dependencies]
 tokio-test = "0.4"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[[bench]]
+name = "middleware"
+harness = false
+
+[[bench]]
+name = "buffer"
+harness = false
+
+[[bench]]
+name = "serialization"
+harness = false
