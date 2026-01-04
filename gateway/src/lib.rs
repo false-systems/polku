@@ -19,6 +19,7 @@
 
 pub mod buffer;
 pub mod buffer_lockfree;
+pub mod buffer_tiered;
 pub mod config;
 pub mod emit;
 pub mod error;
@@ -53,7 +54,7 @@ pub use emit::resilience::{
 pub use emit::{Emitter, GrpcEmitter, StdoutEmitter, WebhookEmitter};
 pub use error::{PluginError, PolkuError, Result};
 pub use hub::{Hub, HubRunner, MessageSender};
-pub use ingest::{IngestContext, Ingestor, TapioIngestor};
+pub use ingest::{IngestContext, Ingestor};
 pub use message::Message;
 pub use metrics_server::MetricsServer;
 pub use middleware::{
