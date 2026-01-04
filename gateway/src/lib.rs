@@ -18,6 +18,7 @@
 #![warn(clippy::panic)]
 
 pub mod buffer;
+pub mod buffer_lockfree;
 pub mod config;
 pub mod emit;
 pub mod error;
@@ -25,6 +26,7 @@ pub mod hub;
 pub mod ingest;
 pub mod message;
 pub mod metrics;
+pub mod shared_message;
 pub mod metrics_server;
 pub mod middleware;
 pub mod registry;
@@ -51,7 +53,7 @@ pub use emit::resilience::{
 pub use emit::{Emitter, GrpcEmitter, StdoutEmitter, WebhookEmitter};
 pub use error::{PluginError, PolkuError, Result};
 pub use hub::{Hub, HubRunner, MessageSender};
-pub use ingest::{IngestContext, Ingestor};
+pub use ingest::{IngestContext, Ingestor, TapioIngestor};
 pub use message::Message;
 pub use metrics_server::MetricsServer;
 pub use middleware::{
