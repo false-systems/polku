@@ -64,7 +64,7 @@ impl Default for BufferMetrics {
 impl LockFreeBuffer {
     /// Create a new lock-free buffer with the given capacity
     ///
-    /// Capacity is rounded up to the next power of 2 internally.
+    /// Capacity is used as provided; no rounding is performed.
     pub fn new(capacity: usize) -> Self {
         Self {
             queue: Arc::new(ArrayQueue::new(capacity)),
