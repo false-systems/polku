@@ -127,8 +127,12 @@ impl TieredBuffer {
                 );
                 if self.secondary.push(wrapper) {
                     self.metrics.overflowed.fetch_add(1, Ordering::Relaxed);
-                    let saved = compressed.original_size.saturating_sub(compressed.data.len());
-                    self.metrics.bytes_saved.fetch_add(saved as u64, Ordering::Relaxed);
+                    let saved = compressed
+                        .original_size
+                        .saturating_sub(compressed.data.len());
+                    self.metrics
+                        .bytes_saved
+                        .fetch_add(saved as u64, Ordering::Relaxed);
                     true
                 } else {
                     self.metrics.dropped.fetch_add(1, Ordering::Relaxed);
@@ -236,11 +240,15 @@ impl TieredBuffer {
 
         // Helper to read length-prefixed string
         let read_str = |data: &[u8], cursor: &mut usize| -> Option<String> {
-            if *cursor + 4 > data.len() { return None; }
-            let len = u32::from_le_bytes(data[*cursor..*cursor+4].try_into().ok()?) as usize;
+            if *cursor + 4 > data.len() {
+                return None;
+            }
+            let len = u32::from_le_bytes(data[*cursor..*cursor + 4].try_into().ok()?) as usize;
             *cursor += 4;
-            if *cursor + len > data.len() { return None; }
-            let s = String::from_utf8(data[*cursor..*cursor+len].to_vec()).ok()?;
+            if *cursor + len > data.len() {
+                return None;
+            }
+            let s = String::from_utf8(data[*cursor..*cursor + len].to_vec()).ok()?;
             *cursor += len;
             Some(s)
         };
@@ -250,13 +258,17 @@ impl TieredBuffer {
         let message_type = read_str(data, &mut cursor)?;
 
         // Read timestamp
-        if cursor + 8 > data.len() { return None; }
-        let timestamp = i64::from_le_bytes(data[cursor..cursor+8].try_into().ok()?);
+        if cursor + 8 > data.len() {
+            return None;
+        }
+        let timestamp = i64::from_le_bytes(data[cursor..cursor + 8].try_into().ok()?);
         cursor += 8;
 
         // Read metadata
-        if cursor + 4 > data.len() { return None; }
-        let meta_count = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+        if cursor + 4 > data.len() {
+            return None;
+        }
+        let meta_count = u32::from_le_bytes(data[cursor..cursor + 4].try_into().ok()?) as usize;
         cursor += 4;
         let mut metadata = std::collections::HashMap::new();
         for _ in 0..meta_count {
@@ -266,8 +278,10 @@ impl TieredBuffer {
         }
 
         // Read routes
-        if cursor + 4 > data.len() { return None; }
-        let route_count = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+        if cursor + 4 > data.len() {
+            return None;
+        }
+        let route_count = u32::from_le_bytes(data[cursor..cursor + 4].try_into().ok()?) as usize;
         cursor += 4;
         let mut route_to = Vec::with_capacity(route_count);
         for _ in 0..route_count {
@@ -411,8 +425,12 @@ mod tests {
             "user.created",
             Bytes::from(b"hello world payload".to_vec()),
         );
-        original.metadata.insert("trace_id".to_string(), "abc-123".to_string());
-        original.metadata.insert("tenant".to_string(), "acme".to_string());
+        original
+            .metadata
+            .insert("trace_id".to_string(), "abc-123".to_string());
+        original
+            .metadata
+            .insert("tenant".to_string(), "acme".to_string());
         original.route_to = vec!["kafka".to_string(), "webhook".to_string()];
 
         // Push twice - first goes to primary, second overflows (compressed)
@@ -431,7 +449,10 @@ mod tests {
         assert_eq!(recovered.message_type, original.message_type);
         assert_eq!(recovered.payload, original.payload);
         // Verify metadata preserved through compression
-        assert_eq!(recovered.metadata.get("trace_id"), Some(&"abc-123".to_string()));
+        assert_eq!(
+            recovered.metadata.get("trace_id"),
+            Some(&"abc-123".to_string())
+        );
         assert_eq!(recovered.metadata.get("tenant"), Some(&"acme".to_string()));
         // Verify routes preserved through compression
         assert_eq!(recovered.route_to, vec!["kafka", "webhook"]);

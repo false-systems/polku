@@ -23,8 +23,8 @@
 use crate::message::Message;
 use crate::shared_message::SharedMessage;
 use crossbeam_queue::ArrayQueue;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Lock-free ring buffer for messages
 ///

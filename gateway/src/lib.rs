@@ -28,11 +28,11 @@ pub mod hub;
 pub mod ingest;
 pub mod message;
 pub mod metrics;
-pub mod shared_message;
 pub mod metrics_server;
 pub mod middleware;
 pub mod registry;
 pub mod server;
+pub mod shared_message;
 
 // Proto types generated from polku/v1/gateway.proto
 pub mod proto {
@@ -47,6 +47,7 @@ pub mod proto {
     pub use gateway_server::GatewayServer;
 }
 
+pub use checkpoint::{CheckpointStore, MemoryCheckpointStore};
 pub use config::Config;
 pub use emit::resilience::{
     BackoffConfig, CircuitBreakerConfig, CircuitBreakerEmitter, CircuitState, FailedEvent,
@@ -65,4 +66,3 @@ pub use middleware::{
 };
 pub use proto::Event;
 pub use registry::PluginRegistry;
-pub use checkpoint::{CheckpointStore, MemoryCheckpointStore};

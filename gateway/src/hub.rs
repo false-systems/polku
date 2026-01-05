@@ -200,8 +200,9 @@ impl HubRunner {
     /// 1. Receive messages from the input channel
     /// 2. Apply middleware chain
     /// 3. Buffer messages
-    /// 4. Periodically flush to outputs
-    /// 5. On shutdown, drain remaining buffer before exiting
+    /// 4. Flush immediately when buffer hits batch_size (inline flush)
+    /// 5. Timer-based flush for partial batches (latency bound)
+    /// 6. On shutdown, drain remaining buffer before exiting
     pub async fn run(mut self) -> Result<(), PluginError> {
         info!(
             emitters = self.emitters.len(),
@@ -222,13 +223,20 @@ impl HubRunner {
         // Shutdown signal: when true, flush loop will drain and exit
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        // Spawn emitter flusher
+        // Spawn timer-based flusher for partial batches (latency bound)
         let buffer = Arc::clone(&self.buffer);
-        let emitters = self.emitters.clone();
+        let emitters_for_timer = self.emitters.clone();
         let batch_size = self.batch_size;
         let flush_interval_ms = self.flush_interval_ms;
         let flush_handle = tokio::spawn(async move {
-            flush_loop(buffer, emitters, shutdown_rx, batch_size, flush_interval_ms).await;
+            flush_loop(
+                buffer,
+                emitters_for_timer,
+                shutdown_rx,
+                batch_size,
+                flush_interval_ms,
+            )
+            .await;
         });
 
         // Process incoming messages
@@ -249,6 +257,12 @@ impl HubRunner {
                     if let Some(metrics) = Metrics::get() {
                         metrics.record_dropped("buffer_overflow", 1);
                     }
+                }
+
+                // INLINE FLUSH: When buffer hits threshold, flush immediately
+                // This avoids waiting for the timer when we have a full batch
+                if self.buffer.len() >= self.batch_size {
+                    self.flush_batch().await;
                 }
             } else {
                 // Message was filtered by middleware
@@ -272,6 +286,65 @@ impl HubRunner {
         Ok(())
     }
 
+    /// Flush a batch of messages to emitters
+    ///
+    /// Called inline when buffer hits threshold, and by the timer loop.
+    async fn flush_batch(&self) {
+        let messages = self.buffer.drain(self.batch_size);
+
+        // Update buffer size metric after drain
+        if let Some(metrics) = Metrics::get() {
+            metrics.set_buffer_size(self.buffer.len());
+        }
+
+        if messages.is_empty() {
+            return;
+        }
+
+        // Convert Messages to proto Events for outputs
+        let events: Vec<crate::proto::Event> = messages
+            .into_iter()
+            .map(crate::proto::Event::from)
+            .collect();
+
+        // Partition events by destination in a single pass
+        let batches = partition_by_destination(&events, &self.emitters);
+
+        // Send pre-partitioned batches to each emitter
+        for emitter in &self.emitters {
+            let indices = match batches.get(emitter.name()) {
+                Some(idx) if !idx.is_empty() => idx,
+                _ => continue,
+            };
+
+            // Collect events for this emitter
+            let routed_events: Vec<_> = indices.iter().map(|&i| events[i].clone()).collect();
+
+            if let Err(e) = emitter.emit(&routed_events).await {
+                error!(
+                    emitter = emitter.name(),
+                    error = %e,
+                    count = routed_events.len(),
+                    "Failed to emit"
+                );
+                if let Some(metrics) = Metrics::get() {
+                    metrics.record_dropped(emitter.name(), routed_events.len() as u64);
+                }
+            } else {
+                debug!(
+                    emitter = emitter.name(),
+                    count = routed_events.len(),
+                    "Emitted (inline)"
+                );
+                if let Some(metrics) = Metrics::get() {
+                    for event in &routed_events {
+                        metrics.record_forwarded(emitter.name(), &event.event_type, 1);
+                    }
+                }
+            }
+        }
+    }
+
     /// Get a reference to the buffer for monitoring
     pub fn buffer(&self) -> &Arc<LockFreeBuffer> {
         &self.buffer
@@ -291,13 +364,16 @@ impl HubRunner {
 fn partition_by_destination(
     events: &[crate::proto::Event],
     emitters: &[Arc<dyn Emitter>],
-) -> std::collections::HashMap<&'static str, Vec<usize>>
-{
-    let mut batches: std::collections::HashMap<&'static str, Vec<usize>> = std::collections::HashMap::new();
+) -> std::collections::HashMap<&'static str, Vec<usize>> {
+    let mut batches: std::collections::HashMap<&'static str, Vec<usize>> =
+        std::collections::HashMap::new();
 
     // Pre-allocate for each emitter
     for emitter in emitters {
-        batches.insert(emitter.name(), Vec::with_capacity(events.len() / emitters.len()));
+        batches.insert(
+            emitter.name(),
+            Vec::with_capacity(events.len() / emitters.len()),
+        );
     }
 
     // Single pass: assign each event to its destinations
@@ -717,9 +793,8 @@ mod tests {
 
     #[test]
     fn test_partition_no_matching_route() {
-        let emitters: Vec<Arc<dyn crate::emit::Emitter>> = vec![
-            Arc::new(NamedEmitter { name: "kafka" }),
-        ];
+        let emitters: Vec<Arc<dyn crate::emit::Emitter>> =
+            vec![Arc::new(NamedEmitter { name: "kafka" })];
 
         // Message routed to non-existent emitter
         let events = vec![crate::proto::Event {
@@ -732,5 +807,101 @@ mod tests {
 
         // kafka should get nothing (route_to doesn't match)
         assert_eq!(batches.get("kafka").map(|v| v.len()), Some(0));
+    }
+
+    // ========================================================================
+    // Inline flush tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_inline_flush_triggers_at_threshold() {
+        use std::sync::atomic::AtomicU64;
+        use std::time::Instant;
+
+        // Emitter that records when it receives events
+        struct TimingEmitter {
+            count: AtomicU64,
+            first_emit_time: parking_lot::Mutex<Option<Instant>>,
+        }
+
+        impl TimingEmitter {
+            fn new() -> Self {
+                Self {
+                    count: AtomicU64::new(0),
+                    first_emit_time: parking_lot::Mutex::new(None),
+                }
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl crate::emit::Emitter for TimingEmitter {
+            fn name(&self) -> &'static str {
+                "timing"
+            }
+
+            async fn emit(
+                &self,
+                events: &[crate::proto::Event],
+            ) -> Result<(), crate::error::PluginError> {
+                self.count.fetch_add(events.len() as u64, Ordering::SeqCst);
+                let mut first = self.first_emit_time.lock();
+                if first.is_none() {
+                    *first = Some(Instant::now());
+                }
+                Ok(())
+            }
+
+            async fn health(&self) -> bool {
+                true
+            }
+        }
+
+        let emitter = Arc::new(TimingEmitter::new());
+
+        // Long flush interval (1 second) - inline flush should beat this
+        // Small batch size (10) - should trigger inline flush quickly
+        let hub = Hub::new()
+            .batch_size(10)
+            .flush_interval_ms(1000) // 1 second - way too slow if we wait for timer
+            .emitter_arc(emitter.clone());
+
+        let (sender, runner) = hub.build();
+        let start = Instant::now();
+
+        // Spawn runner
+        let runner_handle = tokio::spawn(async move { runner.run().await });
+
+        // Send exactly batch_size messages
+        for i in 0..10 {
+            let msg = Message::new("test", format!("evt-{i}"), Bytes::new());
+            sender.send(msg).await.expect("send should work");
+        }
+
+        // Wait a bit for inline flush to trigger (should be < 100ms)
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Check if messages were emitted
+        let emitted = emitter.count.load(Ordering::SeqCst);
+
+        // Drop sender to shutdown
+        drop(sender);
+        let _ = runner_handle.await;
+
+        // With inline flush: messages should be emitted within ~100ms
+        // Without inline flush: would take 1000ms (the flush interval)
+        let first_emit = emitter.first_emit_time.lock();
+        let emit_latency = first_emit.map(|t| t.duration_since(start));
+
+        assert!(
+            emitted >= 10,
+            "Expected at least 10 messages emitted, got {}",
+            emitted
+        );
+
+        assert!(
+            emit_latency.map(|d| d.as_millis() < 500).unwrap_or(false),
+            "Expected emit within 500ms, but took {:?} (inline flush not working)",
+            emit_latency
+        );
     }
 }
