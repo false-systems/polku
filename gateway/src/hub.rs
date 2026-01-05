@@ -40,6 +40,8 @@ use tracing::{debug, error, info, warn};
 pub struct Hub {
     /// Buffer capacity
     buffer_capacity: usize,
+    /// Input channel capacity (mpsc buffer before middleware)
+    channel_capacity: usize,
     /// Flush batch size (messages per flush)
     batch_size: usize,
     /// Flush interval in milliseconds
@@ -55,6 +57,7 @@ impl Hub {
     pub fn new() -> Self {
         Self {
             buffer_capacity: 10_000,
+            channel_capacity: 8192, // Higher default for better throughput
             batch_size: 100,
             flush_interval_ms: 10,
             middleware: MiddlewareChain::new(),
@@ -86,6 +89,18 @@ impl Hub {
     /// Default is 10,000 messages.
     pub fn buffer_capacity(mut self, capacity: usize) -> Self {
         self.buffer_capacity = capacity;
+        self
+    }
+
+    /// Set the input channel capacity
+    ///
+    /// This controls the mpsc channel buffer between send() and the
+    /// middleware/buffer. Higher values allow more messages to queue
+    /// before backpressure kicks in, improving burst handling.
+    ///
+    /// Default is 8,192 messages.
+    pub fn channel_capacity(mut self, capacity: usize) -> Self {
+        self.channel_capacity = capacity;
         self
     }
 
@@ -122,7 +137,7 @@ impl Hub {
     /// Returns a sender that can be used to inject messages into the pipeline.
     /// This is useful for custom inputs or testing.
     pub fn build(self) -> (MessageSender, HubRunner) {
-        let (tx, rx) = mpsc::channel(1024);
+        let (tx, rx) = mpsc::channel(self.channel_capacity);
 
         let sender = MessageSender { tx };
 
@@ -290,7 +305,9 @@ fn partition_by_destination(
         let broadcast = event.route_to.is_empty();
 
         for emitter in emitters {
-            // Check routing first to avoid unnecessary HashMap lookup
+            // Check routing first to avoid unnecessary HashMap lookup.
+            // Intentionally nested: routing check is cheap, HashMap lookup is not.
+            #[allow(clippy::collapsible_if)]
             if broadcast || event.route_to.iter().any(|r| r == emitter.name()) {
                 if let Some(batch) = batches.get_mut(emitter.name()) {
                     batch.push(idx);
