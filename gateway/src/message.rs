@@ -488,8 +488,8 @@ mod tests {
         // - Clone cost: O(1) for id/source/type (vs String clones)
 
         assert!(
-            message_size <= 168,
-            "Message size {} exceeds 168 byte limit",
+            message_size <= 160,
+            "Message size {} exceeds 160 byte limit",
             message_size
         );
     }
