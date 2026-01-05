@@ -46,13 +46,16 @@ axum = "0.8"
 
 # Utils
 parking_lot = "0.12"
+crossbeam-queue = "0.3"
 ulid = "1"
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+zstd = "0.13"
 
 [build-dependencies]
 tonic-build = "0.12"
+prost-build = "0.13"
 
 [features]
 # Empty feature for sykli CI compatibility

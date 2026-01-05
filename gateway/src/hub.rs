@@ -264,6 +264,44 @@ impl HubRunner {
     }
 }
 
+/// Partition events by destination in a single pass
+///
+/// Returns a HashMap where keys are emitter names and values are indices
+/// into the events slice. This avoids cloning events for each emitter.
+///
+/// # Performance
+///
+/// - Single pass over events: O(events × emitters) comparisons
+/// - No cloning - just stores indices
+/// - Each emitter gets a Vec of indices to its routed events
+fn partition_by_destination(
+    events: &[crate::proto::Event],
+    emitters: &[Arc<dyn Emitter>],
+) -> std::collections::HashMap<&'static str, Vec<usize>>
+{
+    let mut batches: std::collections::HashMap<&'static str, Vec<usize>> = std::collections::HashMap::new();
+
+    // Pre-allocate for each emitter
+    for emitter in emitters {
+        batches.insert(emitter.name(), Vec::with_capacity(events.len() / emitters.len()));
+    }
+
+    // Single pass: assign each event to its destinations
+    for (idx, event) in events.iter().enumerate() {
+        let broadcast = event.route_to.is_empty();
+
+        for emitter in emitters {
+            if broadcast || event.route_to.iter().any(|r| r == emitter.name()) {
+                if let Some(batch) = batches.get_mut(emitter.name()) {
+                    batch.push(idx);
+                }
+            }
+        }
+    }
+
+    batches
+}
+
 /// Background flush loop - sends buffered messages to emitters
 ///
 /// When shutdown is signaled, drains the buffer completely before exiting.
@@ -307,18 +345,19 @@ async fn flush_loop(
             .map(crate::proto::Event::from)
             .collect();
 
-        // Send to all emitters (fan-out)
-        for emitter in &emitters {
-            // Check routing
-            let routed_events: Vec<_> = events
-                .iter()
-                .filter(|e| e.route_to.is_empty() || e.route_to.iter().any(|r| r == emitter.name()))
-                .cloned()
-                .collect();
+        // Partition events by destination in a single pass
+        // This replaces O(emitters × events) clones with O(events) index lookups
+        let batches = partition_by_destination(&events, &emitters);
 
-            if routed_events.is_empty() {
-                continue;
-            }
+        // Send pre-partitioned batches to each emitter
+        for emitter in &emitters {
+            let indices = match batches.get(emitter.name()) {
+                Some(idx) if !idx.is_empty() => idx,
+                _ => continue,
+            };
+
+            // Collect events for this emitter (one allocation per emitter, not per event)
+            let routed_events: Vec<_> = indices.iter().map(|&i| events[i].clone()).collect();
 
             if let Err(e) = emitter.emit(&routed_events).await {
                 error!(
@@ -557,5 +596,123 @@ mod tests {
             100,
             "Graceful shutdown should drain all buffered messages"
         );
+    }
+
+    // ========================================================================
+    // Partition by destination tests
+    // ========================================================================
+
+    /// Named emitter for testing routing
+    struct NamedEmitter {
+        name: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::emit::Emitter for NamedEmitter {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        async fn emit(&self, _: &[crate::proto::Event]) -> Result<(), crate::error::PluginError> {
+            Ok(())
+        }
+        async fn health(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_partition_broadcast_messages() {
+        // 3 emitters
+        let emitters: Vec<Arc<dyn crate::emit::Emitter>> = vec![
+            Arc::new(NamedEmitter { name: "kafka" }),
+            Arc::new(NamedEmitter { name: "stdout" }),
+            Arc::new(NamedEmitter { name: "webhook" }),
+        ];
+
+        // 5 broadcast messages (empty route_to = goes everywhere)
+        let events: Vec<crate::proto::Event> = (0..5)
+            .map(|i| crate::proto::Event {
+                id: format!("msg-{i}"),
+                route_to: vec![], // broadcast
+                ..Default::default()
+            })
+            .collect();
+
+        let batches = partition_by_destination(&events, &emitters);
+
+        // Each emitter should get all 5 messages
+        assert_eq!(batches.get("kafka").map(|v| v.len()), Some(5));
+        assert_eq!(batches.get("stdout").map(|v| v.len()), Some(5));
+        assert_eq!(batches.get("webhook").map(|v| v.len()), Some(5));
+    }
+
+    #[test]
+    fn test_partition_targeted_messages() {
+        let emitters: Vec<Arc<dyn crate::emit::Emitter>> = vec![
+            Arc::new(NamedEmitter { name: "kafka" }),
+            Arc::new(NamedEmitter { name: "stdout" }),
+            Arc::new(NamedEmitter { name: "webhook" }),
+        ];
+
+        // Mixed routing:
+        // - msg-0: kafka only
+        // - msg-1: stdout only
+        // - msg-2: kafka + webhook
+        // - msg-3: broadcast (empty)
+        let events = vec![
+            crate::proto::Event {
+                id: "msg-0".into(),
+                route_to: vec!["kafka".into()],
+                ..Default::default()
+            },
+            crate::proto::Event {
+                id: "msg-1".into(),
+                route_to: vec!["stdout".into()],
+                ..Default::default()
+            },
+            crate::proto::Event {
+                id: "msg-2".into(),
+                route_to: vec!["kafka".into(), "webhook".into()],
+                ..Default::default()
+            },
+            crate::proto::Event {
+                id: "msg-3".into(),
+                route_to: vec![], // broadcast
+                ..Default::default()
+            },
+        ];
+
+        let batches = partition_by_destination(&events, &emitters);
+
+        // kafka: msg-0, msg-2, msg-3 (indices 0, 2, 3)
+        let kafka_indices = batches.get("kafka").unwrap();
+        assert_eq!(kafka_indices, &[0, 2, 3]);
+
+        // stdout: msg-1, msg-3 (indices 1, 3)
+        let stdout_indices = batches.get("stdout").unwrap();
+        assert_eq!(stdout_indices, &[1, 3]);
+
+        // webhook: msg-2, msg-3 (indices 2, 3)
+        let webhook_indices = batches.get("webhook").unwrap();
+        assert_eq!(webhook_indices, &[2, 3]);
+    }
+
+    #[test]
+    fn test_partition_no_matching_route() {
+        let emitters: Vec<Arc<dyn crate::emit::Emitter>> = vec![
+            Arc::new(NamedEmitter { name: "kafka" }),
+        ];
+
+        // Message routed to non-existent emitter
+        let events = vec![crate::proto::Event {
+            id: "msg-0".into(),
+            route_to: vec!["nonexistent".into()],
+            ..Default::default()
+        }];
+
+        let batches = partition_by_destination(&events, &emitters);
+
+        // kafka should get nothing (route_to doesn't match)
+        assert_eq!(batches.get("kafka").map(|v| v.len()), Some(0));
     }
 }

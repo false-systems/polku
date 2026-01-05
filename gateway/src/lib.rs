@@ -18,6 +18,9 @@
 #![warn(clippy::panic)]
 
 pub mod buffer;
+pub mod buffer_lockfree;
+pub mod buffer_tiered;
+pub mod checkpoint;
 pub mod config;
 pub mod emit;
 pub mod error;
@@ -25,6 +28,7 @@ pub mod hub;
 pub mod ingest;
 pub mod message;
 pub mod metrics;
+pub mod shared_message;
 pub mod metrics_server;
 pub mod middleware;
 pub mod registry;
@@ -61,3 +65,4 @@ pub use middleware::{
 };
 pub use proto::Event;
 pub use registry::PluginRegistry;
+pub use checkpoint::{CheckpointStore, MemoryCheckpointStore};
