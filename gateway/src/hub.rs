@@ -18,7 +18,7 @@
 //!     .await?;
 //! ```
 
-use crate::buffer::RingBuffer;
+use crate::buffer_lockfree::LockFreeBuffer;
 use crate::emit::Emitter;
 use crate::error::PluginError;
 use crate::message::Message;
@@ -35,7 +35,7 @@ use tracing::{debug, error, info, warn};
 /// # Architecture
 ///
 /// ```text
-/// Input Channels ──► MiddlewareChain ──► RingBuffer ──► Outputs (fan-out)
+/// Input Channels ──► MiddlewareChain ──► LockFreeBuffer ──► Outputs (fan-out)
 /// ```
 pub struct Hub {
     /// Buffer capacity
@@ -128,7 +128,7 @@ impl Hub {
 
         let runner = HubRunner {
             rx,
-            buffer: Arc::new(RingBuffer::new(self.buffer_capacity)),
+            buffer: Arc::new(LockFreeBuffer::new(self.buffer_capacity)),
             batch_size: self.batch_size,
             flush_interval_ms: self.flush_interval_ms,
             middleware: self.middleware,
@@ -171,7 +171,7 @@ impl MessageSender {
 /// Hub runner - processes messages through the pipeline
 pub struct HubRunner {
     rx: mpsc::Receiver<Message>,
-    buffer: Arc<RingBuffer>,
+    buffer: Arc<LockFreeBuffer>,
     batch_size: usize,
     flush_interval_ms: u64,
     middleware: MiddlewareChain,
@@ -228,12 +228,11 @@ impl HubRunner {
 
             if let Some(msg) = processed {
                 debug!(id = %msg.id, "Message buffered");
-                let dropped = self.buffer.push(vec![msg]);
-                if dropped > 0 {
-                    warn!(dropped = dropped, "Buffer overflow, messages dropped");
+                if !self.buffer.push(msg) {
+                    warn!("Buffer overflow, message dropped");
                     // Record dropped due to buffer overflow
                     if let Some(metrics) = Metrics::get() {
-                        metrics.record_dropped("buffer_overflow", dropped as u64);
+                        metrics.record_dropped("buffer_overflow", 1);
                     }
                 }
             } else {
@@ -259,7 +258,7 @@ impl HubRunner {
     }
 
     /// Get a reference to the buffer for monitoring
-    pub fn buffer(&self) -> &Arc<RingBuffer> {
+    pub fn buffer(&self) -> &Arc<LockFreeBuffer> {
         &self.buffer
     }
 }
@@ -291,6 +290,7 @@ fn partition_by_destination(
         let broadcast = event.route_to.is_empty();
 
         for emitter in emitters {
+            // Check routing first to avoid unnecessary HashMap lookup
             if broadcast || event.route_to.iter().any(|r| r == emitter.name()) {
                 if let Some(batch) = batches.get_mut(emitter.name()) {
                     batch.push(idx);
@@ -306,7 +306,7 @@ fn partition_by_destination(
 ///
 /// When shutdown is signaled, drains the buffer completely before exiting.
 async fn flush_loop(
-    buffer: Arc<RingBuffer>,
+    buffer: Arc<LockFreeBuffer>,
     emitters: Vec<Arc<dyn Emitter>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     batch_size: usize,
@@ -346,7 +346,8 @@ async fn flush_loop(
             .collect();
 
         // Partition events by destination in a single pass
-        // This replaces O(emitters × events) clones with O(events) index lookups
+        // This avoids repeated per-emitter filtering and allows batch allocation
+        // instead of per-event allocation, improving cache locality
         let batches = partition_by_destination(&events, &emitters);
 
         // Send pre-partitioned batches to each emitter
