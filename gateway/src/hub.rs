@@ -274,14 +274,12 @@ impl HubRunner {
 /// - Single pass over events: O(events × emitters) comparisons
 /// - No cloning - just stores indices
 /// - Each emitter gets a Vec of indices to its routed events
-fn partition_by_destination<'a>(
+fn partition_by_destination(
     events: &[crate::proto::Event],
     emitters: &[Arc<dyn Emitter>],
-) -> std::collections::HashMap<&'a str, Vec<usize>>
-where
-    'a: 'static,
+) -> std::collections::HashMap<&'static str, Vec<usize>>
 {
-    let mut batches: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+    let mut batches: std::collections::HashMap<&'static str, Vec<usize>> = std::collections::HashMap::new();
 
     // Pre-allocate for each emitter
     for emitter in emitters {
