@@ -359,7 +359,7 @@ mod tests {
                 let source = format!("source-{}", i);
                 let mut passed = 0;
                 for _ in 0..10 {
-                    let msg = Message::new(&source, "evt", Bytes::new());
+                    let msg = Message::new(source.as_str(), "evt", Bytes::new());
                     if throttle.process(msg).await.is_some() {
                         passed += 1;
                     }

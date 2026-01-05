@@ -194,7 +194,7 @@ mod tests {
         // No other references - should not clone
         {
             let inner = shared.make_mut();
-            inner.source = "modified".to_string();
+            inner.source = "modified".into();
         }
 
         assert_eq!(shared.source, "modified");

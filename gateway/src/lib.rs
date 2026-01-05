@@ -26,6 +26,7 @@ pub mod emit;
 pub mod error;
 pub mod hub;
 pub mod ingest;
+pub mod intern;
 pub mod message;
 pub mod metrics;
 pub mod metrics_server;
@@ -48,6 +49,7 @@ pub mod proto {
 }
 
 pub use checkpoint::{CheckpointStore, MemoryCheckpointStore};
+pub use intern::InternedStr;
 pub use config::Config;
 pub use emit::resilience::{
     BackoffConfig, CircuitBreakerConfig, CircuitBreakerEmitter, CircuitState, FailedEvent,

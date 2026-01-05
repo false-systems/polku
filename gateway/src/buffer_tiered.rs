@@ -122,7 +122,7 @@ impl TieredBuffer {
                     &msg.id,
                     msg.timestamp,
                     "compressed",
-                    &msg.message_type,
+                    msg.message_type,
                     compressed.data.clone(),
                 );
                 if self.secondary.push(wrapper) {
@@ -294,8 +294,8 @@ impl TieredBuffer {
         Some(Message {
             id,
             timestamp,
-            source,
-            message_type,
+            source: source.into(),
+            message_type: message_type.into(),
             payload,
             metadata,
             route_to,

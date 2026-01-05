@@ -172,8 +172,8 @@ impl Aggregator {
         Message {
             id: ulid::Ulid::new().to_string(),
             timestamp: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
-            source,
-            message_type: format!("{}.aggregate", first.message_type),
+            source: source.into(),
+            message_type: format!("{}.aggregate", first.message_type).into(),
             metadata,
             payload,
             route_to: routes,

@@ -60,6 +60,7 @@ zstd = "0.13"
 
 # Optional: memory profiling
 dhat = { version = "0.3", optional = true }
+lasso = { version = "0.7.3", features = ["multi-threaded"] }
 
 [build-dependencies]
 tonic-build = "0.12"

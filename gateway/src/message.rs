@@ -16,7 +16,15 @@
 //! Output A        Output B        Output C
 //! (all share same underlying bytes - no copies!)
 //! ```
+//!
+//! # String Interning
+//!
+//! `source` and `message_type` use interned strings for efficient cloning.
+//! When the same string is used across multiple messages, it's stored once
+//! and shared via a small integer key. This reduces memory usage and makes
+//! `Message::clone()` much faster.
 
+use crate::intern::InternedStr;
 use bytes::Bytes;
 use std::collections::HashMap;
 
@@ -41,10 +49,14 @@ pub struct Message {
     pub timestamp: i64,
 
     /// Origin identifier (e.g., service name, agent ID)
-    pub source: String,
+    ///
+    /// Uses string interning - cloning is O(1) regardless of string length.
+    pub source: InternedStr,
 
     /// User-defined message type (e.g., "user.created", "order.shipped")
-    pub message_type: String,
+    ///
+    /// Uses string interning - cloning is O(1) regardless of string length.
+    pub message_type: InternedStr,
 
     /// Headers and context (propagated through the pipeline)
     pub metadata: HashMap<String, String>,
@@ -69,7 +81,7 @@ impl Message {
     /// * `source` - Origin identifier
     /// * `message_type` - User-defined type
     /// * `payload` - Message payload (use `Bytes::from()` to convert)
-    pub fn new(source: impl Into<String>, message_type: impl Into<String>, payload: Bytes) -> Self {
+    pub fn new(source: impl Into<InternedStr>, message_type: impl Into<InternedStr>, payload: Bytes) -> Self {
         Self {
             id: ulid::Ulid::new().to_string(),
             timestamp: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
@@ -85,8 +97,8 @@ impl Message {
     pub fn with_id(
         id: impl Into<String>,
         timestamp: i64,
-        source: impl Into<String>,
-        message_type: impl Into<String>,
+        source: impl Into<InternedStr>,
+        message_type: impl Into<InternedStr>,
         payload: Bytes,
     ) -> Self {
         Self {
@@ -158,8 +170,8 @@ impl From<crate::proto::Event> for Message {
         Self {
             id: event.id,
             timestamp: event.timestamp_unix_ns,
-            source: event.source,
-            message_type: event.event_type,
+            source: event.source.into(),
+            message_type: event.event_type.into(),
             metadata: event.metadata,
             payload: Bytes::from(event.payload),
             route_to: event.route_to,
@@ -173,11 +185,11 @@ impl From<Message> for crate::proto::Event {
         Self {
             id: msg.id,
             timestamp_unix_ns: msg.timestamp,
-            source: msg.source,
-            event_type: msg.message_type,
+            source: msg.source.into(),
+            event_type: msg.message_type.into(),
             metadata: msg.metadata,
             payload: msg.payload.to_vec(),
-            route_to: msg.route_to,
+            route_to: msg.route_to.into(),
         }
     }
 }
