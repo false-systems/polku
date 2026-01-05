@@ -82,7 +82,7 @@ impl Middleware for Router {
     async fn process(&self, mut msg: Message) -> Option<Message> {
         for rule in &self.rules {
             if let Some(targets) = rule(&msg) {
-                msg.route_to = targets;
+                msg.route_to = smallvec::SmallVec::from_vec(targets);
                 tracing::debug!(
                     id = %msg.id,
                     routes = ?msg.route_to,
@@ -122,7 +122,7 @@ mod tests {
         let msg = Message::new("src", "evt", Bytes::new());
         let result = router.process(msg).await.unwrap();
 
-        assert_eq!(result.route_to, vec!["first".to_string()]);
+        assert_eq!(result.route_to.as_slice(), &["first".to_string()]);
     }
 
     #[tokio::test]
@@ -135,17 +135,17 @@ mod tests {
         // Error goes to alerts
         let msg = Message::new("src", "error.critical", Bytes::new());
         let result = router.process(msg).await.unwrap();
-        assert_eq!(result.route_to, vec!["alerts".to_string()]);
+        assert_eq!(result.route_to.as_slice(), &["alerts".to_string()]);
 
         // Metric goes to metrics
         let msg = Message::new("src", "metric.cpu", Bytes::new());
         let result = router.process(msg).await.unwrap();
-        assert_eq!(result.route_to, vec!["metrics".to_string()]);
+        assert_eq!(result.route_to.as_slice(), &["metrics".to_string()]);
 
         // Unknown goes to default
         let msg = Message::new("src", "other.event", Bytes::new());
         let result = router.process(msg).await.unwrap();
-        assert_eq!(result.route_to, vec!["default".to_string()]);
+        assert_eq!(result.route_to.as_slice(), &["default".to_string()]);
     }
 
     #[tokio::test]
@@ -156,17 +156,17 @@ mod tests {
 
         let msg = Message::new("tapio", "evt", Bytes::new());
         let result = router.process(msg).await.unwrap();
-        assert_eq!(result.route_to, vec!["ebpf-sink".to_string()]);
+        assert_eq!(result.route_to.as_slice(), &["ebpf-sink".to_string()]);
 
         let msg = Message::new("elava", "evt", Bytes::new());
         let result = router.process(msg).await.unwrap();
-        assert_eq!(result.route_to, vec!["aws-sink".to_string()]);
+        assert_eq!(result.route_to.as_slice(), &["aws-sink".to_string()]);
     }
 
     #[tokio::test]
     async fn test_router_custom_rule() {
         let router = Router::new().rule(
-            |msg| msg.metadata.get("priority") == Some(&"high".to_string()),
+            |msg| msg.metadata().get("priority") == Some(&"high".to_string()),
             vec!["priority-queue".into()],
         );
 
@@ -178,6 +178,6 @@ mod tests {
         // With priority - matches
         let msg = Message::new("src", "evt", Bytes::new()).with_metadata("priority", "high");
         let result = router.process(msg).await.unwrap();
-        assert_eq!(result.route_to, vec!["priority-queue".to_string()]);
+        assert_eq!(result.route_to.as_slice(), &["priority-queue".to_string()]);
     }
 }

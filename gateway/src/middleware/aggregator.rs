@@ -149,7 +149,7 @@ impl Aggregator {
         // Merge metadata from all messages (last message wins on conflict)
         let mut metadata: HashMap<String, String> = HashMap::new();
         for msg in &messages {
-            metadata.extend(msg.metadata.clone());
+            metadata.extend(msg.metadata().clone());
         }
         metadata.insert(
             "polku.aggregator.count".to_string(),
@@ -174,9 +174,9 @@ impl Aggregator {
             timestamp: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
             source: source.into(),
             message_type: format!("{}.aggregate", first.message_type).into(),
-            metadata,
+            metadata: Some(Box::new(metadata)),
             payload,
-            route_to: routes,
+            route_to: smallvec::SmallVec::from_vec(routes),
         }
     }
 
@@ -307,10 +307,10 @@ mod tests {
             .with_metadata("key2".to_string(), "val2".to_string());
         let result = aggregator.process(msg2).await.unwrap();
 
-        assert_eq!(result.metadata.get("key1"), Some(&"val1".to_string()));
-        assert_eq!(result.metadata.get("key2"), Some(&"val2".to_string()));
+        assert_eq!(result.metadata().get("key1"), Some(&"val1".to_string()));
+        assert_eq!(result.metadata().get("key2"), Some(&"val2".to_string()));
         assert_eq!(
-            result.metadata.get("polku.aggregator.count"),
+            result.metadata().get("polku.aggregator.count"),
             Some(&"2".to_string())
         );
     }
@@ -369,7 +369,7 @@ mod tests {
         // Flush should return combined message
         let result = aggregator.flush().unwrap();
         assert_eq!(
-            result.metadata.get("polku.aggregator.count"),
+            result.metadata().get("polku.aggregator.count"),
             Some(&"3".to_string())
         );
         assert_eq!(aggregator.pending(), 0);

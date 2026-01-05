@@ -67,10 +67,8 @@ fn profile_message_creation() {
     black_box(&messages);
     let stats_after = dhat::HeapStats::get();
 
-    let bytes_per_msg =
-        (stats_after.curr_bytes - stats_before.curr_bytes) as f64 / 1000.0;
-    let allocs_per_msg =
-        (stats_after.curr_blocks - stats_before.curr_blocks) as f64 / 1000.0;
+    let bytes_per_msg = (stats_after.curr_bytes - stats_before.curr_bytes) as f64 / 1000.0;
+    let allocs_per_msg = (stats_after.curr_blocks - stats_before.curr_blocks) as f64 / 1000.0;
 
     println!("  Bytes per message: {:.1}", bytes_per_msg);
     println!("  Allocations per message: {:.1}", allocs_per_msg);
@@ -100,8 +98,7 @@ fn profile_message_clone() {
     black_box(&clones);
     let stats_after = dhat::HeapStats::get();
 
-    let bytes_per_clone =
-        (stats_after.curr_bytes - stats_before.curr_bytes) as f64 / 1000.0;
+    let bytes_per_clone = (stats_after.curr_bytes - stats_before.curr_bytes) as f64 / 1000.0;
 
     println!("  Original payload: 1000 bytes");
     println!("  Bytes per clone: {:.1}", bytes_per_clone);
@@ -130,8 +127,7 @@ fn profile_shared_message() {
     black_box(&clones);
     let stats_after = dhat::HeapStats::get();
 
-    let bytes_per_clone =
-        (stats_after.curr_bytes - stats_before.curr_bytes) as f64 / 1000.0;
+    let bytes_per_clone = (stats_after.curr_bytes - stats_before.curr_bytes) as f64 / 1000.0;
 
     println!("  Original payload: 1000 bytes");
     println!("  Bytes per SharedMessage clone: {:.1}", bytes_per_clone);
@@ -285,9 +281,6 @@ fn profile_pipeline_simulation() {
         "  Bytes per message (amortized): {:.1}",
         (stats_after.total_bytes - stats_before.total_bytes) as f64 / 10_000.0
     );
-    println!(
-        "  Peak memory: {} bytes",
-        stats_after.max_bytes
-    );
+    println!("  Peak memory: {} bytes", stats_after.max_bytes);
     println!();
 }

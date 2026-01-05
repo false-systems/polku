@@ -133,9 +133,9 @@ impl Middleware for Validator {
                 match self.on_invalid {
                     InvalidAction::Drop => None,
                     InvalidAction::Tag => {
-                        msg.metadata
+                        msg.metadata_mut()
                             .insert("polku.validator.error".to_string(), reason);
-                        msg.metadata
+                        msg.metadata_mut()
                             .insert("polku.validator.valid".to_string(), "false".to_string());
                         Some(msg)
                     }
@@ -180,11 +180,11 @@ mod tests {
         let result = validator.process(msg).await.unwrap();
 
         assert_eq!(
-            result.metadata.get("polku.validator.error"),
+            result.metadata().get("polku.validator.error"),
             Some(&"bad data".to_string())
         );
         assert_eq!(
-            result.metadata.get("polku.validator.valid"),
+            result.metadata().get("polku.validator.valid"),
             Some(&"false".to_string())
         );
     }
@@ -263,7 +263,7 @@ mod tests {
     async fn test_validator_custom_logic() {
         // Only accept messages with "valid" in metadata
         let validator = Validator::new(|msg| {
-            if msg.metadata.contains_key("valid") {
+            if msg.metadata().contains_key("valid") {
                 ValidationResult::Valid
             } else {
                 ValidationResult::Invalid("missing 'valid' metadata".to_string())

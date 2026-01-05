@@ -193,7 +193,6 @@ impl From<InternedStr> for String {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

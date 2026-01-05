@@ -52,6 +52,7 @@ axum = "0.8"
 # Utils
 parking_lot = "0.12"
 crossbeam-queue = "0.3"
+smallvec = "1.13"
 ulid = "1"
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
