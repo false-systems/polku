@@ -69,7 +69,7 @@ impl Middleware for Enricher {
     async fn process(&self, mut msg: Message) -> Option<Message> {
         let additional = (self.enrich_fn)(&msg).await;
         for (key, value) in additional {
-            msg.metadata.insert(key, value);
+            msg.metadata_mut().insert(key, value);
         }
         Some(msg)
     }
@@ -92,7 +92,7 @@ mod tests {
         let msg = Message::new("test", "evt", Bytes::new());
         let result = enricher.process(msg).await.unwrap();
 
-        assert_eq!(result.metadata.get("enriched"), Some(&"true".to_string()));
+        assert_eq!(result.metadata().get("enriched"), Some(&"true".to_string()));
     }
 
     #[tokio::test]
@@ -106,8 +106,11 @@ mod tests {
         let msg = Message::new("test", "evt", Bytes::new());
         let result = enricher.process(msg).await.unwrap();
 
-        assert_eq!(result.metadata.get("env"), Some(&"production".to_string()));
-        assert_eq!(result.metadata.get("version"), Some(&"1.0".to_string()));
+        assert_eq!(
+            result.metadata().get("env"),
+            Some(&"production".to_string())
+        );
+        assert_eq!(result.metadata().get("version"), Some(&"1.0".to_string()));
     }
 
     #[tokio::test]
@@ -125,7 +128,7 @@ mod tests {
         let result = enricher.process(msg).await.unwrap();
 
         assert_eq!(
-            result.metadata.get("source_upper"),
+            result.metadata().get("source_upper"),
             Some(&"MY-SERVICE".to_string())
         );
     }
@@ -143,9 +146,12 @@ mod tests {
 
         let result = enricher.process(msg).await.unwrap();
 
-        assert_eq!(result.metadata.get("existing"), Some(&"value".to_string()));
         assert_eq!(
-            result.metadata.get("new_key"),
+            result.metadata().get("existing"),
+            Some(&"value".to_string())
+        );
+        assert_eq!(
+            result.metadata().get("new_key"),
             Some(&"new_value".to_string())
         );
     }
@@ -164,6 +170,6 @@ mod tests {
         let result = enricher.process(msg).await.unwrap();
 
         // New value overwrites old
-        assert_eq!(result.metadata.get("key"), Some(&"new".to_string()));
+        assert_eq!(result.metadata().get("key"), Some(&"new".to_string()));
     }
 }

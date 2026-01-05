@@ -31,9 +31,25 @@
 
 use crate::intern::InternedStr;
 use bytes::Bytes;
+use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+
+/// Type alias for route storage - inline up to 2 routes
+pub type Routes = SmallVec<[String; 2]>;
+
+/// Type alias for metadata storage - lazy allocation
+pub type Metadata = Option<Box<HashMap<String, String>>>;
+
+/// Helper to get metadata or empty map
+#[inline]
+fn metadata_ref(m: &Metadata) -> &HashMap<String, String> {
+    static EMPTY: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+    m.as_ref()
+        .map(|b| b.as_ref())
+        .unwrap_or_else(|| EMPTY.get_or_init(HashMap::new))
+}
 
 /// Compact message identifier (16 bytes instead of 26-char string)
 ///
@@ -208,7 +224,9 @@ pub struct Message {
     pub message_type: InternedStr,
 
     /// Headers and context (propagated through the pipeline)
-    pub metadata: HashMap<String, String>,
+    ///
+    /// Lazily allocated - None when empty to save 48 bytes per message.
+    pub metadata: Metadata,
 
     /// Opaque payload - zero-copy via Bytes
     ///
@@ -220,7 +238,8 @@ pub struct Message {
     ///
     /// If empty, message goes to all outputs.
     /// If specified, only matching outputs receive it.
-    pub route_to: Vec<String>,
+    /// Uses SmallVec to inline up to 2 routes (most common case).
+    pub route_to: Routes,
 }
 
 impl Message {
@@ -230,15 +249,19 @@ impl Message {
     /// * `source` - Origin identifier
     /// * `message_type` - User-defined type
     /// * `payload` - Message payload (use `Bytes::from()` to convert)
-    pub fn new(source: impl Into<InternedStr>, message_type: impl Into<InternedStr>, payload: Bytes) -> Self {
+    pub fn new(
+        source: impl Into<InternedStr>,
+        message_type: impl Into<InternedStr>,
+        payload: Bytes,
+    ) -> Self {
         Self {
             id: MessageId::new(),
             timestamp: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
             source: source.into(),
             message_type: message_type.into(),
-            metadata: HashMap::new(),
+            metadata: None,
             payload,
-            route_to: Vec::new(),
+            route_to: SmallVec::new(),
         }
     }
 
@@ -255,9 +278,9 @@ impl Message {
             timestamp,
             source: source.into(),
             message_type: message_type.into(),
-            metadata: HashMap::new(),
+            metadata: None,
             payload,
-            route_to: Vec::new(),
+            route_to: SmallVec::new(),
         }
     }
 
@@ -273,8 +296,23 @@ impl Message {
     ///     .with_metadata("tenant", "acme");
     /// ```
     pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.metadata.insert(key.into(), value.into());
+        self.metadata
+            .get_or_insert_with(|| Box::new(HashMap::new()))
+            .insert(key.into(), value.into());
         self
+    }
+
+    /// Get metadata reference (returns empty map if None)
+    #[inline]
+    pub fn metadata(&self) -> &HashMap<String, String> {
+        metadata_ref(&self.metadata)
+    }
+
+    /// Get mutable metadata, allocating if needed
+    #[inline]
+    pub fn metadata_mut(&mut self) -> &mut HashMap<String, String> {
+        self.metadata
+            .get_or_insert_with(|| Box::new(HashMap::new()))
     }
 
     /// Set routing targets
@@ -288,8 +326,8 @@ impl Message {
     /// let msg = Message::new("svc", "evt", Bytes::new())
     ///     .with_routes(vec!["kafka".into(), "metrics".into()]);
     /// ```
-    pub fn with_routes(mut self, routes: Vec<String>) -> Self {
-        self.route_to = routes;
+    pub fn with_routes(mut self, routes: impl Into<Routes>) -> Self {
+        self.route_to = routes.into();
         self
     }
 
@@ -321,9 +359,13 @@ impl From<crate::proto::Event> for Message {
             timestamp: event.timestamp_unix_ns,
             source: event.source.into(),
             message_type: event.event_type.into(),
-            metadata: event.metadata,
+            metadata: if event.metadata.is_empty() {
+                None
+            } else {
+                Some(Box::new(event.metadata))
+            },
             payload: Bytes::from(event.payload),
-            route_to: event.route_to,
+            route_to: SmallVec::from_vec(event.route_to),
         }
     }
 }
@@ -336,9 +378,9 @@ impl From<Message> for crate::proto::Event {
             timestamp_unix_ns: msg.timestamp,
             source: msg.source.into(),
             event_type: msg.message_type.into(),
-            metadata: msg.metadata,
+            metadata: msg.metadata.map(|b| *b).unwrap_or_default(),
             payload: msg.payload.to_vec(),
-            route_to: msg.route_to.into(),
+            route_to: msg.route_to.into_vec(),
         }
     }
 }
@@ -367,8 +409,8 @@ mod tests {
             .with_metadata("trace_id", "abc-123")
             .with_metadata("tenant", "acme");
 
-        assert_eq!(msg.metadata.get("trace_id"), Some(&"abc-123".to_string()));
-        assert_eq!(msg.metadata.get("tenant"), Some(&"acme".to_string()));
+        assert_eq!(msg.metadata().get("trace_id"), Some(&"abc-123".to_string()));
+        assert_eq!(msg.metadata().get("tenant"), Some(&"acme".to_string()));
     }
 
     #[test]
@@ -427,6 +469,29 @@ mod tests {
         assert_eq!(back.id, msg.id);
         assert_eq!(back.source, msg.source);
         assert_eq!(back.message_type, msg.message_type);
+    }
+
+    #[test]
+    fn test_message_size() {
+        // Track Message size for memory optimization
+        let message_size = std::mem::size_of::<Message>();
+
+        // Memory layout optimizations applied:
+        // - MessageId: binary 16-byte ULID + hash (32 bytes, Copy)
+        // - source/type: InternedStr (4 bytes each, Copy)
+        // - metadata: Option<Box<HashMap>> (8 bytes, lazy allocation)
+        // - route_to: SmallVec<[String; 2]> (64 bytes, inline for 0-2 routes)
+        //
+        // Key savings vs old layout:
+        // - Metadata heap: 0 bytes when empty (vs 48 byte HashMap overhead)
+        // - Routes heap: 0 bytes for ≤2 routes (vs Vec allocation)
+        // - Clone cost: O(1) for id/source/type (vs String clones)
+
+        assert!(
+            message_size <= 160,
+            "Message size {} exceeds 160 byte limit",
+            message_size
+        );
     }
 
     #[test]

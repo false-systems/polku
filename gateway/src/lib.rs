@@ -49,7 +49,6 @@ pub mod proto {
 }
 
 pub use checkpoint::{CheckpointStore, MemoryCheckpointStore};
-pub use intern::InternedStr;
 pub use config::Config;
 pub use emit::resilience::{
     BackoffConfig, CircuitBreakerConfig, CircuitBreakerEmitter, CircuitState, FailedEvent,
@@ -59,6 +58,7 @@ pub use emit::{Emitter, GrpcEmitter, StdoutEmitter, WebhookEmitter};
 pub use error::{PluginError, PolkuError, Result};
 pub use hub::{Hub, HubRunner, MessageSender};
 pub use ingest::{IngestContext, Ingestor};
+pub use intern::InternedStr;
 pub use message::{Message, MessageId};
 pub use metrics_server::MetricsServer;
 pub use middleware::{

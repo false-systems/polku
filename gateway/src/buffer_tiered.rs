@@ -217,8 +217,9 @@ impl TieredBuffer {
         buf.extend_from_slice(&msg.timestamp.to_le_bytes());
 
         // Metadata: count(4) + entries
-        buf.extend_from_slice(&(msg.metadata.len() as u32).to_le_bytes());
-        for (k, v) in &msg.metadata {
+        let metadata = msg.metadata();
+        buf.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
+        for (k, v) in metadata {
             write_str(&mut buf, k);
             write_str(&mut buf, v);
         }
@@ -297,8 +298,12 @@ impl TieredBuffer {
             source: source.into(),
             message_type: message_type.into(),
             payload,
-            metadata,
-            route_to,
+            metadata: if metadata.is_empty() {
+                None
+            } else {
+                Some(Box::new(metadata))
+            },
+            route_to: smallvec::SmallVec::from_vec(route_to),
         })
     }
 
@@ -434,12 +439,12 @@ mod tests {
             Bytes::from(b"hello world payload".to_vec()),
         );
         original
-            .metadata
+            .metadata_mut()
             .insert("trace_id".to_string(), "abc-123".to_string());
         original
-            .metadata
+            .metadata_mut()
             .insert("tenant".to_string(), "acme".to_string());
-        original.route_to = vec!["kafka".to_string(), "webhook".to_string()];
+        original.route_to = smallvec::smallvec!["kafka".to_string(), "webhook".to_string()];
 
         // Push twice - first goes to primary, second overflows (compressed)
         buffer.push(original.clone());
@@ -458,12 +463,17 @@ mod tests {
         assert_eq!(recovered.payload, original.payload);
         // Verify metadata preserved through compression
         assert_eq!(
-            recovered.metadata.get("trace_id"),
+            recovered.metadata().get("trace_id"),
             Some(&"abc-123".to_string())
         );
-        assert_eq!(recovered.metadata.get("tenant"), Some(&"acme".to_string()));
+        assert_eq!(
+            recovered.metadata().get("tenant"),
+            Some(&"acme".to_string())
+        );
         // Verify routes preserved through compression
-        assert_eq!(recovered.route_to, vec!["kafka", "webhook"]);
+        assert_eq!(recovered.route_to.len(), 2);
+        assert_eq!(recovered.route_to[0], "kafka");
+        assert_eq!(recovered.route_to[1], "webhook");
     }
 
     #[test]

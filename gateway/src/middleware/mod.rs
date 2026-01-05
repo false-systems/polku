@@ -257,7 +257,8 @@ mod tests {
     #[tokio::test]
     async fn test_transform() {
         let transform = Transform::new(|mut msg: Message| {
-            msg.metadata.insert("transformed".into(), "yes".into());
+            msg.metadata_mut()
+                .insert("transformed".into(), "yes".into());
             msg
         });
 
@@ -266,7 +267,7 @@ mod tests {
 
         assert!(result.is_some());
         let msg = result.expect("should have message");
-        assert_eq!(msg.metadata.get("transformed"), Some(&"yes".to_string()));
+        assert_eq!(msg.metadata().get("transformed"), Some(&"yes".to_string()));
     }
 
     #[tokio::test]
@@ -275,7 +276,7 @@ mod tests {
 
         // First: add metadata
         chain.add(Transform::new(|mut msg: Message| {
-            msg.metadata.insert("step1".into(), "done".into());
+            msg.metadata_mut().insert("step1".into(), "done".into());
             msg
         }));
 
@@ -284,7 +285,7 @@ mod tests {
 
         // Third: add more metadata
         chain.add(Transform::new(|mut msg: Message| {
-            msg.metadata.insert("step2".into(), "done".into());
+            msg.metadata_mut().insert("step2".into(), "done".into());
             msg
         }));
 
@@ -293,8 +294,8 @@ mod tests {
 
         assert!(result.is_some());
         let msg = result.expect("should have message");
-        assert_eq!(msg.metadata.get("step1"), Some(&"done".to_string()));
-        assert_eq!(msg.metadata.get("step2"), Some(&"done".to_string()));
+        assert_eq!(msg.metadata().get("step1"), Some(&"done".to_string()));
+        assert_eq!(msg.metadata().get("step2"), Some(&"done".to_string()));
     }
 
     #[tokio::test]
@@ -303,7 +304,7 @@ mod tests {
 
         // First: add metadata
         chain.add(Transform::new(|mut msg: Message| {
-            msg.metadata.insert("step1".into(), "done".into());
+            msg.metadata_mut().insert("step1".into(), "done".into());
             msg
         }));
 
@@ -312,7 +313,7 @@ mod tests {
 
         // Third: should never run
         chain.add(Transform::new(|mut msg: Message| {
-            msg.metadata.insert("step2".into(), "done".into());
+            msg.metadata_mut().insert("step2".into(), "done".into());
             msg
         }));
 
