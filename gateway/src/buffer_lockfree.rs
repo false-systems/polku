@@ -11,9 +11,9 @@
 //!
 //! # Design
 //!
-//! Uses ArrayQueue from crossbeam for bounded MPSC. When full, oldest messages
-//! are dropped (overflow semantics). This is the correct tradeoff for
-//! observability: losing old data is better than blocking the pipeline.
+//! Uses ArrayQueue from crossbeam for bounded MPSC. When full, new incoming
+//! messages are dropped and existing (older) messages are retained. This
+//! avoids blocking the pipeline while preserving buffered data.
 //!
 //! # Variants
 //!
@@ -32,16 +32,22 @@ use std::sync::Arc;
 /// - Lock-free push/pop operations
 /// - Bounded capacity (no unbounded growth)
 /// - MPSC semantics (multiple producers, single consumer)
+///
+/// Cloning a buffer creates a new handle to the same underlying queue
+/// and metrics - all clones share the same counters for accurate totals.
 pub struct LockFreeBuffer {
     /// The underlying lock-free queue
     queue: Arc<ArrayQueue<Message>>,
     /// Capacity
     capacity: usize,
-    /// Metrics
-    metrics: BufferMetrics,
+    /// Metrics (shared across clones)
+    metrics: Arc<BufferMetrics>,
 }
 
 /// Metrics for buffer monitoring
+///
+/// Wrapped in Arc and shared across all cloned buffer handles,
+/// so metrics reflect the global state across all producers/consumers.
 pub struct BufferMetrics {
     /// Total messages pushed successfully
     pub pushed: AtomicU64,
@@ -69,7 +75,7 @@ impl LockFreeBuffer {
         Self {
             queue: Arc::new(ArrayQueue::new(capacity)),
             capacity,
-            metrics: BufferMetrics::default(),
+            metrics: Arc::new(BufferMetrics::default()),
         }
     }
 
@@ -154,13 +160,13 @@ impl LockFreeBuffer {
     }
 }
 
-// Allow cloning the buffer handle (shares the underlying queue)
+// Allow cloning the buffer handle (shares queue AND metrics)
 impl Clone for LockFreeBuffer {
     fn clone(&self) -> Self {
         Self {
             queue: Arc::clone(&self.queue),
             capacity: self.capacity,
-            metrics: BufferMetrics::default(), // New metrics handle
+            metrics: Arc::clone(&self.metrics), // Share metrics across clones
         }
     }
 }
@@ -185,10 +191,12 @@ impl Clone for LockFreeBuffer {
 ///
 /// Push/pop are still lock-free. The only overhead vs `LockFreeBuffer`
 /// is the Arc refcount operations (a few nanoseconds per operation).
+///
+/// Cloning shares both the queue and metrics across all handles.
 pub struct SharedBuffer {
     queue: Arc<ArrayQueue<SharedMessage>>,
     capacity: usize,
-    metrics: BufferMetrics,
+    metrics: Arc<BufferMetrics>,
 }
 
 impl SharedBuffer {
@@ -197,7 +205,7 @@ impl SharedBuffer {
         Self {
             queue: Arc::new(ArrayQueue::new(capacity)),
             capacity,
-            metrics: BufferMetrics::default(),
+            metrics: Arc::new(BufferMetrics::default()),
         }
     }
 
@@ -279,7 +287,7 @@ impl Clone for SharedBuffer {
         Self {
             queue: Arc::clone(&self.queue),
             capacity: self.capacity,
-            metrics: BufferMetrics::default(),
+            metrics: Arc::clone(&self.metrics), // Share metrics across clones
         }
     }
 }

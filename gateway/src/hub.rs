@@ -291,10 +291,11 @@ fn partition_by_destination(
         let broadcast = event.route_to.is_empty();
 
         for emitter in emitters {
+            let Some(batch) = batches.get_mut(emitter.name()) else {
+                continue;
+            };
             if broadcast || event.route_to.iter().any(|r| r == emitter.name()) {
-                if let Some(batch) = batches.get_mut(emitter.name()) {
-                    batch.push(idx);
-                }
+                batch.push(idx);
             }
         }
     }
@@ -346,7 +347,8 @@ async fn flush_loop(
             .collect();
 
         // Partition events by destination in a single pass
-        // This replaces O(emitters × events) clones with O(events) index lookups
+        // This avoids repeated per-emitter filtering and allows batch allocation
+        // instead of per-event allocation, improving cache locality
         let batches = partition_by_destination(&events, &emitters);
 
         // Send pre-partitioned batches to each emitter

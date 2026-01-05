@@ -16,10 +16,11 @@
 //!
 //! # Drain Order
 //!
-//! 1. First drain from secondary (oldest data, decompress)
-//! 2. Then drain from primary (newest data)
+//! 1. First drain from primary (oldest data, fast)
+//! 2. Then drain from secondary (overflow data, decompress)
 //!
-//! This maintains FIFO ordering across tiers.
+//! This maintains FIFO ordering: when primary fills, new messages overflow
+//! to secondary, so primary always contains the oldest messages.
 
 use crate::buffer_lockfree::LockFreeBuffer;
 use crate::message::Message;
@@ -43,7 +44,8 @@ pub struct TieredBuffer {
     primary: LockFreeBuffer,
     /// Overflow - compressed batches
     secondary: LockFreeBuffer,
-    /// Messages to batch before compressing
+    /// Messages to batch before compressing (TODO: batch compression)
+    #[allow(dead_code)]
     batch_size: usize,
     /// Compression level (1-22, default 3)
     compression_level: i32,
@@ -97,18 +99,22 @@ impl TieredBuffer {
         self
     }
 
-    /// Push a message to the buffer
+    /// Push a message to the buffer with overflow to secondary
     ///
     /// Returns true if stored (primary or secondary), false if dropped.
+    ///
+    /// Note: Clones the message before trying primary because LockFreeBuffer
+    /// consumes the message on push. If we need zero-copy for the success path,
+    /// LockFreeBuffer would need to return Result<(), Message> on failure.
     pub fn push(&self, msg: Message) -> bool {
-        // Try primary first
+        // Clone needed because we may need msg for compression if primary fails.
+        // This is a tradeoff: we pay one clone per message to enable overflow.
         if self.primary.push(msg.clone()) {
             self.metrics.primary_pushed.fetch_add(1, Ordering::Relaxed);
             return true;
         }
 
-        // Primary full - need to overflow
-        // For now, we'll compress single messages (batch compression is TODO)
+        // Primary full - compress and overflow to secondary
         match self.compress_message(&msg) {
             Some(compressed) => {
                 // Store compressed in secondary using a wrapper Message
@@ -138,12 +144,21 @@ impl TieredBuffer {
 
     /// Drain up to n messages, respecting FIFO order across tiers
     ///
-    /// Drains secondary (older) first, then primary (newer).
+    /// Drains primary (oldest) first, then secondary (overflow/newer).
+    /// This is correct because when primary fills, NEW messages overflow
+    /// to secondary, so primary always holds the oldest messages.
     pub fn drain(&self, n: usize) -> Vec<Message> {
         let mut result = Vec::with_capacity(n);
 
-        // First drain from secondary (older, compressed)
-        let secondary_msgs = self.secondary.drain(n);
+        // First drain from primary (oldest, uncompressed)
+        result.extend(self.primary.drain(n));
+        if result.len() >= n {
+            return result;
+        }
+
+        // Then drain from secondary (newer overflow, compressed)
+        let remaining = n - result.len();
+        let secondary_msgs = self.secondary.drain(remaining);
         for wrapper in secondary_msgs {
             if wrapper.source == "compressed" {
                 if let Some(msg) = self.decompress_message(&wrapper) {
@@ -152,15 +167,6 @@ impl TieredBuffer {
             } else {
                 result.push(wrapper);
             }
-            if result.len() >= n {
-                return result;
-            }
-        }
-
-        // Then drain from primary (newer, uncompressed)
-        let remaining = n - result.len();
-        if remaining > 0 {
-            result.extend(self.primary.drain(remaining));
         }
 
         result
@@ -190,53 +196,83 @@ impl TieredBuffer {
         }
     }
 
-    /// Simple message serialization
+    /// Message serialization preserving all fields
     fn serialize_message(&self, msg: &Message) -> Vec<u8> {
         let mut buf = Vec::new();
-        // Format: id_len(4) | id | source_len(4) | source | type_len(4) | type | payload
-        buf.extend_from_slice(&(msg.id.len() as u32).to_le_bytes());
-        buf.extend_from_slice(msg.id.as_bytes());
-        buf.extend_from_slice(&(msg.source.len() as u32).to_le_bytes());
-        buf.extend_from_slice(msg.source.as_bytes());
-        buf.extend_from_slice(&(msg.message_type.len() as u32).to_le_bytes());
-        buf.extend_from_slice(msg.message_type.as_bytes());
+        // Format: id | source | type | timestamp | metadata_count | metadata[] | route_count | routes[] | payload
+
+        // String helper: len(4) + bytes
+        let write_str = |buf: &mut Vec<u8>, s: &str| {
+            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        };
+
+        write_str(&mut buf, &msg.id);
+        write_str(&mut buf, &msg.source);
+        write_str(&mut buf, &msg.message_type);
         buf.extend_from_slice(&msg.timestamp.to_le_bytes());
+
+        // Metadata: count(4) + entries
+        buf.extend_from_slice(&(msg.metadata.len() as u32).to_le_bytes());
+        for (k, v) in &msg.metadata {
+            write_str(&mut buf, k);
+            write_str(&mut buf, v);
+        }
+
+        // Routes: count(4) + entries
+        buf.extend_from_slice(&(msg.route_to.len() as u32).to_le_bytes());
+        for route in &msg.route_to {
+            write_str(&mut buf, route);
+        }
+
+        // Payload (remaining bytes)
         buf.extend_from_slice(&msg.payload);
         buf
     }
 
-    /// Simple message deserialization
-    fn deserialize_message(&self, data: &[u8], wrapper: &Message) -> Option<Message> {
+    /// Message deserialization restoring all fields
+    fn deserialize_message(&self, data: &[u8], _wrapper: &Message) -> Option<Message> {
         let mut cursor = 0;
 
-        // Read id
-        if cursor + 4 > data.len() { return None; }
-        let id_len = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
-        cursor += 4;
-        if cursor + id_len > data.len() { return None; }
-        let id = String::from_utf8(data[cursor..cursor+id_len].to_vec()).ok()?;
-        cursor += id_len;
+        // Helper to read length-prefixed string
+        let read_str = |data: &[u8], cursor: &mut usize| -> Option<String> {
+            if *cursor + 4 > data.len() { return None; }
+            let len = u32::from_le_bytes(data[*cursor..*cursor+4].try_into().ok()?) as usize;
+            *cursor += 4;
+            if *cursor + len > data.len() { return None; }
+            let s = String::from_utf8(data[*cursor..*cursor+len].to_vec()).ok()?;
+            *cursor += len;
+            Some(s)
+        };
 
-        // Read source
-        if cursor + 4 > data.len() { return None; }
-        let source_len = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
-        cursor += 4;
-        if cursor + source_len > data.len() { return None; }
-        let source = String::from_utf8(data[cursor..cursor+source_len].to_vec()).ok()?;
-        cursor += source_len;
-
-        // Read message_type
-        if cursor + 4 > data.len() { return None; }
-        let type_len = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
-        cursor += 4;
-        if cursor + type_len > data.len() { return None; }
-        let message_type = String::from_utf8(data[cursor..cursor+type_len].to_vec()).ok()?;
-        cursor += type_len;
+        let id = read_str(data, &mut cursor)?;
+        let source = read_str(data, &mut cursor)?;
+        let message_type = read_str(data, &mut cursor)?;
 
         // Read timestamp
         if cursor + 8 > data.len() { return None; }
         let timestamp = i64::from_le_bytes(data[cursor..cursor+8].try_into().ok()?);
         cursor += 8;
+
+        // Read metadata
+        if cursor + 4 > data.len() { return None; }
+        let meta_count = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+        cursor += 4;
+        let mut metadata = std::collections::HashMap::new();
+        for _ in 0..meta_count {
+            let k = read_str(data, &mut cursor)?;
+            let v = read_str(data, &mut cursor)?;
+            metadata.insert(k, v);
+        }
+
+        // Read routes
+        if cursor + 4 > data.len() { return None; }
+        let route_count = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+        cursor += 4;
+        let mut route_to = Vec::with_capacity(route_count);
+        for _ in 0..route_count {
+            route_to.push(read_str(data, &mut cursor)?);
+        }
 
         // Rest is payload
         let payload = Bytes::copy_from_slice(&data[cursor..]);
@@ -247,8 +283,8 @@ impl TieredBuffer {
             source,
             message_type,
             payload,
-            metadata: wrapper.metadata.clone(),
-            route_to: wrapper.route_to.clone(),
+            metadata,
+            route_to,
         })
     }
 
@@ -345,50 +381,60 @@ mod tests {
     fn test_drain_respects_fifo_order() {
         let buffer = TieredBuffer::new(2, 10, 5);
 
-        // Push 4 messages: msg-0, msg-1 to primary; msg-2, msg-3 overflow
+        // Push 4 messages: msg-0, msg-1 to primary; msg-2, msg-3 overflow to secondary
         for i in 0..4 {
             buffer.push(make_message(&format!("msg-{i}"), 100));
         }
 
-        // Drain should return oldest first (from secondary)
+        // Drain should return true FIFO order:
+        // Primary was filled first (msg-0, msg-1), then overflow to secondary (msg-2, msg-3)
         let drained = buffer.drain(4);
         assert_eq!(drained.len(), 4);
 
-        // Secondary (older) should come first
-        assert_eq!(drained[0].id, "msg-2");
-        assert_eq!(drained[1].id, "msg-3");
-        // Then primary (newer)
-        assert_eq!(drained[2].id, "msg-0");
-        assert_eq!(drained[3].id, "msg-1");
+        // Primary (oldest) comes first
+        assert_eq!(drained[0].id, "msg-0");
+        assert_eq!(drained[1].id, "msg-1");
+        // Then secondary (newer overflow)
+        assert_eq!(drained[2].id, "msg-2");
+        assert_eq!(drained[3].id, "msg-3");
     }
 
     #[test]
     fn test_round_trip_preserves_message() {
         let buffer = TieredBuffer::new(1, 10, 5);
 
-        // Create message with specific content
-        let original = Message::with_id(
+        // Create message with all fields populated
+        let mut original = Message::with_id(
             "test-id-123",
             999_888_777,
             "my-service",
             "user.created",
             Bytes::from(b"hello world payload".to_vec()),
         );
+        original.metadata.insert("trace_id".to_string(), "abc-123".to_string());
+        original.metadata.insert("tenant".to_string(), "acme".to_string());
+        original.route_to = vec!["kafka".to_string(), "webhook".to_string()];
 
         // Push twice - first goes to primary, second overflows (compressed)
         buffer.push(original.clone());
         buffer.push(original.clone());
 
-        // Drain the compressed one first (from secondary)
-        let drained = buffer.drain(1);
-        assert_eq!(drained.len(), 1);
+        // Drain primary first (FIFO), then get the compressed one from secondary
+        let drained = buffer.drain(2);
+        assert_eq!(drained.len(), 2);
 
-        let recovered = &drained[0];
+        // Second message went to secondary (compressed) - verify full round-trip
+        let recovered = &drained[1];
         assert_eq!(recovered.id, original.id);
         assert_eq!(recovered.timestamp, original.timestamp);
         assert_eq!(recovered.source, original.source);
         assert_eq!(recovered.message_type, original.message_type);
         assert_eq!(recovered.payload, original.payload);
+        // Verify metadata preserved through compression
+        assert_eq!(recovered.metadata.get("trace_id"), Some(&"abc-123".to_string()));
+        assert_eq!(recovered.metadata.get("tenant"), Some(&"acme".to_string()));
+        // Verify routes preserved through compression
+        assert_eq!(recovered.route_to, vec!["kafka", "webhook"]);
     }
 
     #[test]
