@@ -20,6 +20,7 @@
 pub mod buffer;
 pub mod buffer_lockfree;
 pub mod buffer_tiered;
+pub mod checkpoint;
 pub mod config;
 pub mod emit;
 pub mod error;
@@ -64,3 +65,4 @@ pub use middleware::{
 };
 pub use proto::Event;
 pub use registry::PluginRegistry;
+pub use checkpoint::{CheckpointStore, MemoryCheckpointStore};
