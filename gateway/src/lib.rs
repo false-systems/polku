@@ -59,7 +59,7 @@ pub use emit::{Emitter, GrpcEmitter, StdoutEmitter, WebhookEmitter};
 pub use error::{PluginError, PolkuError, Result};
 pub use hub::{Hub, HubRunner, MessageSender};
 pub use ingest::{IngestContext, Ingestor};
-pub use message::Message;
+pub use message::{Message, MessageId};
 pub use metrics_server::MetricsServer;
 pub use middleware::{
     AggregateStrategy, Aggregator, Deduplicator, Enricher, Filter, InvalidAction, Middleware,

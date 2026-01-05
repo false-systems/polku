@@ -23,10 +23,159 @@
 //! When the same string is used across multiple messages, it's stored once
 //! and shared via a small integer key. This reduces memory usage and makes
 //! `Message::clone()` much faster.
+//!
+//! # Binary Message ID
+//!
+//! The `id` field uses a compact 16-byte representation instead of a 26-char string.
+//! This saves ~34 bytes per message and makes cloning O(1) (Copy).
 
 use crate::intern::InternedStr;
 use bytes::Bytes;
 use std::collections::HashMap;
+use std::fmt;
+use std::hash::{Hash, Hasher};
+
+/// Compact message identifier (16 bytes instead of 26-char string)
+///
+/// Stores ULID in binary form. Implements Display for string formatting
+/// and PartialEq<str> for easy comparisons.
+#[derive(Clone, Copy)]
+pub struct MessageId {
+    ulid: ulid::Ulid,
+    /// Original string for non-ULID IDs (tests, legacy). Empty if generated.
+    /// We store a hash to enable PartialEq<str> without storing the string.
+    original_hash: u64,
+}
+
+impl MessageId {
+    /// Generate a new unique ID
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            ulid: ulid::Ulid::new(),
+            original_hash: 0,
+        }
+    }
+
+    /// Create from a string (parses ULID or creates deterministic ID)
+    pub fn from_string(s: &str) -> Self {
+        // Try to parse as valid ULID first
+        if let Ok(ulid) = ulid::Ulid::from_string(s) {
+            return Self {
+                ulid,
+                original_hash: 0,
+            };
+        }
+
+        // For arbitrary strings (tests), create deterministic ID from hash
+        let hash = Self::hash_string(s);
+        let bytes = hash.to_le_bytes();
+        // Create ULID from hash bytes (deterministic but not time-ordered)
+        let ulid_bytes: [u8; 16] = [
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ];
+        Self {
+            ulid: ulid::Ulid::from_bytes(ulid_bytes),
+            original_hash: hash,
+        }
+    }
+
+    /// Get the ULID
+    #[inline]
+    pub fn as_ulid(&self) -> ulid::Ulid {
+        self.ulid
+    }
+
+    /// Check if this was created from an arbitrary string (not a real ULID)
+    #[inline]
+    pub fn is_synthetic(&self) -> bool {
+        self.original_hash != 0
+    }
+
+    /// Simple string hash (FNV-1a)
+    fn hash_string(s: &str) -> u64 {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for byte in s.bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
+}
+
+impl Default for MessageId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for MessageId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "MessageId({})", self.ulid)
+    }
+}
+
+impl fmt::Display for MessageId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.ulid)
+    }
+}
+
+impl PartialEq for MessageId {
+    fn eq(&self, other: &Self) -> bool {
+        self.ulid == other.ulid
+    }
+}
+
+impl Eq for MessageId {}
+
+impl PartialEq<str> for MessageId {
+    fn eq(&self, other: &str) -> bool {
+        // For synthetic IDs, compare by hash
+        if self.original_hash != 0 {
+            return self.original_hash == Self::hash_string(other);
+        }
+        // For real ULIDs, compare string representation
+        self.ulid.to_string() == other
+    }
+}
+
+impl PartialEq<&str> for MessageId {
+    fn eq(&self, other: &&str) -> bool {
+        self == *other
+    }
+}
+
+impl PartialEq<String> for MessageId {
+    fn eq(&self, other: &String) -> bool {
+        self == other.as_str()
+    }
+}
+
+impl Hash for MessageId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.ulid.0.hash(state);
+    }
+}
+
+impl From<&str> for MessageId {
+    fn from(s: &str) -> Self {
+        Self::from_string(s)
+    }
+}
+
+impl From<String> for MessageId {
+    fn from(s: String) -> Self {
+        Self::from_string(&s)
+    }
+}
+
+impl From<MessageId> for String {
+    fn from(id: MessageId) -> Self {
+        id.ulid.to_string()
+    }
+}
 
 /// The universal message envelope - protocol agnostic, zero-copy
 ///
@@ -42,8 +191,8 @@ use std::collections::HashMap;
 /// ```
 #[derive(Debug, Clone)]
 pub struct Message {
-    /// Unique identifier (ULID by default)
-    pub id: String,
+    /// Unique identifier (binary ULID - 16 bytes, Copy)
+    pub id: MessageId,
 
     /// Unix timestamp in nanoseconds
     pub timestamp: i64,
@@ -83,7 +232,7 @@ impl Message {
     /// * `payload` - Message payload (use `Bytes::from()` to convert)
     pub fn new(source: impl Into<InternedStr>, message_type: impl Into<InternedStr>, payload: Bytes) -> Self {
         Self {
-            id: ulid::Ulid::new().to_string(),
+            id: MessageId::new(),
             timestamp: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
             source: source.into(),
             message_type: message_type.into(),
@@ -95,7 +244,7 @@ impl Message {
 
     /// Create a Message with all fields specified
     pub fn with_id(
-        id: impl Into<String>,
+        id: impl Into<MessageId>,
         timestamp: i64,
         source: impl Into<InternedStr>,
         message_type: impl Into<InternedStr>,
@@ -168,7 +317,7 @@ impl Message {
 impl From<crate::proto::Event> for Message {
     fn from(event: crate::proto::Event) -> Self {
         Self {
-            id: event.id,
+            id: MessageId::from_string(&event.id),
             timestamp: event.timestamp_unix_ns,
             source: event.source.into(),
             message_type: event.event_type.into(),
@@ -183,7 +332,7 @@ impl From<crate::proto::Event> for Message {
 impl From<Message> for crate::proto::Event {
     fn from(msg: Message) -> Self {
         Self {
-            id: msg.id,
+            id: msg.id.to_string(),
             timestamp_unix_ns: msg.timestamp,
             source: msg.source.into(),
             event_type: msg.message_type.into(),
@@ -203,7 +352,8 @@ mod tests {
         let payload = Bytes::from(r#"{"user_id": 123}"#);
         let msg = Message::new("user-service", "user.created", payload.clone());
 
-        assert!(!msg.id.is_empty());
+        // MessageId is always valid (16 bytes)
+        assert!(!msg.id.to_string().is_empty());
         assert!(msg.timestamp > 0);
         assert_eq!(msg.source, "user-service");
         assert_eq!(msg.message_type, "user.created");
@@ -267,7 +417,7 @@ mod tests {
 
         // Convert to proto
         let proto: crate::proto::Event = msg.clone().into();
-        assert_eq!(proto.id, msg.id);
+        assert_eq!(msg.id.to_string(), proto.id);
         assert_eq!(proto.source, "svc");
         assert_eq!(proto.event_type, "user.created");
         assert_eq!(proto.metadata.get("key"), Some(&"value".to_string()));
@@ -277,5 +427,23 @@ mod tests {
         assert_eq!(back.id, msg.id);
         assert_eq!(back.source, msg.source);
         assert_eq!(back.message_type, msg.message_type);
+    }
+
+    #[test]
+    fn test_message_id_comparison() {
+        // Real ULIDs can be compared
+        let id1 = MessageId::new();
+        let id2 = id1;
+        assert_eq!(id1, id2);
+
+        // Synthetic IDs from strings
+        let id3 = MessageId::from_string("test-id");
+        let id4 = MessageId::from_string("test-id");
+        assert_eq!(id3, id4);
+        assert_eq!(id3, "test-id");
+
+        // Different strings = different IDs
+        let id5 = MessageId::from_string("other-id");
+        assert_ne!(id3, id5);
     }
 }

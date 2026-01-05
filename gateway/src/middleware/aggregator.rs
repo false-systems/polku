@@ -27,7 +27,7 @@
 //! For time-based aggregation, integrate with Hub's flush interval by calling
 //! `flush()` periodically from a timer task.
 
-use crate::message::Message;
+use crate::message::{Message, MessageId};
 use crate::middleware::Middleware;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -170,7 +170,7 @@ impl Aggregator {
         routes.dedup();
 
         Message {
-            id: ulid::Ulid::new().to_string(),
+            id: MessageId::new(),
             timestamp: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
             source: source.into(),
             message_type: format!("{}.aggregate", first.message_type).into(),

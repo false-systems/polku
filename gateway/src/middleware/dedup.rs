@@ -132,7 +132,7 @@ impl Middleware for Deduplicator {
     }
 
     async fn process(&self, msg: Message) -> Option<Message> {
-        if self.check(&msg.id) {
+        if self.check(&msg.id.to_string()) {
             Some(msg)
         } else {
             tracing::debug!(
@@ -165,10 +165,10 @@ mod tests {
 
         // Create message with known ID
         let mut msg1 = Message::new("test", "evt", Bytes::new());
-        msg1.id = "fixed-id".to_string();
+        msg1.id = "fixed-id".into();
 
         let mut msg2 = Message::new("test", "evt", Bytes::new());
-        msg2.id = "fixed-id".to_string();
+        msg2.id = "fixed-id".into();
 
         // First passes
         assert!(dedup.process(msg1).await.is_some());
@@ -182,10 +182,10 @@ mod tests {
         let dedup = Deduplicator::new(Duration::from_secs(60));
 
         let mut msg1 = Message::new("test", "evt", Bytes::new());
-        msg1.id = "id-1".to_string();
+        msg1.id = "id-1".into();
 
         let mut msg2 = Message::new("test", "evt", Bytes::new());
-        msg2.id = "id-2".to_string();
+        msg2.id = "id-2".into();
 
         assert!(dedup.process(msg1).await.is_some());
         assert!(dedup.process(msg2).await.is_some());
@@ -196,7 +196,7 @@ mod tests {
         let dedup = Deduplicator::new(Duration::from_millis(10));
 
         let mut msg1 = Message::new("test", "evt", Bytes::new());
-        msg1.id = "expire-test".to_string();
+        msg1.id = "expire-test".into();
 
         // First passes
         assert!(dedup.process(msg1).await.is_some());
@@ -206,7 +206,7 @@ mod tests {
 
         // Same ID passes again after expiry
         let mut msg2 = Message::new("test", "evt", Bytes::new());
-        msg2.id = "expire-test".to_string();
+        msg2.id = "expire-test".into();
         assert!(dedup.process(msg2).await.is_some());
     }
 
@@ -217,7 +217,7 @@ mod tests {
         // Add some messages
         for i in 0..5 {
             let mut msg = Message::new("test", "evt", Bytes::new());
-            msg.id = format!("msg-{}", i);
+            msg.id = format!("msg-{}", i).into();
             dedup.process(msg).await;
         }
 
@@ -229,7 +229,7 @@ mod tests {
         // Trigger cleanup by adding more messages (need 10 to trigger)
         for i in 5..20 {
             let mut msg = Message::new("test", "evt", Bytes::new());
-            msg.id = format!("msg-{}", i);
+            msg.id = format!("msg-{}", i).into();
             dedup.process(msg).await;
         }
 
