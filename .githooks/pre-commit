@@ -1,17 +1,27 @@
 #!/bin/bash
-# Pre-commit hook for POLKU
-# Runs quick checks before allowing commit
+# Sykli pre-commit hook - runs only affected tasks
 
-set -e
+echo "Running sykli delta (affected tasks only)..."
 
-echo "Running pre-commit checks..."
+# Use local binary if available, then PATH
+if [ -f "./target/release/sykli" ]; then
+    SYKLI="./target/release/sykli"
+elif [ -f "./target/debug/sykli" ]; then
+    SYKLI="./target/debug/sykli"
+elif command -v sykli &> /dev/null; then
+    SYKLI="sykli"
+else
+    echo "sykli not found, falling back to cargo checks"
+    cargo fmt --all --check && cargo clippy --all-targets -- -D warnings
+    exit $?
+fi
 
-# Format check
-echo "  Checking formatting..."
-cargo fmt --all --check
+# Run only affected tasks
+$SYKLI delta
 
-# Clippy
-echo "  Running clippy..."
-cargo clippy --all-targets -- -D warnings
-
-echo "Pre-commit checks passed!"
+if [ $? -ne 0 ]; then
+    echo ""
+    echo "Pre-commit check failed. Fix the issues and try again."
+    echo "To skip: git commit --no-verify"
+    exit 1
+fi
