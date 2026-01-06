@@ -8,22 +8,15 @@ use polku_gateway::{Event, Message};
 use std::collections::HashMap;
 
 fn make_message() -> Message {
-    let mut metadata = HashMap::new();
-    metadata.insert("key1".to_string(), "value1".to_string());
-    metadata.insert("key2".to_string(), "value2".to_string());
-    metadata.insert("trace_id".to_string(), "abc123def456".to_string());
-
-    Message {
-        id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
-        timestamp: 1704067200000000000, // 2024-01-01 00:00:00 UTC
-        source: "benchmark-service".to_string(),
-        message_type: "user.created".to_string(),
-        metadata,
-        payload: Bytes::from(
-            r#"{"user_id": 12345, "email": "test@example.com", "name": "Test User"}"#,
-        ),
-        route_to: vec!["output-1".to_string(), "output-2".to_string()],
-    }
+    Message::new(
+        "benchmark-service",
+        "user.created",
+        Bytes::from(r#"{"user_id": 12345, "email": "test@example.com", "name": "Test User"}"#),
+    )
+    .with_metadata("key1", "value1")
+    .with_metadata("key2", "value2")
+    .with_metadata("trace_id", "abc123def456")
+    .with_routes(vec!["output-1".into(), "output-2".into()])
 }
 
 fn make_event() -> Event {
@@ -106,15 +99,7 @@ fn bench_payload_sizes(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64 * 100)); // 100 messages
 
         let payload = vec![b'x'; size];
-        let msg = Message {
-            id: "test".to_string(),
-            timestamp: 0,
-            source: "bench".to_string(),
-            message_type: "test".to_string(),
-            metadata: HashMap::new(),
-            payload: Bytes::from(payload),
-            route_to: vec![],
-        };
+        let msg = Message::new("bench", "test", Bytes::from(payload));
 
         group.bench_function(format!("clone_{}b_payload", size), |b| {
             b.iter(|| {

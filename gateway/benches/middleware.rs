@@ -40,7 +40,7 @@ fn bench_individual_middleware(c: &mut Criterion) {
     // Transform
     group.bench_function("transform", |b| {
         let transform = Transform::new(|mut msg: Message| {
-            msg.metadata.insert("processed".into(), "true".into());
+            msg.metadata_mut().insert("processed".into(), "true".into());
             msg
         });
         b.iter(|| {

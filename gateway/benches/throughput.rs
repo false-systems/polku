@@ -147,7 +147,7 @@ fn bench_hub_with_middleware(c: &mut Criterion) {
                 let (sender, runner) = Hub::new()
                     .buffer_capacity(2000)
                     .middleware(Transform::new(|mut msg| {
-                        msg.metadata.insert("processed".into(), "true".into());
+                        msg.metadata_mut().insert("processed".into(), "true".into());
                         msg
                     }))
                     .emitter_arc(emitter.clone())
