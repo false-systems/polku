@@ -34,11 +34,13 @@
 
 use crate::buffer_lockfree::LockFreeBuffer;
 use crate::buffer_tiered::TieredBuffer;
+use crate::checkpoint::CheckpointStore;
 use crate::emit::Emitter;
 use crate::error::PluginError;
 use crate::message::Message;
 use crate::metrics::Metrics;
 use crate::middleware::{Middleware, MiddlewareChain};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -243,6 +245,8 @@ pub struct Hub {
     middleware: MiddlewareChain,
     /// Registered emitters
     emitters: Vec<Arc<dyn Emitter>>,
+    /// Optional checkpoint store for reliable delivery tracking
+    checkpoint_store: Option<Arc<dyn CheckpointStore>>,
 }
 
 impl Hub {
@@ -255,6 +259,7 @@ impl Hub {
             flush_interval_ms: 10,
             middleware: MiddlewareChain::new(),
             emitters: Vec::new(),
+            checkpoint_store: None,
         }
     }
 
@@ -345,6 +350,29 @@ impl Hub {
         self.emitter(emitter)
     }
 
+    /// Enable checkpoint-based acknowledgment for reliable delivery
+    ///
+    /// When enabled, the Hub tracks which messages each emitter has successfully
+    /// processed. This allows:
+    /// - Resume from last known position after restarts
+    /// - Safe buffer retention based on minimum checkpoint
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use polku_gateway::{Hub, MemoryCheckpointStore};
+    /// use std::sync::Arc;
+    ///
+    /// let checkpoints = Arc::new(MemoryCheckpointStore::new());
+    /// Hub::new()
+    ///     .checkpoint_store(checkpoints)
+    ///     .build();
+    /// ```
+    pub fn checkpoint_store<S: CheckpointStore + 'static>(mut self, store: Arc<S>) -> Self {
+        self.checkpoint_store = Some(store);
+        self
+    }
+
     /// Build a message sender for this hub
     ///
     /// Returns a sender that can be used to inject messages into the pipeline.
@@ -361,6 +389,8 @@ impl Hub {
             flush_interval_ms: self.flush_interval_ms,
             middleware: self.middleware,
             emitters: self.emitters,
+            checkpoint_store: self.checkpoint_store,
+            sequence: Arc::new(AtomicU64::new(0)),
         };
 
         (sender, runner)
@@ -404,6 +434,10 @@ pub struct HubRunner {
     flush_interval_ms: u64,
     middleware: MiddlewareChain,
     emitters: Vec<Arc<dyn Emitter>>,
+    /// Optional checkpoint store for tracking delivery progress
+    checkpoint_store: Option<Arc<dyn CheckpointStore>>,
+    /// Monotonically increasing sequence number for checkpoint tracking
+    sequence: Arc<AtomicU64>,
 }
 
 impl HubRunner {
@@ -442,6 +476,8 @@ impl HubRunner {
         let emitters_for_timer = self.emitters.clone();
         let batch_size = self.batch_size;
         let flush_interval_ms = self.flush_interval_ms;
+        let checkpoint_store = self.checkpoint_store.clone();
+        let sequence = Arc::clone(&self.sequence);
         let flush_handle = tokio::spawn(async move {
             flush_loop(
                 buffer,
@@ -449,6 +485,8 @@ impl HubRunner {
                 shutdown_rx,
                 batch_size,
                 flush_interval_ms,
+                checkpoint_store,
+                sequence,
             )
             .await;
         });
@@ -515,6 +553,10 @@ impl HubRunner {
             return;
         }
 
+        // Assign sequence numbers to this batch for checkpoint tracking
+        let batch_start_seq = self.sequence.fetch_add(messages.len() as u64, Ordering::SeqCst);
+        let batch_end_seq = batch_start_seq + messages.len() as u64 - 1;
+
         // Convert Messages to proto Events for outputs
         let events: Vec<crate::proto::Event> = messages
             .into_iter()
@@ -541,6 +583,7 @@ impl HubRunner {
                 if let Some(metrics) = Metrics::get() {
                     metrics.record_dropped(emitter.name(), routed_events.len() as u64);
                 }
+                // Note: checkpoint NOT updated on failure - emitter is behind
             } else {
                 debug!(
                     emitter = emitter.name(),
@@ -551,6 +594,10 @@ impl HubRunner {
                     for event in routed_events {
                         metrics.record_forwarded(emitter.name(), &event.event_type, 1);
                     }
+                }
+                // Update checkpoint for this emitter on success
+                if let Some(ref store) = self.checkpoint_store {
+                    store.set(emitter.name(), batch_end_seq);
                 }
             }
         }
@@ -659,6 +706,8 @@ async fn flush_loop(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     batch_size: usize,
     flush_interval_ms: u64,
+    checkpoint_store: Option<Arc<dyn CheckpointStore>>,
+    sequence: Arc<AtomicU64>,
 ) {
     loop {
         // Check if shutdown requested and buffer is empty
@@ -686,6 +735,10 @@ async fn flush_loop(
         if messages.is_empty() {
             continue;
         }
+
+        // Assign sequence numbers to this batch for checkpoint tracking
+        let batch_start_seq = sequence.fetch_add(messages.len() as u64, Ordering::SeqCst);
+        let batch_end_seq = batch_start_seq + messages.len() as u64 - 1;
 
         // Convert Messages to proto Events for outputs
         let events: Vec<crate::proto::Event> = messages
@@ -716,6 +769,7 @@ async fn flush_loop(
                 if let Some(metrics) = Metrics::get() {
                     metrics.record_dropped(emitter.name(), routed_events.len() as u64);
                 }
+                // Note: checkpoint NOT updated on failure - emitter is behind
             } else {
                 debug!(
                     emitter = emitter.name(),
@@ -727,6 +781,10 @@ async fn flush_loop(
                     for event in routed_events {
                         metrics.record_forwarded(emitter.name(), &event.event_type, 1);
                     }
+                }
+                // Update checkpoint for this emitter on success
+                if let Some(ref store) = checkpoint_store {
+                    store.set(emitter.name(), batch_end_seq);
                 }
             }
         }
@@ -1126,6 +1184,128 @@ mod tests {
             assert_eq!(batch[0].id, "broadcast-msg");
             assert_eq!(batch[0].payload, vec![42u8; 100]);
         }
+    }
+
+    // ========================================================================
+    // Checkpoint tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_checkpoint_updates_on_successful_emit() {
+        use crate::checkpoint::MemoryCheckpointStore;
+        use std::sync::atomic::AtomicUsize;
+
+        struct CountingEmitter {
+            count: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::emit::Emitter for CountingEmitter {
+            fn name(&self) -> &'static str {
+                "counter"
+            }
+            async fn emit(&self, events: &[crate::proto::Event]) -> Result<(), PluginError> {
+                self.count.fetch_add(events.len(), std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            async fn health(&self) -> bool {
+                true
+            }
+        }
+
+        let checkpoint_store = Arc::new(MemoryCheckpointStore::new());
+
+        let hub = Hub::new()
+            .batch_size(5)
+            .flush_interval_ms(1000) // Long interval to force inline flush
+            .checkpoint_store(checkpoint_store.clone())
+            .emitter(CountingEmitter {
+                count: AtomicUsize::new(0),
+            });
+
+        let (sender, runner) = hub.build();
+
+        // Spawn the runner
+        let handle = tokio::spawn(async move { runner.run().await });
+
+        // Send 5 messages (triggers inline flush)
+        for _ in 0..5 {
+            sender
+                .send(Message::new("test", "test.event", bytes::Bytes::new()))
+                .await
+                .unwrap();
+        }
+
+        // Give time for processing
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Checkpoint should be updated (seq 0-4, so checkpoint = 4)
+        assert_eq!(checkpoint_store.get("counter"), Some(4));
+
+        // Send another batch
+        for _ in 0..5 {
+            sender
+                .send(Message::new("test", "test.event", bytes::Bytes::new()))
+                .await
+                .unwrap();
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Checkpoint should be updated (seq 5-9, so checkpoint = 9)
+        assert_eq!(checkpoint_store.get("counter"), Some(9));
+
+        // Shutdown
+        drop(sender);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_not_updated_on_emit_failure() {
+        use crate::checkpoint::MemoryCheckpointStore;
+
+        struct FailingEmitter;
+
+        #[async_trait::async_trait]
+        impl crate::emit::Emitter for FailingEmitter {
+            fn name(&self) -> &'static str {
+                "failing"
+            }
+            async fn emit(&self, _events: &[crate::proto::Event]) -> Result<(), PluginError> {
+                Err(PluginError::Send("intentional failure".into()))
+            }
+            async fn health(&self) -> bool {
+                false
+            }
+        }
+
+        let checkpoint_store = Arc::new(MemoryCheckpointStore::new());
+
+        let hub = Hub::new()
+            .batch_size(5)
+            .flush_interval_ms(1000)
+            .checkpoint_store(checkpoint_store.clone())
+            .emitter(FailingEmitter);
+
+        let (sender, runner) = hub.build();
+
+        let handle = tokio::spawn(async move { runner.run().await });
+
+        // Send 5 messages
+        for _ in 0..5 {
+            sender
+                .send(Message::new("test", "test.event", bytes::Bytes::new()))
+                .await
+                .unwrap();
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Checkpoint should NOT be updated due to failure
+        assert_eq!(checkpoint_store.get("failing"), None);
+
+        drop(sender);
+        let _ = handle.await;
     }
 
     // ========================================================================
