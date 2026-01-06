@@ -341,6 +341,21 @@ impl TieredBuffer {
     pub fn total_dropped(&self) -> u64 {
         self.metrics.dropped.load(Ordering::Relaxed)
     }
+
+    /// Get primary buffer capacity
+    pub fn primary_capacity(&self) -> usize {
+        self.primary.capacity()
+    }
+
+    /// Get secondary buffer capacity
+    pub fn secondary_capacity(&self) -> usize {
+        self.secondary.capacity()
+    }
+
+    /// Get total capacity (primary + secondary)
+    pub fn capacity(&self) -> usize {
+        self.primary.capacity() + self.secondary.capacity()
+    }
 }
 
 #[cfg(test)]

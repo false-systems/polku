@@ -56,7 +56,7 @@ pub use emit::resilience::{
 };
 pub use emit::{Emitter, GrpcEmitter, StdoutEmitter, WebhookEmitter};
 pub use error::{PluginError, PolkuError, Result};
-pub use hub::{Hub, HubRunner, MessageSender};
+pub use hub::{BufferStrategy, Hub, HubBuffer, HubRunner, MessageSender};
 pub use ingest::{IngestContext, Ingestor};
 pub use intern::InternedStr;
 pub use message::{Message, MessageId};

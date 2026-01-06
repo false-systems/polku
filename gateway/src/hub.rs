@@ -17,8 +17,23 @@
 //!     .run()
 //!     .await?;
 //! ```
+//!
+//! # Buffer Strategies
+//!
+//! The Hub supports different buffer strategies for different use cases:
+//!
+//! - **Standard** (default): Fast lock-free buffer, drops new messages when full
+//! - **Tiered**: Primary buffer + compressed overflow for graceful degradation
+//!
+//! ```ignore
+//! // Enable tiered buffering for traffic spike handling
+//! Hub::new()
+//!     .buffer_strategy(BufferStrategy::tiered(10_000, 5_000))
+//!     .build();
+//! ```
 
 use crate::buffer_lockfree::LockFreeBuffer;
+use crate::buffer_tiered::TieredBuffer;
 use crate::emit::Emitter;
 use crate::error::PluginError;
 use crate::message::Message;
@@ -28,6 +43,179 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+// ============================================================================
+// Buffer abstraction for pluggable buffer strategies
+// ============================================================================
+
+/// Trait for buffer implementations used by Hub
+///
+/// This allows swapping between different buffer strategies:
+/// - `LockFreeBuffer`: Fast, simple, drops on overflow
+/// - `TieredBuffer`: Compressed overflow for graceful degradation
+pub trait HubBuffer: Send + Sync {
+    /// Push a message into the buffer
+    ///
+    /// Returns `true` if stored, `false` if dropped.
+    fn push(&self, msg: Message) -> bool;
+
+    /// Drain up to `n` messages from the buffer
+    fn drain(&self, n: usize) -> Vec<Message>;
+
+    /// Current number of messages in the buffer
+    fn len(&self) -> usize;
+
+    /// Check if buffer is empty
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Buffer capacity
+    fn capacity(&self) -> usize;
+
+    /// Strategy name for logging
+    fn strategy_name(&self) -> &'static str;
+}
+
+impl HubBuffer for LockFreeBuffer {
+    fn push(&self, msg: Message) -> bool {
+        LockFreeBuffer::push(self, msg)
+    }
+
+    fn drain(&self, n: usize) -> Vec<Message> {
+        LockFreeBuffer::drain(self, n)
+    }
+
+    fn len(&self) -> usize {
+        LockFreeBuffer::len(self)
+    }
+
+    fn capacity(&self) -> usize {
+        LockFreeBuffer::capacity(self)
+    }
+
+    fn strategy_name(&self) -> &'static str {
+        "standard"
+    }
+}
+
+impl HubBuffer for TieredBuffer {
+    fn push(&self, msg: Message) -> bool {
+        TieredBuffer::push(self, msg)
+    }
+
+    fn drain(&self, n: usize) -> Vec<Message> {
+        TieredBuffer::drain(self, n)
+    }
+
+    fn len(&self) -> usize {
+        TieredBuffer::len(self)
+    }
+
+    fn capacity(&self) -> usize {
+        TieredBuffer::capacity(self)
+    }
+
+    fn strategy_name(&self) -> &'static str {
+        "tiered"
+    }
+}
+
+/// Buffer strategy configuration for Hub
+///
+/// Controls how the Hub handles message buffering and overflow.
+#[derive(Clone)]
+pub enum BufferStrategy {
+    /// Standard lock-free buffer (default)
+    ///
+    /// Fast and simple. When full, new messages are dropped.
+    /// Best for: steady-state traffic, low-latency requirements.
+    Standard {
+        /// Buffer capacity in messages
+        capacity: usize,
+    },
+
+    /// Tiered buffer with compressed overflow
+    ///
+    /// Primary buffer (fast) + secondary buffer (compressed).
+    /// When primary fills, messages overflow to compressed secondary.
+    /// Best for: traffic spikes, graceful degradation.
+    Tiered {
+        /// Primary (hot) buffer capacity
+        primary_capacity: usize,
+        /// Secondary (compressed overflow) buffer capacity
+        secondary_capacity: usize,
+        /// Compression level (1-22, default 3)
+        compression_level: i32,
+    },
+}
+
+impl BufferStrategy {
+    /// Create a standard buffer strategy
+    pub fn standard(capacity: usize) -> Self {
+        Self::Standard { capacity }
+    }
+
+    /// Create a tiered buffer strategy with default compression
+    pub fn tiered(primary_capacity: usize, secondary_capacity: usize) -> Self {
+        Self::Tiered {
+            primary_capacity,
+            secondary_capacity,
+            compression_level: 3,
+        }
+    }
+
+    /// Create a tiered buffer with custom compression level
+    pub fn tiered_with_compression(
+        primary_capacity: usize,
+        secondary_capacity: usize,
+        compression_level: i32,
+    ) -> Self {
+        Self::Tiered {
+            primary_capacity,
+            secondary_capacity,
+            compression_level: compression_level.clamp(1, 22),
+        }
+    }
+
+    /// Build the buffer from this strategy
+    fn build(&self) -> Arc<dyn HubBuffer> {
+        match self {
+            Self::Standard { capacity } => Arc::new(LockFreeBuffer::new(*capacity)),
+            Self::Tiered {
+                primary_capacity,
+                secondary_capacity,
+                compression_level,
+            } => Arc::new(
+                TieredBuffer::new(*primary_capacity, *secondary_capacity, 1)
+                    .with_compression_level(*compression_level),
+            ),
+        }
+    }
+
+    /// Get total capacity for this strategy
+    #[allow(dead_code)]
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Standard { capacity } => *capacity,
+            Self::Tiered {
+                primary_capacity,
+                secondary_capacity,
+                ..
+            } => primary_capacity + secondary_capacity,
+        }
+    }
+}
+
+impl Default for BufferStrategy {
+    fn default() -> Self {
+        Self::Standard { capacity: 10_000 }
+    }
+}
+
+// ============================================================================
+// Hub implementation
+// ============================================================================
+
 /// The Hub - central message pipeline
 ///
 /// Connects inputs → middleware → buffer → outputs.
@@ -35,11 +223,16 @@ use tracing::{debug, error, info, warn};
 /// # Architecture
 ///
 /// ```text
-/// Input Channels ──► MiddlewareChain ──► LockFreeBuffer ──► Outputs (fan-out)
+/// Input Channels ──► MiddlewareChain ──► Buffer ──► Outputs (fan-out)
 /// ```
+///
+/// # Buffer Strategies
+///
+/// - `BufferStrategy::Standard`: Lock-free buffer, drops on overflow (default)
+/// - `BufferStrategy::Tiered`: Compressed overflow for graceful degradation
 pub struct Hub {
-    /// Buffer capacity
-    buffer_capacity: usize,
+    /// Buffer strategy (standard or tiered)
+    buffer_strategy: BufferStrategy,
     /// Input channel capacity (mpsc buffer before middleware)
     channel_capacity: usize,
     /// Flush batch size (messages per flush)
@@ -56,7 +249,7 @@ impl Hub {
     /// Create a new Hub with default settings
     pub fn new() -> Self {
         Self {
-            buffer_capacity: 10_000,
+            buffer_strategy: BufferStrategy::default(),
             channel_capacity: 8192, // Higher default for better throughput
             batch_size: 100,
             flush_interval_ms: 10,
@@ -84,11 +277,31 @@ impl Hub {
         self
     }
 
-    /// Set the buffer capacity
+    /// Set the buffer capacity (standard strategy)
     ///
     /// Default is 10,000 messages.
+    /// This is a convenience method that sets a standard buffer strategy.
+    /// For tiered buffering, use `buffer_strategy()` instead.
     pub fn buffer_capacity(mut self, capacity: usize) -> Self {
-        self.buffer_capacity = capacity;
+        self.buffer_strategy = BufferStrategy::standard(capacity);
+        self
+    }
+
+    /// Set the buffer strategy
+    ///
+    /// Controls how messages are buffered and how overflow is handled.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Standard buffer (default) - drops on overflow
+    /// Hub::new().buffer_strategy(BufferStrategy::standard(10_000))
+    ///
+    /// // Tiered buffer - compressed overflow for graceful degradation
+    /// Hub::new().buffer_strategy(BufferStrategy::tiered(10_000, 5_000))
+    /// ```
+    pub fn buffer_strategy(mut self, strategy: BufferStrategy) -> Self {
+        self.buffer_strategy = strategy;
         self
     }
 
@@ -143,7 +356,7 @@ impl Hub {
 
         let runner = HubRunner {
             rx,
-            buffer: Arc::new(LockFreeBuffer::new(self.buffer_capacity)),
+            buffer: self.buffer_strategy.build(),
             batch_size: self.batch_size,
             flush_interval_ms: self.flush_interval_ms,
             middleware: self.middleware,
@@ -186,7 +399,7 @@ impl MessageSender {
 /// Hub runner - processes messages through the pipeline
 pub struct HubRunner {
     rx: mpsc::Receiver<Message>,
-    buffer: Arc<LockFreeBuffer>,
+    buffer: Arc<dyn HubBuffer>,
     batch_size: usize,
     flush_interval_ms: u64,
     middleware: MiddlewareChain,
@@ -208,6 +421,7 @@ impl HubRunner {
             emitters = self.emitters.len(),
             middleware = self.middleware.len(),
             buffer_capacity = self.buffer.capacity(),
+            buffer_strategy = self.buffer.strategy_name(),
             "Hub started"
         );
 
@@ -346,7 +560,7 @@ impl HubRunner {
     }
 
     /// Get a reference to the buffer for monitoring
-    pub fn buffer(&self) -> &Arc<LockFreeBuffer> {
+    pub fn buffer(&self) -> &Arc<dyn HubBuffer> {
         &self.buffer
     }
 }
@@ -399,7 +613,7 @@ fn partition_by_destination(
 ///
 /// When shutdown is signaled, drains the buffer completely before exiting.
 async fn flush_loop(
-    buffer: Arc<LockFreeBuffer>,
+    buffer: Arc<dyn HubBuffer>,
     emitters: Vec<Arc<dyn Emitter>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     batch_size: usize,
@@ -497,7 +711,7 @@ mod tests {
             .middleware(Transform::new(|msg| msg))
             .emitter(StdoutEmitter::new());
 
-        assert_eq!(hub.buffer_capacity, 1000);
+        // Verify strategy was set (can't inspect capacity directly, but emitters count is visible)
         assert_eq!(hub.emitters.len(), 1);
     }
 
@@ -903,5 +1117,113 @@ mod tests {
             "Expected emit within 500ms, but took {:?} (inline flush not working)",
             emit_latency
         );
+    }
+
+    // ========================================================================
+    // Buffer strategy tests
+    // ========================================================================
+
+    #[test]
+    fn test_buffer_strategy_standard() {
+        let hub = Hub::new().buffer_strategy(BufferStrategy::standard(5000));
+
+        let (_sender, runner) = hub.build();
+
+        // Should have standard strategy
+        assert_eq!(runner.buffer.strategy_name(), "standard");
+        assert_eq!(runner.buffer.capacity(), 5000);
+    }
+
+    #[test]
+    fn test_buffer_strategy_tiered() {
+        let hub = Hub::new().buffer_strategy(BufferStrategy::tiered(3000, 2000));
+
+        let (_sender, runner) = hub.build();
+
+        // Should have tiered strategy
+        assert_eq!(runner.buffer.strategy_name(), "tiered");
+        // Total capacity = primary + secondary
+        assert_eq!(runner.buffer.capacity(), 5000);
+    }
+
+    #[tokio::test]
+    async fn test_tiered_buffer_handles_overflow() {
+        use std::sync::atomic::AtomicU64;
+
+        struct CountingEmitter {
+            count: AtomicU64,
+        }
+
+        impl CountingEmitter {
+            fn new() -> Self {
+                Self {
+                    count: AtomicU64::new(0),
+                }
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl crate::emit::Emitter for CountingEmitter {
+            fn name(&self) -> &'static str {
+                "counter"
+            }
+
+            async fn emit(
+                &self,
+                events: &[crate::proto::Event],
+            ) -> Result<(), crate::error::PluginError> {
+                self.count.fetch_add(events.len() as u64, Ordering::SeqCst);
+                Ok(())
+            }
+
+            async fn health(&self) -> bool {
+                true
+            }
+        }
+
+        let emitter = Arc::new(CountingEmitter::new());
+
+        // Tiny primary buffer (5) + overflow buffer (10)
+        // This forces overflow to secondary tier
+        let hub = Hub::new()
+            .buffer_strategy(BufferStrategy::tiered(5, 10))
+            .batch_size(20) // Large batch to drain all at once
+            .flush_interval_ms(1)
+            .emitter_arc(emitter.clone());
+
+        let (sender, runner) = hub.build();
+        let runner_handle = tokio::spawn(async move { runner.run().await });
+
+        // Send 12 messages - 5 go to primary, 7 overflow to secondary (compressed)
+        for i in 0..12 {
+            let msg = Message::new("test", format!("evt-{i}"), Bytes::from("test payload"));
+            sender.send(msg).await.expect("send should work");
+        }
+
+        // Wait for flush
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Shutdown
+        drop(sender);
+        let _ = runner_handle.await;
+
+        // All 12 messages should have been processed (none dropped)
+        let emitted = emitter.count.load(Ordering::SeqCst);
+        assert!(
+            emitted >= 12,
+            "Expected at least 12 messages emitted with tiered buffer, got {}",
+            emitted
+        );
+    }
+
+    #[test]
+    fn test_buffer_capacity_sets_standard_strategy() {
+        // buffer_capacity() should set a standard strategy
+        let hub = Hub::new().buffer_capacity(7500);
+
+        let (_sender, runner) = hub.build();
+
+        assert_eq!(runner.buffer.strategy_name(), "standard");
+        assert_eq!(runner.buffer.capacity(), 7500);
     }
 }
