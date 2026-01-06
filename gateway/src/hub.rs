@@ -40,8 +40,8 @@ use crate::error::PluginError;
 use crate::message::Message;
 use crate::metrics::Metrics;
 use crate::middleware::{Middleware, MiddlewareChain};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -554,7 +554,9 @@ impl HubRunner {
         }
 
         // Assign sequence numbers to this batch for checkpoint tracking
-        let batch_start_seq = self.sequence.fetch_add(messages.len() as u64, Ordering::SeqCst);
+        let batch_start_seq = self
+            .sequence
+            .fetch_add(messages.len() as u64, Ordering::SeqCst);
         let batch_end_seq = batch_start_seq + messages.len() as u64 - 1;
 
         // Convert Messages to proto Events for outputs
@@ -1205,7 +1207,8 @@ mod tests {
                 "counter"
             }
             async fn emit(&self, events: &[crate::proto::Event]) -> Result<(), PluginError> {
-                self.count.fetch_add(events.len(), std::sync::atomic::Ordering::SeqCst);
+                self.count
+                    .fetch_add(events.len(), std::sync::atomic::Ordering::SeqCst);
                 Ok(())
             }
             async fn health(&self) -> bool {
