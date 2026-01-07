@@ -119,18 +119,18 @@ impl CircuitBreakerEmitter {
 
             CircuitState::Open => {
                 // Check if reset timeout has elapsed
-                if let Some(last_failure) = state.last_failure_time
-                    && last_failure.elapsed() >= self.config.reset_timeout
-                {
-                    // Transition to HalfOpen
-                    state.state = CircuitState::HalfOpen;
-                    state.half_open_requests = 1; // Allow this request
-                    state.consecutive_successes = 0;
-                    tracing::info!(
-                        emitter = self.inner.name(),
-                        "circuit breaker transitioning to half-open"
-                    );
-                    return true;
+                if let Some(last_failure) = state.last_failure_time {
+                    if last_failure.elapsed() >= self.config.reset_timeout {
+                        // Transition to HalfOpen
+                        state.state = CircuitState::HalfOpen;
+                        state.half_open_requests = 1; // Allow this request
+                        state.consecutive_successes = 0;
+                        tracing::info!(
+                            emitter = self.inner.name(),
+                            "circuit breaker transitioning to half-open"
+                        );
+                        return true;
+                    }
                 }
                 self.rejected_count.fetch_add(1, Ordering::Relaxed);
                 false
