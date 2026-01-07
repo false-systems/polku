@@ -388,13 +388,7 @@ impl Hub {
         let initial_sequence = self
             .checkpoint_store
             .as_ref()
-            .and_then(|store| {
-                store
-                    .all()
-                    .values()
-                    .max()
-                    .map(|max| max + 1)
-            })
+            .and_then(|store| store.all().values().max().map(|max| max + 1))
             .unwrap_or(0);
 
         let runner = HubRunner {
@@ -645,7 +639,6 @@ fn partition_by_destination_owned(
     events: Vec<crate::proto::Event>,
     emitters: &[Arc<dyn Emitter>],
 ) -> std::collections::HashMap<&'static str, Vec<crate::proto::Event>> {
-
     if emitters.is_empty() || events.is_empty() {
         return std::collections::HashMap::new();
     }
