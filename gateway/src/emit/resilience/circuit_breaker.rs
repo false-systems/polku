@@ -119,6 +119,8 @@ impl CircuitBreakerEmitter {
 
             CircuitState::Open => {
                 // Check if reset timeout has elapsed
+                // Note: clippy suggests `if let ... &&` but that's unstable (RFC 2497)
+                #[allow(clippy::collapsible_if)]
                 if let Some(last_failure) = state.last_failure_time {
                     if last_failure.elapsed() >= self.config.reset_timeout {
                         // Transition to HalfOpen

@@ -382,6 +382,21 @@ impl Hub {
 
         let sender = MessageSender { tx };
 
+        // Initialize sequence from checkpoint store to resume after restart.
+        // If checkpoints exist, start from max checkpoint + 1 to avoid conflicts.
+        // This ensures sequence numbers are always monotonically increasing across restarts.
+        let initial_sequence = self
+            .checkpoint_store
+            .as_ref()
+            .and_then(|store| {
+                store
+                    .all()
+                    .values()
+                    .max()
+                    .map(|max| max + 1)
+            })
+            .unwrap_or(0);
+
         let runner = HubRunner {
             rx,
             buffer: self.buffer_strategy.build(),
@@ -390,7 +405,7 @@ impl Hub {
             middleware: self.middleware,
             emitters: self.emitters,
             checkpoint_store: self.checkpoint_store,
-            sequence: Arc::new(AtomicU64::new(0)),
+            sequence: Arc::new(AtomicU64::new(initial_sequence)),
         };
 
         (sender, runner)
@@ -553,11 +568,11 @@ impl HubRunner {
             return;
         }
 
-        // Assign sequence numbers to this batch for checkpoint tracking
+        // Assign sequence numbers to this batch for checkpoint tracking.
+        // Each message gets a unique sequence number for precise tracking.
         let batch_start_seq = self
             .sequence
             .fetch_add(messages.len() as u64, Ordering::SeqCst);
-        let batch_end_seq = batch_start_seq + messages.len() as u64 - 1;
 
         // Convert Messages to proto Events for outputs
         let events: Vec<crate::proto::Event> = messages
@@ -568,7 +583,9 @@ impl HubRunner {
         // Partition events by destination with zero-copy optimization
         let batches = partition_by_destination_owned(events, &self.emitters);
 
-        // Send pre-partitioned batches to each emitter
+        // Send pre-partitioned batches to each emitter.
+        // Each emitter's checkpoint advances by the number of events IT processed,
+        // not the total batch size (which may differ due to routing).
         for emitter in &self.emitters {
             let routed_events = match batches.get(emitter.name()) {
                 Some(events) if !events.is_empty() => events,
@@ -597,9 +614,12 @@ impl HubRunner {
                         metrics.record_forwarded(emitter.name(), &event.event_type, 1);
                     }
                 }
-                // Update checkpoint for this emitter on success
+                // Update checkpoint: advance by number of events this emitter processed.
+                // Uses batch_start_seq + emitter's event count - 1 as the checkpoint.
+                // This ensures each emitter tracks its own progress independently.
                 if let Some(ref store) = self.checkpoint_store {
-                    store.set(emitter.name(), batch_end_seq);
+                    let emitter_end_seq = batch_start_seq + routed_events.len() as u64 - 1;
+                    store.set(emitter.name(), emitter_end_seq);
                 }
             }
         }
@@ -614,18 +634,17 @@ impl HubRunner {
 /// Partition events by destination, returning ready-to-emit batches
 ///
 /// For events that go to only ONE emitter, moves the event (no clone).
-/// For events that go to MULTIPLE emitters, clones only as needed.
+/// For events that go to MULTIPLE emitters, clones N-1 times (last one is moved).
 ///
 /// # Performance
 ///
 /// - Single pass to count destinations per event: O(events × emitters)
 /// - Second pass to distribute: O(events × avg_destinations)
-/// - Shared events use Arc for zero-copy fan-out
+/// - Multi-destination events: N-1 clones instead of N (last destination gets moved value)
 fn partition_by_destination_owned(
     events: Vec<crate::proto::Event>,
     emitters: &[Arc<dyn Emitter>],
 ) -> std::collections::HashMap<&'static str, Vec<crate::proto::Event>> {
-    use std::sync::Arc as StdArc;
 
     if emitters.is_empty() || events.is_empty() {
         return std::collections::HashMap::new();
@@ -644,7 +663,8 @@ fn partition_by_destination_owned(
 
     // First pass: count destinations for each event
     let mut dest_counts: Vec<usize> = vec![0; events.len()];
-    let mut destinations: Vec<Vec<&'static str>> = vec![Vec::new(); events.len()];
+    let mut destinations: Vec<Vec<&'static str>> =
+        vec![Vec::with_capacity(emitters.len()); events.len()];
 
     for (idx, event) in events.iter().enumerate() {
         let broadcast = event.route_to.is_empty();
@@ -659,7 +679,7 @@ fn partition_by_destination_owned(
 
     // Second pass: distribute events
     // - Single destination: move (no clone)
-    // - Multiple destinations: use Arc for zero-copy sharing, clone on final access
+    // - Multiple destinations: clone N-1 times, move on final access
     for (idx, event) in events.into_iter().enumerate() {
         let count = dest_counts[idx];
         let dests = &destinations[idx];
@@ -675,20 +695,17 @@ fn partition_by_destination_owned(
                 }
             }
             _ => {
-                // Multiple destinations: wrap in Arc for shared access
-                let shared = StdArc::new(event);
+                // Multiple destinations: clone for first N-1, move for last
+                // This saves one clone compared to cloning for all N destinations
                 for (i, dest) in dests.iter().enumerate() {
                     if let Some(batch) = batches.get_mut(*dest) {
                         if i == dests.len() - 1 {
-                            // Last destination: try to unwrap or clone
-                            match StdArc::try_unwrap(shared) {
-                                Ok(owned) => batch.push(owned),
-                                Err(arc) => batch.push((*arc).clone()),
-                            }
+                            // Last destination: move the original
+                            batch.push(event);
                             break;
                         } else {
-                            // Not last: clone from Arc
-                            batch.push((*shared).clone());
+                            // Not last: clone
+                            batch.push(event.clone());
                         }
                     }
                 }
@@ -738,9 +755,9 @@ async fn flush_loop(
             continue;
         }
 
-        // Assign sequence numbers to this batch for checkpoint tracking
+        // Assign sequence numbers to this batch for checkpoint tracking.
+        // Each message gets a unique sequence number for precise tracking.
         let batch_start_seq = sequence.fetch_add(messages.len() as u64, Ordering::SeqCst);
-        let batch_end_seq = batch_start_seq + messages.len() as u64 - 1;
 
         // Convert Messages to proto Events for outputs
         let events: Vec<crate::proto::Event> = messages
@@ -750,10 +767,12 @@ async fn flush_loop(
 
         // Partition events by destination with zero-copy optimization
         // - Single-destination events: moved, not cloned
-        // - Multi-destination events: cloned only as needed
+        // - Multi-destination events: N-1 clones (last one moved)
         let batches = partition_by_destination_owned(events, &emitters);
 
-        // Send pre-partitioned batches to each emitter
+        // Send pre-partitioned batches to each emitter.
+        // Each emitter's checkpoint advances by the number of events IT processed,
+        // not the total batch size (which may differ due to routing).
         for emitter in &emitters {
             let routed_events = match batches.get(emitter.name()) {
                 Some(events) if !events.is_empty() => events,
@@ -784,9 +803,12 @@ async fn flush_loop(
                         metrics.record_forwarded(emitter.name(), &event.event_type, 1);
                     }
                 }
-                // Update checkpoint for this emitter on success
+                // Update checkpoint: advance by number of events this emitter processed.
+                // Uses batch_start_seq + emitter's event count - 1 as the checkpoint.
+                // This ensures each emitter tracks its own progress independently.
                 if let Some(ref store) = checkpoint_store {
-                    store.set(emitter.name(), batch_end_seq);
+                    let emitter_end_seq = batch_start_seq + routed_events.len() as u64 - 1;
+                    store.set(emitter.name(), emitter_end_seq);
                 }
             }
         }
