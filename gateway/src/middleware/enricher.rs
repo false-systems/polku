@@ -116,7 +116,7 @@ mod tests {
     #[tokio::test]
     async fn test_enricher_uses_message_context() {
         let enricher = Enricher::new(|msg| {
-            let source = msg.source.clone();
+            let source = msg.source; // InternedStr is Copy
             async move {
                 let mut meta = HashMap::new();
                 meta.insert("source_upper".to_string(), source.to_uppercase());

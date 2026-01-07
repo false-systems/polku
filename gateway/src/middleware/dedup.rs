@@ -90,11 +90,13 @@ impl Deduplicator {
 
         let mut seen = self.seen.lock();
 
-        if let Some(last_seen) = seen.get(id)
-            && now.duration_since(*last_seen) < self.ttl
-        {
-            // Duplicate within TTL
-            return false;
+        // Note: clippy suggests `if let ... &&` but that's unstable (RFC 2497)
+        #[allow(clippy::collapsible_if)]
+        if let Some(last_seen) = seen.get(id) {
+            if now.duration_since(*last_seen) < self.ttl {
+                // Duplicate within TTL
+                return false;
+            }
         }
 
         // New or expired - record and allow

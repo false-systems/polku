@@ -224,7 +224,7 @@ mod tests {
     fn test_clone_is_copy() {
         let s1 = InternedStr::new("copyable");
         let s2 = s1; // Copy, not move
-        let s3 = s1.clone();
+        let s3 = s1; // Also Copy
         assert_eq!(s1, s2);
         assert_eq!(s1, s3);
     }
@@ -240,7 +240,9 @@ mod tests {
     fn test_eq_with_str() {
         let s = InternedStr::new("compare");
         assert!(s == "compare");
-        assert!(s == String::from("compare"));
+        // Also test owned String comparison
+        let owned = String::from("compare");
+        assert!(s == owned);
     }
 
     #[test]

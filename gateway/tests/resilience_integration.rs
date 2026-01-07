@@ -3,6 +3,8 @@
 //! These tests verify that resilience wrappers work correctly together
 //! and integrate properly with the Hub.
 
+#![allow(clippy::unwrap_used, clippy::len_zero)]
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use polku_gateway::{

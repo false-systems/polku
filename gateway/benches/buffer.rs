@@ -4,6 +4,8 @@
 //! - RingBuffer: Mutex-based (original)
 //! - LockFreeBuffer: crossbeam-based (Monster optimization)
 
+#![allow(clippy::unwrap_used, unused_imports)]
+
 use bytes::Bytes;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use polku_gateway::Message;

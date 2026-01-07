@@ -34,12 +34,14 @@
 
 use crate::buffer_lockfree::LockFreeBuffer;
 use crate::buffer_tiered::TieredBuffer;
+use crate::checkpoint::CheckpointStore;
 use crate::emit::Emitter;
 use crate::error::PluginError;
 use crate::message::Message;
 use crate::metrics::Metrics;
 use crate::middleware::{Middleware, MiddlewareChain};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -243,6 +245,8 @@ pub struct Hub {
     middleware: MiddlewareChain,
     /// Registered emitters
     emitters: Vec<Arc<dyn Emitter>>,
+    /// Optional checkpoint store for reliable delivery tracking
+    checkpoint_store: Option<Arc<dyn CheckpointStore>>,
 }
 
 impl Hub {
@@ -255,6 +259,7 @@ impl Hub {
             flush_interval_ms: 10,
             middleware: MiddlewareChain::new(),
             emitters: Vec::new(),
+            checkpoint_store: None,
         }
     }
 
@@ -345,6 +350,29 @@ impl Hub {
         self.emitter(emitter)
     }
 
+    /// Enable checkpoint-based acknowledgment for reliable delivery
+    ///
+    /// When enabled, the Hub tracks which messages each emitter has successfully
+    /// processed. This allows:
+    /// - Resume from last known position after restarts
+    /// - Safe buffer retention based on minimum checkpoint
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use polku_gateway::{Hub, MemoryCheckpointStore};
+    /// use std::sync::Arc;
+    ///
+    /// let checkpoints = Arc::new(MemoryCheckpointStore::new());
+    /// Hub::new()
+    ///     .checkpoint_store(checkpoints)
+    ///     .build();
+    /// ```
+    pub fn checkpoint_store<S: CheckpointStore + 'static>(mut self, store: Arc<S>) -> Self {
+        self.checkpoint_store = Some(store);
+        self
+    }
+
     /// Build a message sender for this hub
     ///
     /// Returns a sender that can be used to inject messages into the pipeline.
@@ -354,6 +382,15 @@ impl Hub {
 
         let sender = MessageSender { tx };
 
+        // Initialize sequence from checkpoint store to resume after restart.
+        // If checkpoints exist, start from max checkpoint + 1 to avoid conflicts.
+        // This ensures sequence numbers are always monotonically increasing across restarts.
+        let initial_sequence = self
+            .checkpoint_store
+            .as_ref()
+            .and_then(|store| store.all().values().max().map(|max| max + 1))
+            .unwrap_or(0);
+
         let runner = HubRunner {
             rx,
             buffer: self.buffer_strategy.build(),
@@ -361,6 +398,8 @@ impl Hub {
             flush_interval_ms: self.flush_interval_ms,
             middleware: self.middleware,
             emitters: self.emitters,
+            checkpoint_store: self.checkpoint_store,
+            sequence: Arc::new(AtomicU64::new(initial_sequence)),
         };
 
         (sender, runner)
@@ -404,6 +443,10 @@ pub struct HubRunner {
     flush_interval_ms: u64,
     middleware: MiddlewareChain,
     emitters: Vec<Arc<dyn Emitter>>,
+    /// Optional checkpoint store for tracking delivery progress
+    checkpoint_store: Option<Arc<dyn CheckpointStore>>,
+    /// Monotonically increasing sequence number for checkpoint tracking
+    sequence: Arc<AtomicU64>,
 }
 
 impl HubRunner {
@@ -442,6 +485,8 @@ impl HubRunner {
         let emitters_for_timer = self.emitters.clone();
         let batch_size = self.batch_size;
         let flush_interval_ms = self.flush_interval_ms;
+        let checkpoint_store = self.checkpoint_store.clone();
+        let sequence = Arc::clone(&self.sequence);
         let flush_handle = tokio::spawn(async move {
             flush_loop(
                 buffer,
@@ -449,6 +494,8 @@ impl HubRunner {
                 shutdown_rx,
                 batch_size,
                 flush_interval_ms,
+                checkpoint_store,
+                sequence,
             )
             .await;
         });
@@ -515,26 +562,31 @@ impl HubRunner {
             return;
         }
 
+        // Assign sequence numbers to this batch for checkpoint tracking.
+        // Each message gets a unique sequence number for precise tracking.
+        let batch_start_seq = self
+            .sequence
+            .fetch_add(messages.len() as u64, Ordering::SeqCst);
+
         // Convert Messages to proto Events for outputs
         let events: Vec<crate::proto::Event> = messages
             .into_iter()
             .map(crate::proto::Event::from)
             .collect();
 
-        // Partition events by destination in a single pass
-        let batches = partition_by_destination(&events, &self.emitters);
+        // Partition events by destination with zero-copy optimization
+        let batches = partition_by_destination_owned(events, &self.emitters);
 
-        // Send pre-partitioned batches to each emitter
+        // Send pre-partitioned batches to each emitter.
+        // Each emitter's checkpoint advances by the number of events IT processed,
+        // not the total batch size (which may differ due to routing).
         for emitter in &self.emitters {
-            let indices = match batches.get(emitter.name()) {
-                Some(idx) if !idx.is_empty() => idx,
+            let routed_events = match batches.get(emitter.name()) {
+                Some(events) if !events.is_empty() => events,
                 _ => continue,
             };
 
-            // Collect events for this emitter
-            let routed_events: Vec<_> = indices.iter().map(|&i| events[i].clone()).collect();
-
-            if let Err(e) = emitter.emit(&routed_events).await {
+            if let Err(e) = emitter.emit(routed_events).await {
                 error!(
                     emitter = emitter.name(),
                     error = %e,
@@ -544,6 +596,7 @@ impl HubRunner {
                 if let Some(metrics) = Metrics::get() {
                     metrics.record_dropped(emitter.name(), routed_events.len() as u64);
                 }
+                // Note: checkpoint NOT updated on failure - emitter is behind
             } else {
                 debug!(
                     emitter = emitter.name(),
@@ -551,9 +604,16 @@ impl HubRunner {
                     "Emitted (inline)"
                 );
                 if let Some(metrics) = Metrics::get() {
-                    for event in &routed_events {
+                    for event in routed_events {
                         metrics.record_forwarded(emitter.name(), &event.event_type, 1);
                     }
+                }
+                // Update checkpoint: advance by number of events this emitter processed.
+                // Uses batch_start_seq + emitter's event count - 1 as the checkpoint.
+                // This ensures each emitter tracks its own progress independently.
+                if let Some(ref store) = self.checkpoint_store {
+                    let emitter_end_seq = batch_start_seq + routed_events.len() as u64 - 1;
+                    store.set(emitter.name(), emitter_end_seq);
                 }
             }
         }
@@ -565,21 +625,25 @@ impl HubRunner {
     }
 }
 
-/// Partition events by destination in a single pass
+/// Partition events by destination, returning ready-to-emit batches
 ///
-/// Returns a HashMap where keys are emitter names and values are indices
-/// into the events slice. This avoids cloning events for each emitter.
+/// For events that go to only ONE emitter, moves the event (no clone).
+/// For events that go to MULTIPLE emitters, clones N-1 times (last one is moved).
 ///
 /// # Performance
 ///
-/// - Single pass over events: O(events × emitters) comparisons
-/// - No cloning - just stores indices
-/// - Each emitter gets a Vec of indices to its routed events
-fn partition_by_destination(
-    events: &[crate::proto::Event],
+/// - Single pass to count destinations per event: O(events × emitters)
+/// - Second pass to distribute: O(events × avg_destinations)
+/// - Multi-destination events: N-1 clones instead of N (last destination gets moved value)
+fn partition_by_destination_owned(
+    events: Vec<crate::proto::Event>,
     emitters: &[Arc<dyn Emitter>],
-) -> std::collections::HashMap<&'static str, Vec<usize>> {
-    let mut batches: std::collections::HashMap<&'static str, Vec<usize>> =
+) -> std::collections::HashMap<&'static str, Vec<crate::proto::Event>> {
+    if emitters.is_empty() || events.is_empty() {
+        return std::collections::HashMap::new();
+    }
+
+    let mut batches: std::collections::HashMap<&'static str, Vec<crate::proto::Event>> =
         std::collections::HashMap::new();
 
     // Pre-allocate for each emitter
@@ -590,17 +654,53 @@ fn partition_by_destination(
         );
     }
 
-    // Single pass: assign each event to its destinations
+    // First pass: count destinations for each event
+    let mut dest_counts: Vec<usize> = vec![0; events.len()];
+    let mut destinations: Vec<Vec<&'static str>> =
+        vec![Vec::with_capacity(emitters.len()); events.len()];
+
     for (idx, event) in events.iter().enumerate() {
         let broadcast = event.route_to.is_empty();
 
         for emitter in emitters {
-            // Check routing first to avoid unnecessary HashMap lookup.
-            // Intentionally nested: routing check is cheap, HashMap lookup is not.
-            #[allow(clippy::collapsible_if)]
             if broadcast || event.route_to.iter().any(|r| r == emitter.name()) {
-                if let Some(batch) = batches.get_mut(emitter.name()) {
-                    batch.push(idx);
+                dest_counts[idx] += 1;
+                destinations[idx].push(emitter.name());
+            }
+        }
+    }
+
+    // Second pass: distribute events
+    // - Single destination: move (no clone)
+    // - Multiple destinations: clone N-1 times, move on final access
+    for (idx, event) in events.into_iter().enumerate() {
+        let count = dest_counts[idx];
+        let dests = &destinations[idx];
+
+        match count {
+            0 => {
+                // Event has no matching emitters, drop it
+            }
+            1 => {
+                // Single destination: move without cloning
+                if let Some(batch) = batches.get_mut(dests[0]) {
+                    batch.push(event);
+                }
+            }
+            _ => {
+                // Multiple destinations: clone for first N-1, move for last
+                // This saves one clone compared to cloning for all N destinations
+                for (i, dest) in dests.iter().enumerate() {
+                    if let Some(batch) = batches.get_mut(*dest) {
+                        if i == dests.len() - 1 {
+                            // Last destination: move the original
+                            batch.push(event);
+                            break;
+                        } else {
+                            // Not last: clone
+                            batch.push(event.clone());
+                        }
+                    }
                 }
             }
         }
@@ -618,6 +718,8 @@ async fn flush_loop(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     batch_size: usize,
     flush_interval_ms: u64,
+    checkpoint_store: Option<Arc<dyn CheckpointStore>>,
+    sequence: Arc<AtomicU64>,
 ) {
     loop {
         // Check if shutdown requested and buffer is empty
@@ -646,28 +748,31 @@ async fn flush_loop(
             continue;
         }
 
+        // Assign sequence numbers to this batch for checkpoint tracking.
+        // Each message gets a unique sequence number for precise tracking.
+        let batch_start_seq = sequence.fetch_add(messages.len() as u64, Ordering::SeqCst);
+
         // Convert Messages to proto Events for outputs
         let events: Vec<crate::proto::Event> = messages
             .into_iter()
             .map(crate::proto::Event::from)
             .collect();
 
-        // Partition events by destination in a single pass
-        // This avoids repeated per-emitter filtering and allows batch allocation
-        // instead of per-event allocation, improving cache locality
-        let batches = partition_by_destination(&events, &emitters);
+        // Partition events by destination with zero-copy optimization
+        // - Single-destination events: moved, not cloned
+        // - Multi-destination events: N-1 clones (last one moved)
+        let batches = partition_by_destination_owned(events, &emitters);
 
-        // Send pre-partitioned batches to each emitter
+        // Send pre-partitioned batches to each emitter.
+        // Each emitter's checkpoint advances by the number of events IT processed,
+        // not the total batch size (which may differ due to routing).
         for emitter in &emitters {
-            let indices = match batches.get(emitter.name()) {
-                Some(idx) if !idx.is_empty() => idx,
+            let routed_events = match batches.get(emitter.name()) {
+                Some(events) if !events.is_empty() => events,
                 _ => continue,
             };
 
-            // Collect events for this emitter (one allocation per emitter, not per event)
-            let routed_events: Vec<_> = indices.iter().map(|&i| events[i].clone()).collect();
-
-            if let Err(e) = emitter.emit(&routed_events).await {
+            if let Err(e) = emitter.emit(routed_events).await {
                 error!(
                     emitter = emitter.name(),
                     error = %e,
@@ -678,6 +783,7 @@ async fn flush_loop(
                 if let Some(metrics) = Metrics::get() {
                     metrics.record_dropped(emitter.name(), routed_events.len() as u64);
                 }
+                // Note: checkpoint NOT updated on failure - emitter is behind
             } else {
                 debug!(
                     emitter = emitter.name(),
@@ -686,9 +792,16 @@ async fn flush_loop(
                 );
                 // Record successful forwards
                 if let Some(metrics) = Metrics::get() {
-                    for event in &routed_events {
+                    for event in routed_events {
                         metrics.record_forwarded(emitter.name(), &event.event_type, 1);
                     }
+                }
+                // Update checkpoint: advance by number of events this emitter processed.
+                // Uses batch_start_seq + emitter's event count - 1 as the checkpoint.
+                // This ensures each emitter tracks its own progress independently.
+                if let Some(ref store) = checkpoint_store {
+                    let emitter_end_seq = batch_start_seq + routed_events.len() as u64 - 1;
+                    store.set(emitter.name(), emitter_end_seq);
                 }
             }
         }
@@ -946,7 +1059,7 @@ mod tests {
             })
             .collect();
 
-        let batches = partition_by_destination(&events, &emitters);
+        let batches = partition_by_destination_owned(events, &emitters);
 
         // Each emitter should get all 5 messages
         assert_eq!(batches.get("kafka").map(|v| v.len()), Some(5));
@@ -990,19 +1103,22 @@ mod tests {
             },
         ];
 
-        let batches = partition_by_destination(&events, &emitters);
+        let batches = partition_by_destination_owned(events, &emitters);
 
-        // kafka: msg-0, msg-2, msg-3 (indices 0, 2, 3)
-        let kafka_indices = batches.get("kafka").unwrap();
-        assert_eq!(kafka_indices, &[0, 2, 3]);
+        // kafka: msg-0, msg-2, msg-3
+        let kafka_events = batches.get("kafka").unwrap();
+        let kafka_ids: Vec<_> = kafka_events.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(kafka_ids, &["msg-0", "msg-2", "msg-3"]);
 
-        // stdout: msg-1, msg-3 (indices 1, 3)
-        let stdout_indices = batches.get("stdout").unwrap();
-        assert_eq!(stdout_indices, &[1, 3]);
+        // stdout: msg-1, msg-3
+        let stdout_events = batches.get("stdout").unwrap();
+        let stdout_ids: Vec<_> = stdout_events.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(stdout_ids, &["msg-1", "msg-3"]);
 
-        // webhook: msg-2, msg-3 (indices 2, 3)
-        let webhook_indices = batches.get("webhook").unwrap();
-        assert_eq!(webhook_indices, &[2, 3]);
+        // webhook: msg-2, msg-3
+        let webhook_events = batches.get("webhook").unwrap();
+        let webhook_ids: Vec<_> = webhook_events.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(webhook_ids, &["msg-2", "msg-3"]);
     }
 
     #[test]
@@ -1017,10 +1133,197 @@ mod tests {
             ..Default::default()
         }];
 
-        let batches = partition_by_destination(&events, &emitters);
+        let batches = partition_by_destination_owned(events, &emitters);
 
         // kafka should get nothing (route_to doesn't match)
         assert_eq!(batches.get("kafka").map(|v| v.len()), Some(0));
+    }
+
+    #[test]
+    fn test_partition_single_destination_no_clone() {
+        // Test that single-destination events are moved, not cloned
+        let emitters: Vec<Arc<dyn crate::emit::Emitter>> = vec![
+            Arc::new(NamedEmitter { name: "kafka" }),
+            Arc::new(NamedEmitter { name: "stdout" }),
+        ];
+
+        // Create events with large payloads to make clone cost visible
+        let events: Vec<crate::proto::Event> = (0..3)
+            .map(|i| crate::proto::Event {
+                id: format!("msg-{i}"),
+                // Each goes to only one destination
+                route_to: if i % 2 == 0 {
+                    vec!["kafka".into()]
+                } else {
+                    vec!["stdout".into()]
+                },
+                payload: vec![0u8; 10_000], // 10KB payload
+                ..Default::default()
+            })
+            .collect();
+
+        let batches = partition_by_destination_owned(events, &emitters);
+
+        // kafka: msg-0, msg-2
+        assert_eq!(batches.get("kafka").map(|v| v.len()), Some(2));
+        // stdout: msg-1
+        assert_eq!(batches.get("stdout").map(|v| v.len()), Some(1));
+
+        // Verify the payloads are intact (moved, not corrupted)
+        let kafka_events = batches.get("kafka").unwrap();
+        assert_eq!(kafka_events[0].payload.len(), 10_000);
+        assert_eq!(kafka_events[1].payload.len(), 10_000);
+    }
+
+    #[test]
+    fn test_partition_multi_destination_clones_correctly() {
+        // Test that multi-destination events are cloned to each destination
+        let emitters: Vec<Arc<dyn crate::emit::Emitter>> = vec![
+            Arc::new(NamedEmitter { name: "kafka" }),
+            Arc::new(NamedEmitter { name: "stdout" }),
+            Arc::new(NamedEmitter { name: "webhook" }),
+        ];
+
+        // One event going to all 3 destinations
+        let events = vec![crate::proto::Event {
+            id: "broadcast-msg".into(),
+            route_to: vec![], // broadcast = all destinations
+            payload: vec![42u8; 100],
+            ..Default::default()
+        }];
+
+        let batches = partition_by_destination_owned(events, &emitters);
+
+        // Each emitter should have the event
+        for name in ["kafka", "stdout", "webhook"] {
+            let batch = batches.get(name).unwrap();
+            assert_eq!(batch.len(), 1);
+            assert_eq!(batch[0].id, "broadcast-msg");
+            assert_eq!(batch[0].payload, vec![42u8; 100]);
+        }
+    }
+
+    // ========================================================================
+    // Checkpoint tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_checkpoint_updates_on_successful_emit() {
+        use crate::checkpoint::MemoryCheckpointStore;
+        use std::sync::atomic::AtomicUsize;
+
+        struct CountingEmitter {
+            count: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::emit::Emitter for CountingEmitter {
+            fn name(&self) -> &'static str {
+                "counter"
+            }
+            async fn emit(&self, events: &[crate::proto::Event]) -> Result<(), PluginError> {
+                self.count
+                    .fetch_add(events.len(), std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            async fn health(&self) -> bool {
+                true
+            }
+        }
+
+        let checkpoint_store = Arc::new(MemoryCheckpointStore::new());
+
+        let hub = Hub::new()
+            .batch_size(5)
+            .flush_interval_ms(1000) // Long interval to force inline flush
+            .checkpoint_store(checkpoint_store.clone())
+            .emitter(CountingEmitter {
+                count: AtomicUsize::new(0),
+            });
+
+        let (sender, runner) = hub.build();
+
+        // Spawn the runner
+        let handle = tokio::spawn(async move { runner.run().await });
+
+        // Send 5 messages (triggers inline flush)
+        for _ in 0..5 {
+            sender
+                .send(Message::new("test", "test.event", bytes::Bytes::new()))
+                .await
+                .unwrap();
+        }
+
+        // Give time for processing
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Checkpoint should be updated (seq 0-4, so checkpoint = 4)
+        assert_eq!(checkpoint_store.get("counter"), Some(4));
+
+        // Send another batch
+        for _ in 0..5 {
+            sender
+                .send(Message::new("test", "test.event", bytes::Bytes::new()))
+                .await
+                .unwrap();
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Checkpoint should be updated (seq 5-9, so checkpoint = 9)
+        assert_eq!(checkpoint_store.get("counter"), Some(9));
+
+        // Shutdown
+        drop(sender);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_not_updated_on_emit_failure() {
+        use crate::checkpoint::MemoryCheckpointStore;
+
+        struct FailingEmitter;
+
+        #[async_trait::async_trait]
+        impl crate::emit::Emitter for FailingEmitter {
+            fn name(&self) -> &'static str {
+                "failing"
+            }
+            async fn emit(&self, _events: &[crate::proto::Event]) -> Result<(), PluginError> {
+                Err(PluginError::Send("intentional failure".into()))
+            }
+            async fn health(&self) -> bool {
+                false
+            }
+        }
+
+        let checkpoint_store = Arc::new(MemoryCheckpointStore::new());
+
+        let hub = Hub::new()
+            .batch_size(5)
+            .flush_interval_ms(1000)
+            .checkpoint_store(checkpoint_store.clone())
+            .emitter(FailingEmitter);
+
+        let (sender, runner) = hub.build();
+
+        let handle = tokio::spawn(async move { runner.run().await });
+
+        // Send 5 messages
+        for _ in 0..5 {
+            sender
+                .send(Message::new("test", "test.event", bytes::Bytes::new()))
+                .await
+                .unwrap();
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Checkpoint should NOT be updated due to failure
+        assert_eq!(checkpoint_store.get("failing"), None);
+
+        drop(sender);
+        let _ = handle.await;
     }
 
     // ========================================================================

@@ -118,6 +118,52 @@ Hub::new()
 
 ---
 
+## Buffer Strategies
+
+POLKU supports pluggable buffer strategies for different traffic patterns:
+
+```rust
+use polku_gateway::{Hub, BufferStrategy};
+
+// Standard: Fast lock-free buffer, drops on overflow (default)
+Hub::new()
+    .buffer_strategy(BufferStrategy::standard(10_000))
+    .build();
+
+// Tiered: Primary + compressed overflow for graceful degradation
+Hub::new()
+    .buffer_strategy(BufferStrategy::tiered(10_000, 5_000))
+    .build();
+```
+
+| Strategy | Best For | Overflow Behavior |
+|----------|----------|-------------------|
+| **Standard** | Steady traffic, low latency | Drops new messages |
+| **Tiered** | Traffic spikes, reliability | Compresses to secondary buffer |
+
+---
+
+## Reliable Delivery
+
+Enable checkpoint-based acknowledgment for at-least-once delivery:
+
+```rust
+use polku_gateway::{Hub, MemoryCheckpointStore};
+use std::sync::Arc;
+
+let checkpoints = Arc::new(MemoryCheckpointStore::new());
+
+Hub::new()
+    .checkpoint_store(checkpoints.clone())
+    .emitter(MyEmitter::new())
+    .build();
+
+// Query safe retention point
+let min_seq = checkpoints.min_checkpoint();
+```
+
+---
+
 ## Deployment Modes
 
 | Mode | Description |
