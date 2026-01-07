@@ -2,6 +2,8 @@
 //!
 //! Measures cost of each middleware type per message.
 
+#![allow(clippy::unwrap_used)]
+
 use bytes::Bytes;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use polku_gateway::{

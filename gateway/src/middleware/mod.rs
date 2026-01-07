@@ -229,11 +229,11 @@ mod tests {
     async fn test_passthrough() {
         let mw = PassThrough;
         let msg = Message::new("test", "evt", Bytes::new());
-        let id = msg.id.clone();
+        let id = msg.id; // MessageId is Copy
 
         let result = mw.process(msg).await;
         assert!(result.is_some());
-        assert_eq!(result.expect("should have message").id, id);
+        assert_eq!(result.unwrap().id, id);
     }
 
     #[tokio::test]

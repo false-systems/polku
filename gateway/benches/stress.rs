@@ -2,6 +2,8 @@
 //!
 //! Pushes until buffer overflows or system chokes.
 
+#![allow(clippy::unwrap_used)]
+
 use bytes::Bytes;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use polku_gateway::{Emitter, Event, Hub, Message, PluginError};

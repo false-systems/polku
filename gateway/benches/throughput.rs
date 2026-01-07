@@ -2,6 +2,8 @@
 //!
 //! Measures messages/second through the full pipeline.
 
+#![allow(clippy::unwrap_used, clippy::redundant_async_block)]
+
 use bytes::Bytes;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use polku_gateway::{Emitter, Event, Hub, Message, PluginError};
