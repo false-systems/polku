@@ -358,28 +358,10 @@ impl Metrics {
     /// Set circuit breaker state for an emitter
     ///
     /// States: 0 = Closed (normal), 1 = Open (rejecting), 2 = HalfOpen (testing)
-    pub fn set_circuit_state(&self, emitter: &str, state: CircuitState) {
+    pub fn set_circuit_state(&self, emitter: &str, state: crate::emit::resilience::CircuitState) {
         self.circuit_breaker_state
             .with_label_values(&[emitter])
             .set(state.as_metric_value());
-    }
-}
-
-/// Circuit breaker states for metrics
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CircuitState {
-    /// Normal operation - requests pass through
-    Closed = 0,
-    /// Circuit tripped - requests rejected
-    Open = 1,
-    /// Testing recovery - limited requests allowed
-    HalfOpen = 2,
-}
-
-impl CircuitState {
-    /// Convert to metric value
-    pub fn as_metric_value(self) -> f64 {
-        self as i32 as f64
     }
 }
 
@@ -423,6 +405,40 @@ mod tests {
         if let Some(metrics) = Metrics::get() {
             metrics.record_received("tapio", "network", 10);
             metrics.set_buffer_size(100);
+        }
+    }
+
+    #[test]
+    fn test_record_forwarded_batch() {
+        // Metrics::init() may fail if already initialized from another test
+        let _ = Metrics::init();
+        if let Some(metrics) = Metrics::get() {
+            // Build a batch with aggregated counts
+            let mut counts = std::collections::HashMap::new();
+            // 5 events of type "user.created" to emitter "stdout"
+            counts.insert(("stdout", "user.created"), 5);
+            // 3 events of type "order.placed" to emitter "stdout"
+            counts.insert(("stdout", "order.placed"), 3);
+            // 2 events of type "user.created" to emitter "kafka"
+            counts.insert(("kafka", "user.created"), 2);
+
+            // Record the batch
+            metrics.record_forwarded_batch(&counts);
+
+            // Verify: Can't easily inspect Prometheus counters, but we verify
+            // the method doesn't panic and handles multiple label combinations.
+            // The actual values are tested via integration tests or Prometheus scraping.
+        }
+    }
+
+    #[test]
+    fn test_record_forwarded_batch_empty() {
+        let _ = Metrics::init();
+        if let Some(metrics) = Metrics::get() {
+            // Empty batch should not panic
+            let counts: std::collections::HashMap<(&str, &str), u64> =
+                std::collections::HashMap::new();
+            metrics.record_forwarded_batch(&counts);
         }
     }
 }

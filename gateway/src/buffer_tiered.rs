@@ -178,6 +178,8 @@ impl TieredBuffer {
         // Then drain from secondary (newer overflow, compressed)
         let remaining = n - result.len();
         let secondary_msgs = self.secondary.drain(remaining);
+        let drained_from_secondary = !secondary_msgs.is_empty();
+
         for wrapper in secondary_msgs {
             if wrapper.source == "compressed" {
                 if let Some(msg) = self.decompress_message(&wrapper) {
@@ -185,6 +187,15 @@ impl TieredBuffer {
                 }
             } else {
                 result.push(wrapper);
+            }
+        }
+
+        // Update secondary tier size metric after draining
+        // Note: clippy suggests `if ... && let` but that's unstable (RFC 2497)
+        #[allow(clippy::collapsible_if)]
+        if drained_from_secondary {
+            if let Some(m) = Metrics::get() {
+                m.set_tiered_secondary_size(self.secondary.len());
             }
         }
 

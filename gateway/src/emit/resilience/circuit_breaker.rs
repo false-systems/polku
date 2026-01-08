@@ -22,6 +22,17 @@ pub enum CircuitState {
     HalfOpen,
 }
 
+impl CircuitState {
+    /// Convert to Prometheus metric value (0=Closed, 1=Open, 2=HalfOpen)
+    pub fn as_metric_value(self) -> f64 {
+        match self {
+            CircuitState::Closed => 0.0,
+            CircuitState::Open => 1.0,
+            CircuitState::HalfOpen => 2.0,
+        }
+    }
+}
+
 /// Configuration for circuit breaker behavior
 #[derive(Debug, Clone)]
 pub struct CircuitBreakerConfig {
