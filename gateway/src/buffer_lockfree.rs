@@ -21,6 +21,7 @@
 //! - `SharedBuffer`: Stores `SharedMessage` (Arc pointer, zero-copy fan-out)
 
 use crate::message::Message;
+use crate::metrics::Metrics;
 use crate::shared_message::SharedMessage;
 use crossbeam_queue::ArrayQueue;
 use std::sync::Arc;
@@ -93,6 +94,10 @@ impl LockFreeBuffer {
                 // Note: In a more sophisticated implementation, we could
                 // pop the oldest and retry, but for now we just drop.
                 self.metrics.dropped.fetch_add(1, Ordering::Relaxed);
+                // Export overflow to Prometheus
+                if let Some(m) = Metrics::get() {
+                    m.record_buffer_overflow(1);
+                }
                 false
             }
         }
