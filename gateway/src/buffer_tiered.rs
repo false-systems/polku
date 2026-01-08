@@ -24,6 +24,7 @@
 
 use crate::buffer_lockfree::LockFreeBuffer;
 use crate::message::Message;
+use crate::metrics::Metrics;
 use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -133,14 +134,28 @@ impl TieredBuffer {
                     self.metrics
                         .bytes_saved
                         .fetch_add(saved as u64, Ordering::Relaxed);
+
+                    // Export to Prometheus
+                    if let Some(m) = Metrics::get() {
+                        m.record_compression_savings(saved as u64);
+                        m.set_tiered_secondary_size(self.secondary.len());
+                    }
                     true
                 } else {
                     self.metrics.dropped.fetch_add(1, Ordering::Relaxed);
+                    // Export overflow (drop) to Prometheus
+                    if let Some(m) = Metrics::get() {
+                        m.record_buffer_overflow(1);
+                    }
                     false
                 }
             }
             None => {
                 self.metrics.dropped.fetch_add(1, Ordering::Relaxed);
+                // Export overflow (drop) to Prometheus
+                if let Some(m) = Metrics::get() {
+                    m.record_buffer_overflow(1);
+                }
                 false
             }
         }

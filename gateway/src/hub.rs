@@ -551,6 +551,7 @@ impl HubRunner {
     ///
     /// Called inline when buffer hits threshold, and by the timer loop.
     async fn flush_batch(&self) {
+        let flush_start = std::time::Instant::now();
         let messages = self.buffer.drain(self.batch_size);
 
         // Update buffer size metric after drain
@@ -561,6 +562,8 @@ impl HubRunner {
         if messages.is_empty() {
             return;
         }
+
+        let total_events = messages.len();
 
         // Assign sequence numbers to this batch for checkpoint tracking.
         // Each message gets a unique sequence number for precise tracking.
@@ -592,7 +595,18 @@ impl HubRunner {
                 _ => continue,
             };
 
-            if let Err(e) = emitter.emit(routed_events).await {
+            let emitter_start = std::time::Instant::now();
+            let emit_result = emitter.emit(routed_events).await;
+            let emitter_duration = emitter_start.elapsed();
+
+            // Record per-emitter metrics
+            if let Some(metrics) = Metrics::get() {
+                metrics.record_batch_size(emitter.name(), routed_events.len());
+                metrics.record_flush_duration(emitter.name(), emitter_duration.as_secs_f64());
+                metrics.set_emitter_health(emitter.name(), emit_result.is_ok());
+            }
+
+            if let Err(e) = emit_result {
                 error!(
                     emitter = emitter.name(),
                     error = %e,
@@ -628,6 +642,14 @@ impl HubRunner {
         // Batch update to Prometheus - single HashMap lookup per unique label combo
         if let Some(metrics) = Metrics::get() {
             metrics.record_forwarded_batch(&forward_counts);
+            metrics.inc_flush();
+
+            // Calculate and record throughput
+            let flush_duration = flush_start.elapsed();
+            if flush_duration.as_secs_f64() > 0.0 {
+                let events_per_sec = total_events as f64 / flush_duration.as_secs_f64();
+                metrics.set_events_per_second(events_per_sec);
+            }
         }
     }
 
@@ -749,6 +771,7 @@ async fn flush_loop(
             }
         }
 
+        let flush_start = std::time::Instant::now();
         let messages = buffer.drain(batch_size);
 
         // Update buffer size metric after drain
@@ -759,6 +782,8 @@ async fn flush_loop(
         if messages.is_empty() {
             continue;
         }
+
+        let total_events = messages.len();
 
         // Assign sequence numbers to this batch for checkpoint tracking.
         // Each message gets a unique sequence number for precise tracking.
@@ -790,7 +815,18 @@ async fn flush_loop(
                 _ => continue,
             };
 
-            if let Err(e) = emitter.emit(routed_events).await {
+            let emitter_start = std::time::Instant::now();
+            let emit_result = emitter.emit(routed_events).await;
+            let emitter_duration = emitter_start.elapsed();
+
+            // Record per-emitter metrics
+            if let Some(metrics) = Metrics::get() {
+                metrics.record_batch_size(emitter.name(), routed_events.len());
+                metrics.record_flush_duration(emitter.name(), emitter_duration.as_secs_f64());
+                metrics.set_emitter_health(emitter.name(), emit_result.is_ok());
+            }
+
+            if let Err(e) = emit_result {
                 error!(
                     emitter = emitter.name(),
                     error = %e,
@@ -827,6 +863,14 @@ async fn flush_loop(
         // Batch update to Prometheus - single HashMap lookup per unique label combo
         if let Some(metrics) = Metrics::get() {
             metrics.record_forwarded_batch(&forward_counts);
+            metrics.inc_flush();
+
+            // Calculate and record throughput
+            let flush_duration = flush_start.elapsed();
+            if flush_duration.as_secs_f64() > 0.0 {
+                let events_per_sec = total_events as f64 / flush_duration.as_secs_f64();
+                metrics.set_events_per_second(events_per_sec);
+            }
         }
     }
 }

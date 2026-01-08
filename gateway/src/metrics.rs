@@ -2,8 +2,8 @@
 
 use crate::error::{PolkuError, Result};
 use prometheus::{
-    CounterVec, Encoder, Gauge, HistogramVec, TextEncoder, register_counter_vec, register_gauge,
-    register_histogram_vec,
+    Counter, CounterVec, Encoder, Gauge, GaugeVec, HistogramVec, TextEncoder, register_counter,
+    register_counter_vec, register_gauge, register_gauge_vec, register_histogram_vec,
 };
 use std::sync::OnceLock;
 
@@ -12,6 +12,9 @@ static METRICS: OnceLock<Metrics> = OnceLock::new();
 
 /// All POLKU metrics
 pub struct Metrics {
+    // ─────────────────────────────────────────────────────────────────────────
+    // Event counters
+    // ─────────────────────────────────────────────────────────────────────────
     /// Events received (by source, type)
     pub events_received: CounterVec,
 
@@ -21,12 +24,51 @@ pub struct Metrics {
     /// Events dropped (by reason)
     pub events_dropped: CounterVec,
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Throughput & performance
+    // ─────────────────────────────────────────────────────────────────────────
+    /// Instantaneous throughput (events/sec) - updated each flush
+    pub events_per_second: Gauge,
+
+    /// Total flushes performed
+    pub flush_total: Counter,
+
+    /// Batch sizes (histogram of events per flush)
+    pub batch_size: HistogramVec,
+
+    /// Flush duration in seconds
+    pub flush_duration_seconds: HistogramVec,
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Buffer metrics
+    // ─────────────────────────────────────────────────────────────────────────
     /// Current buffer size
     pub buffer_size: Gauge,
 
     /// Buffer capacity
     pub buffer_capacity: Gauge,
 
+    /// Buffer overflow events (when buffer is full)
+    pub buffer_overflow_total: Counter,
+
+    /// Bytes saved by tiered buffer compression
+    pub tiered_buffer_compressed_bytes: Counter,
+
+    /// Messages currently in secondary (compressed) tier
+    pub tiered_buffer_secondary_size: Gauge,
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Emitter health
+    // ─────────────────────────────────────────────────────────────────────────
+    /// Per-emitter health (1 = healthy, 0 = unhealthy)
+    pub emitter_health: GaugeVec,
+
+    /// Circuit breaker state per emitter (0=closed, 1=open, 2=half-open)
+    pub circuit_breaker_state: GaugeVec,
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Latency & streams
+    // ─────────────────────────────────────────────────────────────────────────
     /// Event processing latency (by source)
     pub processing_latency: HistogramVec,
 
@@ -48,6 +90,9 @@ impl Metrics {
         }
 
         let metrics = Metrics {
+            // ─────────────────────────────────────────────────────────────────
+            // Event counters
+            // ─────────────────────────────────────────────────────────────────
             events_received: register_counter_vec!(
                 "polku_events_received_total",
                 "Total events received",
@@ -69,12 +114,85 @@ impl Metrics {
             )
             .map_err(|e| PolkuError::Metrics(format!("events_dropped: {e}")))?,
 
+            // ─────────────────────────────────────────────────────────────────
+            // Throughput & performance
+            // ─────────────────────────────────────────────────────────────────
+            events_per_second: register_gauge!(
+                "polku_events_per_second",
+                "Instantaneous throughput (events/sec)"
+            )
+            .map_err(|e| PolkuError::Metrics(format!("events_per_second: {e}")))?,
+
+            flush_total: register_counter!("polku_flush_total", "Total number of flush operations")
+                .map_err(|e| PolkuError::Metrics(format!("flush_total: {e}")))?,
+
+            batch_size: register_histogram_vec!(
+                "polku_batch_size",
+                "Number of events per flush batch",
+                &["emitter"],
+                // Buckets: 1, 10, 50, 100, 500, 1000, 5000, 10000
+                vec![1.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0]
+            )
+            .map_err(|e| PolkuError::Metrics(format!("batch_size: {e}")))?,
+
+            flush_duration_seconds: register_histogram_vec!(
+                "polku_flush_duration_seconds",
+                "Time spent flushing events to emitters",
+                &["emitter"],
+                // Buckets: 100us to 10s
+                vec![
+                    0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0
+                ]
+            )
+            .map_err(|e| PolkuError::Metrics(format!("flush_duration_seconds: {e}")))?,
+
+            // ─────────────────────────────────────────────────────────────────
+            // Buffer metrics
+            // ─────────────────────────────────────────────────────────────────
             buffer_size: register_gauge!("polku_buffer_size", "Current number of events in buffer")
                 .map_err(|e| PolkuError::Metrics(format!("buffer_size: {e}")))?,
 
             buffer_capacity: register_gauge!("polku_buffer_capacity", "Maximum buffer capacity")
                 .map_err(|e| PolkuError::Metrics(format!("buffer_capacity: {e}")))?,
 
+            buffer_overflow_total: register_counter!(
+                "polku_buffer_overflow_total",
+                "Total events dropped due to buffer overflow"
+            )
+            .map_err(|e| PolkuError::Metrics(format!("buffer_overflow_total: {e}")))?,
+
+            tiered_buffer_compressed_bytes: register_counter!(
+                "polku_tiered_buffer_compressed_bytes_total",
+                "Total bytes saved by tiered buffer compression"
+            )
+            .map_err(|e| PolkuError::Metrics(format!("tiered_buffer_compressed_bytes: {e}")))?,
+
+            tiered_buffer_secondary_size: register_gauge!(
+                "polku_tiered_buffer_secondary_size",
+                "Number of messages in secondary (compressed) buffer tier"
+            )
+            .map_err(|e| PolkuError::Metrics(format!("tiered_buffer_secondary_size: {e}")))?,
+
+            // ─────────────────────────────────────────────────────────────────
+            // Emitter health
+            // ─────────────────────────────────────────────────────────────────
+            emitter_health: register_gauge_vec!(
+                "polku_emitter_health",
+                "Emitter health status (1 = healthy, 0 = unhealthy)",
+                &["emitter"]
+            )
+            .map_err(|e| PolkuError::Metrics(format!("emitter_health: {e}")))?,
+
+            circuit_breaker_state: register_gauge_vec!(
+                "polku_circuit_breaker_state",
+                "Circuit breaker state (0 = closed, 1 = open, 2 = half-open)",
+                &["emitter"]
+            )
+            .map_err(|e| PolkuError::Metrics(format!("circuit_breaker_state: {e}")))?,
+
+            // ─────────────────────────────────────────────────────────────────
+            // Latency & streams
+            // ─────────────────────────────────────────────────────────────────
             processing_latency: register_histogram_vec!(
                 "polku_processing_latency_seconds",
                 "Event processing latency",
@@ -176,6 +294,92 @@ impl Metrics {
     /// Set plugin health
     pub fn set_plugin_health(&self, healthy: bool) {
         self.plugin_health.set(if healthy { 1.0 } else { 0.0 });
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Throughput & performance helpers
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Update instantaneous throughput (events/sec)
+    pub fn set_events_per_second(&self, eps: f64) {
+        self.events_per_second.set(eps);
+    }
+
+    /// Increment flush counter
+    pub fn inc_flush(&self) {
+        self.flush_total.inc();
+    }
+
+    /// Record batch size for an emitter
+    pub fn record_batch_size(&self, emitter: &str, size: usize) {
+        self.batch_size
+            .with_label_values(&[emitter])
+            .observe(size as f64);
+    }
+
+    /// Record flush duration for an emitter
+    pub fn record_flush_duration(&self, emitter: &str, seconds: f64) {
+        self.flush_duration_seconds
+            .with_label_values(&[emitter])
+            .observe(seconds);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Buffer helpers
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Record buffer overflow (message dropped due to full buffer)
+    pub fn record_buffer_overflow(&self, count: u64) {
+        self.buffer_overflow_total.inc_by(count as f64);
+    }
+
+    /// Record bytes saved by tiered buffer compression
+    pub fn record_compression_savings(&self, bytes_saved: u64) {
+        self.tiered_buffer_compressed_bytes
+            .inc_by(bytes_saved as f64);
+    }
+
+    /// Update secondary tier buffer size
+    pub fn set_tiered_secondary_size(&self, size: usize) {
+        self.tiered_buffer_secondary_size.set(size as f64);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Emitter health helpers
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Set emitter health status
+    pub fn set_emitter_health(&self, emitter: &str, healthy: bool) {
+        self.emitter_health
+            .with_label_values(&[emitter])
+            .set(if healthy { 1.0 } else { 0.0 });
+    }
+
+    /// Set circuit breaker state for an emitter
+    ///
+    /// States: 0 = Closed (normal), 1 = Open (rejecting), 2 = HalfOpen (testing)
+    pub fn set_circuit_state(&self, emitter: &str, state: CircuitState) {
+        self.circuit_breaker_state
+            .with_label_values(&[emitter])
+            .set(state.as_metric_value());
+    }
+}
+
+/// Circuit breaker states for metrics
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitState {
+    /// Normal operation - requests pass through
+    Closed = 0,
+    /// Circuit tripped - requests rejected
+    Open = 1,
+    /// Testing recovery - limited requests allowed
+    HalfOpen = 2,
+}
+
+impl CircuitState {
+    /// Convert to metric value
+    pub fn as_metric_value(self) -> f64 {
+        self as i32 as f64
     }
 }
 
