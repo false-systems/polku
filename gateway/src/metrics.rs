@@ -125,6 +125,20 @@ impl Metrics {
             .inc_by(count as f64);
     }
 
+    /// Record multiple forwarded events in batch (more efficient than per-event)
+    ///
+    /// This reduces Prometheus HashMap lookups from O(events) to O(unique label combos).
+    /// Use this when processing a batch of events to avoid per-event overhead.
+    ///
+    /// Accepts a reference to a HashMap<(&str, &str), u64> for zero-copy iteration.
+    pub fn record_forwarded_batch(&self, counts: &std::collections::HashMap<(&str, &str), u64>) {
+        for ((output, event_type), count) in counts {
+            self.events_forwarded
+                .with_label_values(&[*output, *event_type])
+                .inc_by(*count as f64);
+        }
+    }
+
     /// Record events dropped
     pub fn record_dropped(&self, reason: &str, count: u64) {
         self.events_dropped

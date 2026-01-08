@@ -577,6 +577,12 @@ impl HubRunner {
         // Partition events by destination with zero-copy optimization
         let batches = partition_by_destination_owned(events, &self.emitters);
 
+        // Pre-aggregate metrics to reduce Prometheus HashMap lookups.
+        // Key: (emitter_name, event_type), Value: count
+        // This reduces O(events) lookups to O(unique label combos).
+        let mut forward_counts: std::collections::HashMap<(&str, &str), u64> =
+            std::collections::HashMap::new();
+
         // Send pre-partitioned batches to each emitter.
         // Each emitter's checkpoint advances by the number of events IT processed,
         // not the total batch size (which may differ due to routing).
@@ -603,10 +609,11 @@ impl HubRunner {
                     count = routed_events.len(),
                     "Emitted (inline)"
                 );
-                if let Some(metrics) = Metrics::get() {
-                    for event in routed_events {
-                        metrics.record_forwarded(emitter.name(), &event.event_type, 1);
-                    }
+                // Aggregate counts locally instead of per-event Prometheus updates
+                for event in routed_events {
+                    *forward_counts
+                        .entry((emitter.name(), event.event_type.as_str()))
+                        .or_default() += 1;
                 }
                 // Update checkpoint: advance by number of events this emitter processed.
                 // Uses batch_start_seq + emitter's event count - 1 as the checkpoint.
@@ -616,6 +623,11 @@ impl HubRunner {
                     store.set(emitter.name(), emitter_end_seq);
                 }
             }
+        }
+
+        // Batch update to Prometheus - single HashMap lookup per unique label combo
+        if let Some(metrics) = Metrics::get() {
+            metrics.record_forwarded_batch(&forward_counts);
         }
     }
 
@@ -763,6 +775,12 @@ async fn flush_loop(
         // - Multi-destination events: N-1 clones (last one moved)
         let batches = partition_by_destination_owned(events, &emitters);
 
+        // Pre-aggregate metrics to reduce Prometheus HashMap lookups.
+        // Key: (emitter_name, event_type), Value: count
+        // This reduces O(events) lookups to O(unique label combos).
+        let mut forward_counts: std::collections::HashMap<(&str, &str), u64> =
+            std::collections::HashMap::new();
+
         // Send pre-partitioned batches to each emitter.
         // Each emitter's checkpoint advances by the number of events IT processed,
         // not the total batch size (which may differ due to routing).
@@ -790,11 +808,11 @@ async fn flush_loop(
                     count = routed_events.len(),
                     "Emitted"
                 );
-                // Record successful forwards
-                if let Some(metrics) = Metrics::get() {
-                    for event in routed_events {
-                        metrics.record_forwarded(emitter.name(), &event.event_type, 1);
-                    }
+                // Aggregate counts locally instead of per-event Prometheus updates
+                for event in routed_events {
+                    *forward_counts
+                        .entry((emitter.name(), event.event_type.as_str()))
+                        .or_default() += 1;
                 }
                 // Update checkpoint: advance by number of events this emitter processed.
                 // Uses batch_start_seq + emitter's event count - 1 as the checkpoint.
@@ -804,6 +822,11 @@ async fn flush_loop(
                     store.set(emitter.name(), emitter_end_seq);
                 }
             }
+        }
+
+        // Batch update to Prometheus - single HashMap lookup per unique label combo
+        if let Some(metrics) = Metrics::get() {
+            metrics.record_forwarded_batch(&forward_counts);
         }
     }
 }
