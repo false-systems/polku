@@ -601,9 +601,12 @@ impl HubRunner {
 
             // Record per-emitter metrics
             if let Some(metrics) = Metrics::get() {
-                metrics.record_batch_size(emitter.name(), routed_events.len());
-                metrics.record_flush_duration(emitter.name(), emitter_duration.as_secs_f64());
-                metrics.set_emitter_health(emitter.name(), emit_result.is_ok());
+                metrics.record_emitter_flush(
+                    emitter.name(),
+                    routed_events.len(),
+                    emitter_duration,
+                    emit_result.is_ok(),
+                );
             }
 
             if let Err(e) = emit_result {
@@ -821,9 +824,12 @@ async fn flush_loop(
 
             // Record per-emitter metrics
             if let Some(metrics) = Metrics::get() {
-                metrics.record_batch_size(emitter.name(), routed_events.len());
-                metrics.record_flush_duration(emitter.name(), emitter_duration.as_secs_f64());
-                metrics.set_emitter_health(emitter.name(), emit_result.is_ok());
+                metrics.record_emitter_flush(
+                    emitter.name(),
+                    routed_events.len(),
+                    emitter_duration,
+                    emit_result.is_ok(),
+                );
             }
 
             if let Err(e) = emit_result {
