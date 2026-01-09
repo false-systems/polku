@@ -32,7 +32,6 @@ use crate::proto::{Event, EventPayload, HealthRequest, IngestBatch, ingest_batch
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::Mutex;
 use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, error, info, warn};
 
@@ -116,9 +115,14 @@ impl EndpointState {
 /// Uses batch streaming (`stream_events`) for high throughput instead of
 /// per-event unary calls. Supports multiple endpoints with intelligent
 /// load balancing based on downstream buffer pressure.
+///
+/// # Failover Behavior
+///
+/// When an emit fails, the emitter automatically tries the next healthy endpoint
+/// before returning an error. This provides resilience against transient failures.
 pub struct GrpcEmitter {
-    /// Multiple clients for load balancing (single client if one endpoint)
-    clients: Vec<Mutex<GatewayClient<Channel>>>,
+    /// Multiple clients for load balancing (no Mutex - tonic clients are thread-safe)
+    clients: Vec<GatewayClient<Channel>>,
     /// Per-endpoint state (fill ratio, health)
     states: Vec<EndpointState>,
     /// Target endpoints for logging/debugging
@@ -131,6 +135,7 @@ impl GrpcEmitter {
     /// Create a new GrpcEmitter connected to the given endpoint
     ///
     /// Uses default timeouts: 10s connect, 30s request.
+    /// Connects eagerly - fails if endpoint is unreachable.
     ///
     /// # Arguments
     /// * `endpoint` - The gRPC endpoint URL (e.g., "http://localhost:50051")
@@ -140,8 +145,8 @@ impl GrpcEmitter {
 
     /// Create a GrpcEmitter with multiple endpoints using least-loaded balancing
     ///
-    /// Uses intelligent load balancing: picks the endpoint with lowest buffer
-    /// fill ratio (learned from Ack responses).
+    /// Connects eagerly to all endpoints - fails if any endpoint is unreachable.
+    /// Use `with_endpoints_lazy` for lazy connection.
     ///
     /// # Arguments
     /// * `endpoints` - List of gRPC endpoint URLs
@@ -164,9 +169,45 @@ impl GrpcEmitter {
                     PluginError::Connection(format!("Failed to connect to {}: {}", endpoint_str, e))
                 })?;
 
-            clients.push(Mutex::new(GatewayClient::new(channel)));
+            clients.push(GatewayClient::new(channel));
             states.push(EndpointState::new());
             debug!(endpoint = %endpoint_str, "gRPC emitter connected");
+        }
+
+        Ok(Self {
+            clients,
+            states,
+            endpoints,
+            source: "polku-emitter".to_string(),
+        })
+    }
+
+    /// Create a GrpcEmitter with lazy connection to endpoints
+    ///
+    /// Does not connect immediately - connection happens on first emit.
+    /// This allows creating an emitter even if some endpoints are temporarily down.
+    /// Useful for failover scenarios where not all endpoints need to be up at startup.
+    ///
+    /// # Arguments
+    /// * `endpoints` - List of gRPC endpoint URLs
+    pub async fn with_endpoints_lazy(endpoints: Vec<String>) -> Result<Self, PluginError> {
+        if endpoints.is_empty() {
+            return Err(PluginError::Init("No endpoints provided".to_string()));
+        }
+
+        let mut clients = Vec::with_capacity(endpoints.len());
+        let mut states = Vec::with_capacity(endpoints.len());
+
+        for endpoint_str in &endpoints {
+            let channel = Endpoint::from_shared(endpoint_str.clone())
+                .map_err(|e| PluginError::Init(format!("Invalid endpoint URL: {}", e)))?
+                .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
+                .timeout(Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS))
+                .connect_lazy();
+
+            clients.push(GatewayClient::new(channel));
+            states.push(EndpointState::new());
+            debug!(endpoint = %endpoint_str, "gRPC emitter configured (lazy)");
         }
 
         Ok(Self {
@@ -183,14 +224,25 @@ impl GrpcEmitter {
         self
     }
 
-    /// Select endpoint with lowest buffer fill ratio
+    /// Select endpoint with lowest buffer fill ratio, excluding already-tried indices
     ///
-    /// Falls back to first endpoint if all are unhealthy (give them a chance to recover)
-    fn select_endpoint(&self) -> usize {
+    /// Returns None if all endpoints have been tried or are unhealthy
+    fn select_endpoint(&self, exclude: &[bool]) -> Option<usize> {
+        debug_assert_eq!(
+            exclude.len(),
+            self.states.len(),
+            "exclude slice length must match number of endpoint states"
+        );
+
         let mut best_idx = None;
         let mut best_ratio = f32::MAX;
 
         for (idx, state) in self.states.iter().enumerate() {
+            // Skip already-tried endpoints
+            if exclude[idx] {
+                continue;
+            }
+
             if state.is_healthy() {
                 let ratio = state.get_fill_ratio();
                 if ratio < best_ratio {
@@ -200,19 +252,97 @@ impl GrpcEmitter {
             }
         }
 
-        match best_idx {
-            Some(idx) => {
-                debug!(
-                    endpoint = %self.endpoints[idx],
-                    fill_ratio = %format!("{:.1}%", best_ratio * 100.0),
-                    "Selected least-loaded endpoint"
-                );
-                idx
+        if let Some(idx) = best_idx {
+            debug!(
+                endpoint = %self.endpoints[idx],
+                fill_ratio = %format!("{:.1}%", best_ratio * 100.0),
+                "Selected least-loaded endpoint"
+            );
+        }
+
+        best_idx
+    }
+
+    /// Select any untried endpoint (fallback when all healthy endpoints failed)
+    fn select_any_untried(&self, exclude: &[bool]) -> Option<usize> {
+        for (idx, excluded) in exclude.iter().enumerate() {
+            if !excluded {
+                return Some(idx);
             }
-            None => {
-                // All unhealthy - try first endpoint (give it a chance to recover)
-                warn!("All endpoints unhealthy, trying first endpoint");
-                0
+        }
+        None
+    }
+
+    /// Try to emit to a specific endpoint
+    async fn try_emit_to(&self, idx: usize, events: &[Event]) -> Result<(), PluginError> {
+        let mut client = self.clients[idx].clone();
+        let endpoint = &self.endpoints[idx];
+        let state = &self.states[idx];
+
+        // Build batch
+        let batch = IngestBatch {
+            source: self.source.clone(),
+            cluster: String::new(),
+            payload: Some(ingest_batch::Payload::Events(EventPayload {
+                events: events.to_vec(),
+            })),
+        };
+
+        let stream = tokio_stream::once(batch);
+
+        match client.stream_events(stream).await {
+            Ok(response) => {
+                let mut ack_stream = response.into_inner();
+
+                // Consume acks - properly handle errors
+                loop {
+                    match ack_stream.message().await {
+                        Ok(Some(ack)) => {
+                            debug!(
+                                endpoint = %endpoint,
+                                acked = ack.event_ids.len(),
+                                buffer_size = ack.buffer_size,
+                                "Batch forwarded"
+                            );
+
+                            // Update endpoint state from Ack
+                            state.update_fill_ratio(ack.buffer_size, ack.buffer_capacity);
+
+                            // Log backpressure warning
+                            if ack.buffer_size > 0 && ack.buffer_capacity > 0 {
+                                let fill_ratio =
+                                    ack.buffer_size as f64 / ack.buffer_capacity as f64;
+                                if fill_ratio > 0.8 {
+                                    warn!(
+                                        endpoint = %endpoint,
+                                        fill_ratio = %format!("{:.1}%", fill_ratio * 100.0),
+                                        "Downstream buffer nearing capacity"
+                                    );
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            // Stream ended normally
+                            break;
+                        }
+                        Err(e) => {
+                            // Mid-stream error - record failure
+                            state.record_failure();
+                            return Err(PluginError::Send(format!(
+                                "Stream error from {}: {}",
+                                endpoint, e
+                            )));
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => {
+                state.record_failure();
+                Err(PluginError::Send(format!(
+                    "Failed to send to {}: {}",
+                    endpoint, e
+                )))
             }
         }
     }
@@ -229,86 +359,60 @@ impl Emitter for GrpcEmitter {
             return Ok(());
         }
 
-        // Select least-loaded endpoint
-        let client_idx = self.select_endpoint();
-        let mut client = self.clients[client_idx].lock().await.clone();
-        let endpoint = &self.endpoints[client_idx];
-        let state = &self.states[client_idx];
+        // Track which endpoints we've tried
+        let mut tried = vec![false; self.clients.len()];
+        let mut last_error = None;
 
-        // Build a single batch with all events
-        let batch = IngestBatch {
-            source: self.source.clone(),
-            cluster: String::new(),
-            payload: Some(ingest_batch::Payload::Events(EventPayload {
-                events: events.to_vec(),
-            })),
-        };
+        // Try healthy endpoints first (least-loaded order)
+        while let Some(idx) = self.select_endpoint(&tried) {
+            tried[idx] = true;
 
-        // Use streaming RPC - send batch, receive ack
-        let stream = tokio_stream::once(batch);
-
-        match client.stream_events(stream).await {
-            Ok(response) => {
-                let mut ack_stream = response.into_inner();
-
-                // Consume acks from the stream
-                while let Ok(Some(ack)) = ack_stream.message().await {
-                    debug!(
-                        endpoint = %endpoint,
-                        acked = ack.event_ids.len(),
-                        buffer_size = ack.buffer_size,
-                        "Batch forwarded"
+            match self.try_emit_to(idx, events).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    warn!(
+                        endpoint = %self.endpoints[idx],
+                        error = %e,
+                        "Emit failed, trying next endpoint"
                     );
-
-                    // Update endpoint state from Ack (this is the magic - we learn actual load)
-                    state.update_fill_ratio(ack.buffer_size, ack.buffer_capacity);
-
-                    // Log backpressure warning
-                    if ack.buffer_size > 0 && ack.buffer_capacity > 0 {
-                        let fill_ratio = ack.buffer_size as f64 / ack.buffer_capacity as f64;
-                        if fill_ratio > 0.8 {
-                            warn!(
-                                endpoint = %endpoint,
-                                fill_ratio = %format!("{:.1}%", fill_ratio * 100.0),
-                                "Downstream buffer nearing capacity"
-                            );
-                        }
-                    }
+                    last_error = Some(e);
                 }
-                Ok(())
-            }
-            Err(e) => {
-                // Record failure - may mark endpoint unhealthy after threshold
-                state.record_failure();
-                let failures = state.consecutive_failures.load(Ordering::Relaxed);
-
-                if failures >= FAILURE_THRESHOLD {
-                    info!(
-                        endpoint = %endpoint,
-                        failures = failures,
-                        "Endpoint marked unhealthy after consecutive failures"
-                    );
-                }
-
-                error!(
-                    endpoint = %endpoint,
-                    event_count = events.len(),
-                    error = %e,
-                    "Failed to forward batch"
-                );
-                Err(PluginError::Send(format!(
-                    "Failed to forward batch of {} events: {}",
-                    events.len(),
-                    e
-                )))
             }
         }
+
+        // All healthy endpoints failed - try any remaining unhealthy ones
+        // (they might have recovered)
+        while let Some(idx) = self.select_any_untried(&tried) {
+            tried[idx] = true;
+
+            match self.try_emit_to(idx, events).await {
+                Ok(()) => {
+                    info!(
+                        endpoint = %self.endpoints[idx],
+                        "Unhealthy endpoint recovered"
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        // All endpoints failed
+        error!(
+            event_count = events.len(),
+            endpoints_tried = tried.iter().filter(|&&t| t).count(),
+            "All endpoints failed"
+        );
+
+        Err(last_error.unwrap_or_else(|| PluginError::Send("No endpoints available".to_string())))
     }
 
     async fn health(&self) -> bool {
         // Check health of all endpoints, return true if any is healthy
-        for (idx, client_mutex) in self.clients.iter().enumerate() {
-            let mut client = client_mutex.lock().await.clone();
+        for (idx, client) in self.clients.iter().enumerate() {
+            let mut client = client.clone();
             match client.health(HealthRequest {}).await {
                 Ok(response) => {
                     if response.into_inner().healthy {
@@ -544,7 +648,11 @@ mod tests {
         assert!(result.is_ok(), "Should emit large batch successfully");
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        assert_eq!(buffer.len(), 100, "Server should have received all 100 events");
+        assert_eq!(
+            buffer.len(),
+            100,
+            "Server should have received all 100 events"
+        );
     }
 
     #[tokio::test]
@@ -564,5 +672,109 @@ mod tests {
     async fn test_grpc_emitter_empty_endpoints() {
         let result = GrpcEmitter::with_endpoints(vec![]).await;
         assert!(result.is_err(), "Should fail with empty endpoints");
+    }
+
+    #[tokio::test]
+    async fn test_grpc_emitter_failover_on_emit_failure() {
+        // Start two servers
+        let (addr1, buffer1) = start_test_server().await;
+        let (addr2, buffer2) = start_test_server().await;
+
+        let emitter = GrpcEmitter::with_endpoints(vec![
+            format!("http://{}", addr1),
+            format!("http://{}", addr2),
+        ])
+        .await
+        .unwrap();
+
+        // Manually mark first endpoint as unhealthy (simulating failures)
+        emitter.states[0]
+            .consecutive_failures
+            .store(10, Ordering::Relaxed);
+        emitter.states[0].unhealthy_until.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+                + 60000, // Unhealthy for 60s
+            Ordering::Relaxed,
+        );
+
+        // Emit should failover to second endpoint
+        let events = vec![make_event("failover-1", "test.failover")];
+        let result = emitter.emit(&events).await;
+        assert!(result.is_ok(), "Should succeed via failover");
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Events should have gone to server2, not server1
+        assert_eq!(
+            buffer1.len(),
+            0,
+            "Unhealthy server should not receive events"
+        );
+        assert_eq!(buffer2.len(), 1, "Healthy server should receive events");
+    }
+
+    #[tokio::test]
+    async fn test_grpc_emitter_tries_all_endpoints_before_failing() {
+        // This test verifies that when the initially selected endpoint fails during emit,
+        // the emitter automatically tries the next healthy endpoint instead of immediately failing.
+        //
+        // In other words, we should attempt all healthy endpoints before giving up.
+
+        let (addr, buffer) = start_test_server().await;
+
+        // Create emitter with one bad endpoint and one good endpoint
+        // Bad endpoint will fail on emit (wrong port, nothing listening)
+        let emitter = GrpcEmitter::with_endpoints_lazy(vec![
+            "http://127.0.0.1:1".to_string(), // Bad - nothing listening
+            format!("http://{}", addr),       // Good
+        ])
+        .await
+        .unwrap();
+
+        // Emit should try bad endpoint, fail, then try good endpoint and succeed
+        let events = vec![make_event("retry-1", "test.retry")];
+        let result = emitter.emit(&events).await;
+
+        assert!(
+            result.is_ok(),
+            "Should succeed after failover to good endpoint"
+        );
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            buffer.len(),
+            1,
+            "Good server should receive event after failover"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_grpc_emitter_no_mutex_contention() {
+        // Verify that concurrent emits all succeed without blocking each other.
+        // This tests that we removed the unnecessary Mutex - tonic clients are thread-safe.
+        let (addr, buffer) = start_test_server().await;
+        let endpoint = format!("http://{}", addr);
+
+        let emitter = Arc::new(GrpcEmitter::new(&endpoint).await.unwrap());
+
+        // Spawn many concurrent emit tasks
+        let mut handles = vec![];
+        for i in 0..20 {
+            let emitter = Arc::clone(&emitter);
+            let events = vec![make_event(&format!("concurrent-{}", i), "test.concurrent")];
+            handles.push(tokio::spawn(async move { emitter.emit(&events).await }));
+        }
+
+        // All should complete successfully
+        for handle in handles {
+            let result = handle.await.unwrap();
+            assert!(result.is_ok(), "Concurrent emit should succeed");
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert_eq!(buffer.len(), 20, "All 20 events should arrive");
     }
 }
