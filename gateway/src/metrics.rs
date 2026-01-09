@@ -375,6 +375,32 @@ impl Metrics {
             .with_label_values(&[emitter])
             .set(events_per_sec);
     }
+
+    /// Record all per-emitter flush metrics in one call
+    ///
+    /// This is the canonical way to record emitter metrics after a flush:
+    /// - Batch size (histogram)
+    /// - Flush duration (histogram)
+    /// - Health status (gauge)
+    /// - Throughput in events/sec (gauge)
+    pub fn record_emitter_flush(
+        &self,
+        emitter: &str,
+        event_count: usize,
+        duration: std::time::Duration,
+        success: bool,
+    ) {
+        let duration_secs = duration.as_secs_f64();
+
+        self.record_batch_size(emitter, event_count);
+        self.record_flush_duration(emitter, duration_secs);
+        self.set_emitter_health(emitter, success);
+
+        // Calculate throughput if we have a measurable duration
+        if duration_secs > 0.0 {
+            self.set_emitter_throughput(emitter, event_count as f64 / duration_secs);
+        }
+    }
 }
 
 /// Gather all metrics and encode as Prometheus text format
@@ -480,6 +506,32 @@ mod tests {
             counts.insert(("emitter", "type"), 1_u64);
             metrics.record_forwarded_batch(&counts);
             // Note: record_forwarded() should NOT exist on Metrics
+        }
+    }
+
+    #[test]
+    fn test_record_emitter_flush() {
+        // The canonical way to record all per-emitter metrics in one call
+        let _ = Metrics::init();
+        if let Some(metrics) = Metrics::get() {
+            // Simulate a successful flush
+            metrics.record_emitter_flush(
+                "test_emitter",
+                100,
+                std::time::Duration::from_millis(50),
+                true,
+            );
+
+            // Simulate a failed flush
+            metrics.record_emitter_flush(
+                "failing_emitter",
+                50,
+                std::time::Duration::from_millis(100),
+                false,
+            );
+
+            // Zero duration should not panic (throughput skipped)
+            metrics.record_emitter_flush("instant_emitter", 10, std::time::Duration::ZERO, true);
         }
     }
 }
