@@ -604,6 +604,11 @@ impl HubRunner {
                 metrics.record_batch_size(emitter.name(), routed_events.len());
                 metrics.record_flush_duration(emitter.name(), emitter_duration.as_secs_f64());
                 metrics.set_emitter_health(emitter.name(), emit_result.is_ok());
+                // Per-emitter throughput: more accurate than global when emitters have different latencies
+                if emitter_duration.as_secs_f64() > 0.0 {
+                    let emitter_eps = routed_events.len() as f64 / emitter_duration.as_secs_f64();
+                    metrics.set_emitter_throughput(emitter.name(), emitter_eps);
+                }
             }
 
             if let Err(e) = emit_result {
@@ -824,6 +829,11 @@ async fn flush_loop(
                 metrics.record_batch_size(emitter.name(), routed_events.len());
                 metrics.record_flush_duration(emitter.name(), emitter_duration.as_secs_f64());
                 metrics.set_emitter_health(emitter.name(), emit_result.is_ok());
+                // Per-emitter throughput: more accurate than global when emitters have different latencies
+                if emitter_duration.as_secs_f64() > 0.0 {
+                    let emitter_eps = routed_events.len() as f64 / emitter_duration.as_secs_f64();
+                    metrics.set_emitter_throughput(emitter.name(), emitter_eps);
+                }
             }
 
             if let Err(e) = emit_result {

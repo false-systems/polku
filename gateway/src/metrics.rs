@@ -66,6 +66,9 @@ pub struct Metrics {
     /// Circuit breaker state per emitter (0=closed, 1=open, 2=half-open)
     pub circuit_breaker_state: GaugeVec,
 
+    /// Per-emitter throughput (events/sec) - updated each flush
+    pub emitter_throughput: GaugeVec,
+
     // ─────────────────────────────────────────────────────────────────────────
     // Latency & streams
     // ─────────────────────────────────────────────────────────────────────────
@@ -190,6 +193,13 @@ impl Metrics {
             )
             .map_err(|e| PolkuError::Metrics(format!("circuit_breaker_state: {e}")))?,
 
+            emitter_throughput: register_gauge_vec!(
+                "polku_emitter_throughput",
+                "Per-emitter throughput (events/sec)",
+                &["emitter"]
+            )
+            .map_err(|e| PolkuError::Metrics(format!("emitter_throughput: {e}")))?,
+
             // ─────────────────────────────────────────────────────────────────
             // Latency & streams
             // ─────────────────────────────────────────────────────────────────
@@ -236,14 +246,7 @@ impl Metrics {
             .inc_by(count as f64);
     }
 
-    /// Record event forwarded
-    pub fn record_forwarded(&self, output: &str, event_type: &str, count: u64) {
-        self.events_forwarded
-            .with_label_values(&[output, event_type])
-            .inc_by(count as f64);
-    }
-
-    /// Record multiple forwarded events in batch (more efficient than per-event)
+    /// Record multiple forwarded events in batch
     ///
     /// This reduces Prometheus HashMap lookups from O(events) to O(unique label combos).
     /// Use this when processing a batch of events to avoid per-event overhead.
@@ -363,6 +366,15 @@ impl Metrics {
             .with_label_values(&[emitter])
             .set(state.as_metric_value());
     }
+
+    /// Set per-emitter throughput (events/sec)
+    ///
+    /// More accurate than global throughput when emitters have different latencies.
+    pub fn set_emitter_throughput(&self, emitter: &str, events_per_sec: f64) {
+        self.emitter_throughput
+            .with_label_values(&[emitter])
+            .set(events_per_sec);
+    }
 }
 
 /// Gather all metrics and encode as Prometheus text format
@@ -439,6 +451,35 @@ mod tests {
             let counts: std::collections::HashMap<(&str, &str), u64> =
                 std::collections::HashMap::new();
             metrics.record_forwarded_batch(&counts);
+        }
+    }
+
+    #[test]
+    fn test_per_emitter_throughput() {
+        // Issue #1: Throughput should be tracked per-emitter, not globally
+        // This allows accurate monitoring when emitters have different latencies
+        let _ = Metrics::init();
+        if let Some(metrics) = Metrics::get() {
+            // Record throughput for different emitters
+            metrics.set_emitter_throughput("stdout", 1000.0);
+            metrics.set_emitter_throughput("kafka", 500.0);
+
+            // The global events_per_second should still work for backwards compat
+            metrics.set_events_per_second(1500.0);
+        }
+    }
+
+    #[test]
+    fn test_no_per_event_record_forwarded() {
+        // Issue #2: record_forwarded (per-event) should not exist
+        // Only record_forwarded_batch should be available
+        // This test documents the API - record_forwarded_batch is the only way
+        let _ = Metrics::init();
+        if let Some(metrics) = Metrics::get() {
+            let mut counts = std::collections::HashMap::new();
+            counts.insert(("emitter", "type"), 1_u64);
+            metrics.record_forwarded_batch(&counts);
+            // Note: record_forwarded() should NOT exist on Metrics
         }
     }
 }
