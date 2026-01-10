@@ -7,6 +7,7 @@
 //! - Transform: Clients send raw bytes, InputPlugins transform them to Events
 
 use crate::buffer::RingBuffer;
+use crate::hub::MessageSender;
 use crate::ingest::IngestContext;
 use crate::message::Message;
 use crate::proto::{
@@ -30,6 +31,8 @@ pub struct GatewayService {
     registry: Arc<PluginRegistry>,
     start_time: Instant,
     events_processed: Arc<AtomicU64>,
+    /// Optional Hub sender for forwarding events to the processing pipeline
+    hub_sender: Option<MessageSender>,
 }
 
 impl GatewayService {
@@ -40,6 +43,7 @@ impl GatewayService {
             registry: Arc::new(PluginRegistry::new()),
             start_time: Instant::now(),
             events_processed: Arc::new(AtomicU64::new(0)),
+            hub_sender: None,
         }
     }
 
@@ -50,6 +54,26 @@ impl GatewayService {
             registry,
             start_time: Instant::now(),
             events_processed: Arc::new(AtomicU64::new(0)),
+            hub_sender: None,
+        }
+    }
+
+    /// Create a new GatewayService with Hub sender for event forwarding
+    ///
+    /// When a Hub sender is provided, events are sent to the Hub pipeline
+    /// for processing and emission to configured outputs. The buffer is
+    /// still used for backpressure signaling in Ack responses.
+    pub fn with_hub(
+        buffer: Arc<RingBuffer>,
+        registry: Arc<PluginRegistry>,
+        hub_sender: MessageSender,
+    ) -> Self {
+        Self {
+            buffer,
+            registry,
+            start_time: Instant::now(),
+            events_processed: Arc::new(AtomicU64::new(0)),
+            hub_sender: Some(hub_sender),
         }
     }
 
@@ -117,6 +141,7 @@ impl Gateway for GatewayService {
         let buffer = Arc::clone(&self.buffer);
         let registry = Arc::clone(&self.registry);
         let events_processed = Arc::clone(&self.events_processed);
+        let hub_sender = self.hub_sender.clone();
 
         let (tx, rx) = mpsc::channel(32);
 
@@ -149,12 +174,26 @@ impl Gateway for GatewayService {
                 let event_ids: Vec<String> = events.iter().map(|e| e.id.clone()).collect();
                 let event_count = events.len();
 
-                // Convert proto Events to internal Messages for buffer
+                // Convert proto Events to internal Messages
                 let messages: Vec<Message> = events.into_iter().map(Message::from).collect();
-                let dropped = buffer.push(messages);
 
-                if dropped > 0 {
-                    info!(dropped = dropped, source = %source, "Buffer overflow, events dropped");
+                // Send to Hub if configured (for processing and emission)
+                // Otherwise just buffer (legacy behavior)
+                if let Some(ref sender) = hub_sender {
+                    let mut send_errors = 0;
+                    for msg in messages {
+                        if sender.try_send(msg).is_err() {
+                            send_errors += 1;
+                        }
+                    }
+                    if send_errors > 0 {
+                        info!(dropped = send_errors, source = %source, "Hub channel full, events dropped");
+                    }
+                } else {
+                    let dropped = buffer.push(messages);
+                    if dropped > 0 {
+                        info!(dropped = dropped, source = %source, "Buffer overflow, events dropped");
+                    }
                 }
 
                 events_processed.fetch_add(event_count as u64, Ordering::Relaxed);
@@ -180,12 +219,19 @@ impl Gateway for GatewayService {
         let event = self.process_event(&ingest)?;
 
         let event_id = event.id.clone();
-        // Convert proto Event to internal Message for buffer
+        // Convert proto Event to internal Message
         let message: Message = event.into();
-        let dropped = self.buffer.push(vec![message]);
 
-        if dropped > 0 {
-            return Err(Status::resource_exhausted("Buffer full, event dropped"));
+        // Send to Hub if configured, otherwise buffer
+        if let Some(ref sender) = self.hub_sender {
+            if sender.try_send(message).is_err() {
+                return Err(Status::resource_exhausted("Hub channel full, event dropped"));
+            }
+        } else {
+            let dropped = self.buffer.push(vec![message]);
+            if dropped > 0 {
+                return Err(Status::resource_exhausted("Buffer full, event dropped"));
+            }
         }
 
         self.events_processed.fetch_add(1, Ordering::Relaxed);

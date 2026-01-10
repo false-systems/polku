@@ -70,6 +70,27 @@ pub struct Metrics {
     pub emitter_throughput: GaugeVec,
 
     // ─────────────────────────────────────────────────────────────────────────
+    // gRPC Load Balancer metrics
+    // ─────────────────────────────────────────────────────────────────────────
+    /// Per-endpoint buffer fill ratio (0.0-1.0) from downstream Ack
+    pub grpc_endpoint_fill_ratio: GaugeVec,
+
+    /// Per-endpoint health status (1 = healthy, 0 = unhealthy/cooldown)
+    pub grpc_endpoint_health: GaugeVec,
+
+    /// Per-endpoint consecutive failure count
+    pub grpc_endpoint_failures: GaugeVec,
+
+    /// Total events sent per endpoint
+    pub grpc_endpoint_events_total: CounterVec,
+
+    /// Endpoint selection count (which endpoint was chosen)
+    pub grpc_endpoint_selected_total: CounterVec,
+
+    /// Failover events (when primary failed and we tried another)
+    pub grpc_failover_total: Counter,
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Latency & streams
     // ─────────────────────────────────────────────────────────────────────────
     /// Event processing latency (by source)
@@ -199,6 +220,50 @@ impl Metrics {
                 &["emitter"]
             )
             .map_err(|e| PolkuError::Metrics(format!("emitter_throughput: {e}")))?,
+
+            // ─────────────────────────────────────────────────────────────────
+            // gRPC Load Balancer metrics
+            // ─────────────────────────────────────────────────────────────────
+            grpc_endpoint_fill_ratio: register_gauge_vec!(
+                "polku_grpc_endpoint_fill_ratio",
+                "Downstream buffer fill ratio (0.0-1.0) from Ack response",
+                &["endpoint"]
+            )
+            .map_err(|e| PolkuError::Metrics(format!("grpc_endpoint_fill_ratio: {e}")))?,
+
+            grpc_endpoint_health: register_gauge_vec!(
+                "polku_grpc_endpoint_health",
+                "Endpoint health (1 = healthy, 0 = unhealthy/cooldown)",
+                &["endpoint"]
+            )
+            .map_err(|e| PolkuError::Metrics(format!("grpc_endpoint_health: {e}")))?,
+
+            grpc_endpoint_failures: register_gauge_vec!(
+                "polku_grpc_endpoint_failures",
+                "Consecutive failure count per endpoint",
+                &["endpoint"]
+            )
+            .map_err(|e| PolkuError::Metrics(format!("grpc_endpoint_failures: {e}")))?,
+
+            grpc_endpoint_events_total: register_counter_vec!(
+                "polku_grpc_endpoint_events_total",
+                "Total events sent to each endpoint",
+                &["endpoint"]
+            )
+            .map_err(|e| PolkuError::Metrics(format!("grpc_endpoint_events_total: {e}")))?,
+
+            grpc_endpoint_selected_total: register_counter_vec!(
+                "polku_grpc_endpoint_selected_total",
+                "Number of times each endpoint was selected by LB",
+                &["endpoint"]
+            )
+            .map_err(|e| PolkuError::Metrics(format!("grpc_endpoint_selected_total: {e}")))?,
+
+            grpc_failover_total: register_counter!(
+                "polku_grpc_failover_total",
+                "Total failover events (primary failed, tried another)"
+            )
+            .map_err(|e| PolkuError::Metrics(format!("grpc_failover_total: {e}")))?,
 
             // ─────────────────────────────────────────────────────────────────
             // Latency & streams
@@ -374,6 +439,50 @@ impl Metrics {
         self.emitter_throughput
             .with_label_values(&[emitter])
             .set(events_per_sec);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // gRPC Load Balancer helpers
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Update endpoint fill ratio from downstream Ack response
+    pub fn set_grpc_endpoint_fill_ratio(&self, endpoint: &str, ratio: f64) {
+        self.grpc_endpoint_fill_ratio
+            .with_label_values(&[endpoint])
+            .set(ratio);
+    }
+
+    /// Update endpoint health status
+    pub fn set_grpc_endpoint_health(&self, endpoint: &str, healthy: bool) {
+        self.grpc_endpoint_health
+            .with_label_values(&[endpoint])
+            .set(if healthy { 1.0 } else { 0.0 });
+    }
+
+    /// Update endpoint consecutive failure count
+    pub fn set_grpc_endpoint_failures(&self, endpoint: &str, count: u32) {
+        self.grpc_endpoint_failures
+            .with_label_values(&[endpoint])
+            .set(count as f64);
+    }
+
+    /// Record events sent to an endpoint
+    pub fn record_grpc_endpoint_events(&self, endpoint: &str, count: u64) {
+        self.grpc_endpoint_events_total
+            .with_label_values(&[endpoint])
+            .inc_by(count as f64);
+    }
+
+    /// Record endpoint selection by load balancer
+    pub fn record_grpc_endpoint_selected(&self, endpoint: &str) {
+        self.grpc_endpoint_selected_total
+            .with_label_values(&[endpoint])
+            .inc();
+    }
+
+    /// Record a failover event
+    pub fn record_grpc_failover(&self) {
+        self.grpc_failover_total.inc();
     }
 
     /// Record all per-emitter flush metrics in one call

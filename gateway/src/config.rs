@@ -27,6 +27,14 @@ pub struct Config {
 
     /// Log format (json or pretty)
     pub log_format: LogFormat,
+
+    /// gRPC emitter endpoints (comma-separated)
+    /// When set, events are forwarded to these downstream POLKU instances
+    pub emit_grpc_endpoints: Vec<String>,
+
+    /// Whether to use lazy connection for gRPC emitter
+    /// Useful when not all endpoints are available at startup
+    pub emit_grpc_lazy: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +55,8 @@ impl Default for Config {
             flush_interval_ms: 100,
             log_level: "info".to_string(),
             log_format: LogFormat::Pretty,
+            emit_grpc_endpoints: Vec::new(),
+            emit_grpc_lazy: false,
         }
     }
 }
@@ -101,6 +111,18 @@ impl Config {
                     )));
                 }
             };
+        }
+
+        if let Ok(endpoints) = env::var("POLKU_EMIT_GRPC_ENDPOINTS") {
+            config.emit_grpc_endpoints = endpoints
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+
+        if let Ok(lazy) = env::var("POLKU_EMIT_GRPC_LAZY") {
+            config.emit_grpc_lazy = lazy.to_lowercase() == "true" || lazy == "1";
         }
 
         Ok(config)
