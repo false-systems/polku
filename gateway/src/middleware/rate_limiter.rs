@@ -27,6 +27,8 @@ pub struct RateLimiter {
     last_refill: AtomicU64,
     /// Start instant for time tracking
     start: Instant,
+    /// Count of messages dropped due to rate limiting
+    dropped: AtomicU64,
 }
 
 impl RateLimiter {
@@ -52,7 +54,13 @@ impl RateLimiter {
             tokens: AtomicU64::new(scaled_burst),
             last_refill: AtomicU64::new(0),
             start: Instant::now(),
+            dropped: AtomicU64::new(0),
         }
+    }
+
+    /// Get the count of dropped messages
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     /// Try to acquire a token
@@ -156,6 +164,7 @@ impl Middleware for RateLimiter {
         if self.try_acquire() {
             Some(msg)
         } else {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(
                 source = %msg.source,
                 message_type = %msg.message_type,

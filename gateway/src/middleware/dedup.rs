@@ -15,7 +15,7 @@ use crate::middleware::Middleware;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Time-windowed deduplicator
@@ -37,6 +37,8 @@ pub struct Deduplicator {
     ops_since_cleanup: AtomicU32,
     /// Cleanup every N operations (minimum 1)
     cleanup_interval: u32,
+    /// Count of duplicate messages dropped
+    dropped: AtomicU64,
 }
 
 impl Deduplicator {
@@ -52,6 +54,7 @@ impl Deduplicator {
             ttl,
             ops_since_cleanup: AtomicU32::new(0),
             cleanup_interval: 1000,
+            dropped: AtomicU64::new(0),
         }
     }
 
@@ -69,6 +72,7 @@ impl Deduplicator {
             ttl,
             ops_since_cleanup: AtomicU32::new(0),
             cleanup_interval: cleanup_interval.max(1), // Ensure at least 1
+            dropped: AtomicU64::new(0),
         }
     }
 
@@ -105,9 +109,29 @@ impl Deduplicator {
     }
 
     /// Remove expired entries
+    ///
+    /// Collects expired keys first to minimize lock hold time.
     fn cleanup(&self, now: Instant) {
-        let mut seen = self.seen.lock();
-        seen.retain(|_, last_seen| now.duration_since(*last_seen) < self.ttl);
+        // First pass: collect expired keys (short lock)
+        let expired_keys: Vec<String> = {
+            let seen = self.seen.lock();
+            seen.iter()
+                .filter(|(_, last_seen)| now.duration_since(**last_seen) >= self.ttl)
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+
+        if expired_keys.is_empty() {
+            return;
+        }
+
+        // Second pass: remove expired keys (short lock)
+        {
+            let mut seen = self.seen.lock();
+            for key in expired_keys {
+                seen.remove(&key);
+            }
+        }
     }
 
     /// Get current number of tracked IDs
@@ -125,6 +149,11 @@ impl Deduplicator {
     pub fn is_empty(&self) -> bool {
         self.seen.lock().is_empty()
     }
+
+    /// Get the count of dropped duplicate messages
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
 }
 
 #[async_trait]
@@ -137,6 +166,7 @@ impl Middleware for Deduplicator {
         if self.check(&msg.id.to_string()) {
             Some(msg)
         } else {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(
                 id = %msg.id,
                 "duplicate message dropped"

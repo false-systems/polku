@@ -17,6 +17,8 @@ pub struct Sampler {
     threshold: u64,
     /// PRNG state
     state: AtomicU64,
+    /// Count of messages dropped by sampling
+    dropped: AtomicU64,
 }
 
 impl Sampler {
@@ -54,6 +56,7 @@ impl Sampler {
         Self {
             threshold,
             state: AtomicU64::new(seed | 1), // Ensure non-zero for xorshift
+            dropped: AtomicU64::new(0),
         }
     }
 
@@ -62,6 +65,11 @@ impl Sampler {
         let mut sampler = Self::new(rate);
         sampler.state = AtomicU64::new(seed | 1);
         sampler
+    }
+
+    /// Get the count of dropped messages
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     /// Generate next random number (xorshift64)
@@ -107,6 +115,7 @@ impl Middleware for Sampler {
         if self.should_sample() {
             Some(msg)
         } else {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
             tracing::trace!(
                 id = %msg.id,
                 "sampled out"
