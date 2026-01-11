@@ -110,26 +110,33 @@ impl Deduplicator {
 
     /// Remove expired entries
     ///
-    /// Collects expired keys first to minimize lock hold time.
+    /// Collects expired (key, timestamp) pairs first, then only removes
+    /// entries if the timestamp still matches (to avoid removing fresh entries
+    /// that arrived between the two passes).
     fn cleanup(&self, now: Instant) {
-        // First pass: collect expired keys (short lock)
-        let expired_keys: Vec<String> = {
+        // First pass: collect expired keys WITH their timestamps (short lock)
+        let expired: Vec<(String, Instant)> = {
             let seen = self.seen.lock();
             seen.iter()
                 .filter(|(_, last_seen)| now.duration_since(**last_seen) >= self.ttl)
-                .map(|(k, _)| k.clone())
+                .map(|(k, ts)| (k.clone(), *ts))
                 .collect()
         };
 
-        if expired_keys.is_empty() {
+        if expired.is_empty() {
             return;
         }
 
-        // Second pass: remove expired keys (short lock)
+        // Second pass: remove only if timestamp still matches (short lock)
+        // This prevents removing a fresh entry that arrived between passes
         {
             let mut seen = self.seen.lock();
-            for key in expired_keys {
-                seen.remove(&key);
+            for (key, old_ts) in expired {
+                if let Some(current_ts) = seen.get(&key) {
+                    if *current_ts == old_ts {
+                        seen.remove(&key);
+                    }
+                }
             }
         }
     }
@@ -310,5 +317,28 @@ mod tests {
         // cleanup_interval of 0 should be treated as 1
         let dedup = Deduplicator::with_cleanup_interval(Duration::from_secs(1), 0);
         assert!(dedup.check("test")); // Should not panic
+    }
+
+    #[tokio::test]
+    async fn test_dedup_dropped_count() {
+        let dedup = Deduplicator::new(Duration::from_secs(60));
+
+        // First message passes
+        let mut msg1 = Message::new("test", "evt", Bytes::new());
+        msg1.id = "dup-test".into();
+        assert!(dedup.process(msg1).await.is_some());
+        assert_eq!(dedup.dropped_count(), 0);
+
+        // Duplicate is dropped
+        let mut msg2 = Message::new("test", "evt", Bytes::new());
+        msg2.id = "dup-test".into();
+        assert!(dedup.process(msg2).await.is_none());
+        assert_eq!(dedup.dropped_count(), 1);
+
+        // Another duplicate
+        let mut msg3 = Message::new("test", "evt", Bytes::new());
+        msg3.id = "dup-test".into();
+        assert!(dedup.process(msg3).await.is_none());
+        assert_eq!(dedup.dropped_count(), 2);
     }
 }

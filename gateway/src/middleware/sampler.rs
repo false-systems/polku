@@ -237,4 +237,16 @@ mod tests {
     fn test_sampler_invalid_rate_negative() {
         let _ = Sampler::new(-0.1);
     }
+
+    #[tokio::test]
+    async fn test_sampler_dropped_count() {
+        // 0% rate = drop all
+        let sampler = Sampler::new(0.0);
+
+        for _ in 0..5 {
+            let msg = Message::new("test", "evt", Bytes::new());
+            assert!(sampler.process(msg).await.is_none());
+        }
+        assert_eq!(sampler.dropped_count(), 5);
+    }
 }

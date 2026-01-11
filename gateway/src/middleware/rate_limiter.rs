@@ -260,4 +260,23 @@ mod tests {
         let limiter = RateLimiter::new(1000, 0);
         assert!(!limiter.try_acquire());
     }
+
+    #[tokio::test]
+    async fn test_rate_limiter_dropped_count() {
+        let limiter = RateLimiter::new(100, 2); // burst 2
+
+        // First two pass
+        for _ in 0..2 {
+            let msg = Message::new("test", "evt", Bytes::new());
+            assert!(limiter.process(msg).await.is_some());
+        }
+        assert_eq!(limiter.dropped_count(), 0);
+
+        // Next 3 get dropped
+        for _ in 0..3 {
+            let msg = Message::new("test", "evt", Bytes::new());
+            assert!(limiter.process(msg).await.is_none());
+        }
+        assert_eq!(limiter.dropped_count(), 3);
+    }
 }
