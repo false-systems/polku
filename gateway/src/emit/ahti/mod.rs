@@ -26,7 +26,7 @@ use super::{Emitter, Event, PluginError};
 use ahti_proto::ahti::v1::{
     self as ahti_types, ahti_service_client::AhtiServiceClient, AhtiEvent, AhtiEventBatch,
     AhtiHealthRequest, Entity, EntityReference, EntityType, EventType, Relationship,
-    RelationshipType,
+    RelationshipState, RelationshipType,
 };
 // Import polku_core types for the Event.data oneof
 use polku_core::proto::event::Data as PolkuEventData;
@@ -184,10 +184,11 @@ impl AhtiEmitter {
     }
 
     /// Select the best healthy endpoint based on average latency.
-    /// Returns the endpoint with lowest latency, or the first healthy one if no latency data.
+    /// Prefers endpoints with known latency data over those without.
     fn select_endpoint(&self, exclude: &[bool]) -> Option<usize> {
-        let mut best_idx = None;
+        let mut best_known_idx = None;
         let mut best_latency = u64::MAX;
+        let mut first_unknown_idx = None;
 
         for (idx, state) in self.states.iter().enumerate() {
             if exclude[idx] || !state.is_healthy() {
@@ -195,16 +196,20 @@ impl AhtiEmitter {
             }
 
             let latency = state.avg_latency_us();
-            // Prefer endpoints with latency data; use 0 as "unknown, try first"
-            if latency == 0 && best_idx.is_none() {
-                best_idx = Some(idx);
-            } else if latency > 0 && latency < best_latency {
+            if latency == 0 {
+                // No latency data yet - track as fallback
+                if first_unknown_idx.is_none() {
+                    first_unknown_idx = Some(idx);
+                }
+            } else if latency < best_latency {
+                // Has latency data - prefer lowest
                 best_latency = latency;
-                best_idx = Some(idx);
+                best_known_idx = Some(idx);
             }
         }
 
-        best_idx
+        // Prefer endpoints with known latency, fall back to unknown
+        best_known_idx.or(first_unknown_idx)
     }
 
     fn select_any_untried(&self, exclude: &[bool]) -> Option<usize> {
@@ -228,6 +233,11 @@ impl AhtiEmitter {
             events: ahti_events,
         };
 
+        // NOTE: We use streaming RPC with a single batch rather than unary because:
+        // 1. AHTI's API is streaming-based (StreamEvents)
+        // 2. Hub already batches events, so each emit() call is one logical batch
+        // 3. This keeps the door open for multi-batch streaming if needed later
+        // The single-element channel overhead is negligible vs. network latency.
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         tx.send(batch)
             .await
@@ -385,7 +395,7 @@ impl AhtiEmitter {
                         .into_iter()
                         .collect(),
                     generation: 0,
-                    state: 1, // Active
+                    state: RelationshipState::Active as i32,
                     deleted_at: None,
                     delete_reason: String::new(),
                     created_at: None,
@@ -429,7 +439,7 @@ impl AhtiEmitter {
                         }),
                         labels: Default::default(),
                         generation: 0,
-                        state: 1, // Active
+                        state: RelationshipState::Active as i32,
                         deleted_at: None,
                         delete_reason: String::new(),
                         created_at: None,
