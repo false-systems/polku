@@ -3,19 +3,36 @@
 //! Converts polku_core::Event to ahti.v1.AhtiEvent and streams to AHTI.
 //! Supports typed event data (network, kernel, container, k8s, process, resource)
 //! which maps directly to Ahti's event model.
+//!
+//! # Design Notes
+//!
+//! ## Streaming Model
+//! Each `emit()` call opens a new gRPC stream and sends a single batch. This is
+//! intentionally simple rather than maintaining persistent streams, because:
+//! - Polku's Hub already batches events before calling emit()
+//! - ResilientEmitter handles retries with exponential backoff
+//! - Persistent streams add complexity (reconnection, flow control, ordering)
+//!
+//! For high-throughput scenarios, consider wrapping with ResilientEmitter and
+//! tuning the Hub's batch_size and flush_interval.
+//!
+//! ## Retry & Resilience
+//! This emitter does basic endpoint failover but NOT retry with backoff.
+//! For production use, wrap with `ResilientEmitter::wrap(ahti_emitter).with_retry(...)`.
 
 mod ahti_proto;
 
 use super::{Emitter, Event, PluginError};
 use ahti_proto::ahti::v1::{
     self as ahti_types, ahti_service_client::AhtiServiceClient, AhtiEvent, AhtiEventBatch,
-    AhtiHealthRequest, Entity, EntityType, EventType,
+    AhtiHealthRequest, Entity, EntityReference, EntityType, EventType, Relationship,
+    RelationshipType,
 };
 // Import polku_core types for the Event.data oneof
 use polku_core::proto::event::Data as PolkuEventData;
 use polku_core::{Outcome as PolkuOutcome, Severity as PolkuSeverity};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, error, info, warn};
 
@@ -24,40 +41,50 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 const FAILURE_THRESHOLD: u32 = 3;
 const UNHEALTHY_DURATION_MS: u64 = 30_000;
 
+/// Tracks health and performance of a single AHTI endpoint.
+///
+/// Uses `Ordering::SeqCst` for failure tracking to ensure proper visibility
+/// across threads during endpoint selection and failure recording.
 struct EndpointState {
-    load: AtomicU32,
     unhealthy_until: AtomicU64,
-    consecutive_failures: AtomicU32,
+    consecutive_failures: AtomicU64,
+    /// Cumulative latency in microseconds for calculating averages
+    total_latency_us: AtomicU64,
+    /// Number of successful emits for latency averaging
+    emit_count: AtomicU64,
 }
 
 impl EndpointState {
     fn new() -> Self {
         Self {
-            load: AtomicU32::new(500),
             unhealthy_until: AtomicU64::new(0),
-            consecutive_failures: AtomicU32::new(0),
+            consecutive_failures: AtomicU64::new(0),
+            total_latency_us: AtomicU64::new(0),
+            emit_count: AtomicU64::new(0),
         }
     }
 
-    fn record_success(&self) {
-        self.consecutive_failures.store(0, Ordering::Relaxed);
-        self.unhealthy_until.store(0, Ordering::Relaxed);
+    fn record_success(&self, latency_us: u64) {
+        self.consecutive_failures.store(0, Ordering::SeqCst);
+        self.unhealthy_until.store(0, Ordering::SeqCst);
+        self.total_latency_us.fetch_add(latency_us, Ordering::Relaxed);
+        self.emit_count.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_failure(&self) {
-        let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
-        if failures >= FAILURE_THRESHOLD {
+        let failures = self.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
+        if failures >= FAILURE_THRESHOLD as u64 {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
             self.unhealthy_until
-                .store(now + UNHEALTHY_DURATION_MS, Ordering::Relaxed);
+                .store(now + UNHEALTHY_DURATION_MS, Ordering::SeqCst);
         }
     }
 
     fn is_healthy(&self) -> bool {
-        let unhealthy_until = self.unhealthy_until.load(Ordering::Relaxed);
+        let unhealthy_until = self.unhealthy_until.load(Ordering::SeqCst);
         if unhealthy_until == 0 {
             return true;
         }
@@ -68,8 +95,13 @@ impl EndpointState {
         now >= unhealthy_until
     }
 
-    fn get_load(&self) -> f64 {
-        self.load.load(Ordering::Relaxed) as f64 / 1000.0
+    /// Average latency in microseconds, or 0 if no data yet
+    fn avg_latency_us(&self) -> u64 {
+        let count = self.emit_count.load(Ordering::Relaxed);
+        if count == 0 {
+            return 0;
+        }
+        self.total_latency_us.load(Ordering::Relaxed) / count
     }
 }
 
@@ -151,18 +183,23 @@ impl AhtiEmitter {
         })
     }
 
+    /// Select the best healthy endpoint based on average latency.
+    /// Returns the endpoint with lowest latency, or the first healthy one if no latency data.
     fn select_endpoint(&self, exclude: &[bool]) -> Option<usize> {
         let mut best_idx = None;
-        let mut best_load = f64::MAX;
+        let mut best_latency = u64::MAX;
 
         for (idx, state) in self.states.iter().enumerate() {
             if exclude[idx] || !state.is_healthy() {
                 continue;
             }
 
-            let load = state.get_load();
-            if load < best_load {
-                best_load = load;
+            let latency = state.avg_latency_us();
+            // Prefer endpoints with latency data; use 0 as "unknown, try first"
+            if latency == 0 && best_idx.is_none() {
+                best_idx = Some(idx);
+            } else if latency > 0 && latency < best_latency {
+                best_latency = latency;
                 best_idx = Some(idx);
             }
         }
@@ -179,11 +216,12 @@ impl AhtiEmitter {
         None
     }
 
-    async fn try_emit_to(&self, idx: usize, events: &[Event]) -> Result<(), PluginError> {
+    async fn try_emit_to(&self, idx: usize, events: &[Event]) -> Result<u64, PluginError> {
         let mut client = self.clients[idx].clone();
         let endpoint = &self.endpoints[idx];
         let state = &self.states[idx];
 
+        let start = Instant::now();
         let ahti_events: Vec<AhtiEvent> = events.iter().map(Self::event_to_ahti_event).collect();
 
         let batch = AhtiEventBatch {
@@ -204,10 +242,11 @@ impl AhtiEmitter {
 
                 match ack_stream.message().await {
                     Ok(Some(ack)) => {
+                        let latency_us = start.elapsed().as_micros() as u64;
                         if ack.success {
-                            debug!(endpoint = %endpoint, acked = ack.event_ids.len(), "Batch sent to AHTI");
-                            state.record_success();
-                            Ok(())
+                            debug!(endpoint = %endpoint, acked = ack.event_ids.len(), latency_us, "Batch sent to AHTI");
+                            state.record_success(latency_us);
+                            Ok(latency_us)
                         } else {
                             warn!(endpoint = %endpoint, error = %ack.error, "AHTI rejected batch");
                             state.record_failure();
@@ -215,9 +254,10 @@ impl AhtiEmitter {
                         }
                     }
                     Ok(None) => {
-                        debug!(endpoint = %endpoint, "Stream ended normally");
-                        state.record_success();
-                        Ok(())
+                        let latency_us = start.elapsed().as_micros() as u64;
+                        debug!(endpoint = %endpoint, latency_us, "Stream ended normally");
+                        state.record_success(latency_us);
+                        Ok(latency_us)
                     }
                     Err(e) => {
                         error!(endpoint = %endpoint, error = %e, "Stream error from AHTI");
@@ -246,6 +286,7 @@ impl AhtiEmitter {
         let namespace = event.metadata.get("namespace").cloned().unwrap_or_default();
 
         let entities = Self::extract_entities(event);
+        let relationships = Self::extract_relationships(event);
 
         let timestamp = Some(prost_types::Timestamp {
             seconds: event.timestamp_unix_ns / 1_000_000_000,
@@ -261,6 +302,9 @@ impl AhtiEmitter {
         // Map typed event data from polku to ahti
         let data = Self::map_event_data(&event.data);
 
+        // Extract duration from metadata or typed data
+        let duration_us = Self::extract_duration_us(event);
+
         AhtiEvent {
             id: event.id.clone(),
             timestamp,
@@ -272,15 +316,129 @@ impl AhtiEmitter {
             trace_id: event.metadata.get("trace_id").cloned().unwrap_or_default(),
             span_id: event.metadata.get("span_id").cloned().unwrap_or_default(),
             parent_span_id: event.metadata.get("parent_span_id").cloned().unwrap_or_default(),
-            duration_us: 0,
+            duration_us,
             entities,
-            relationships: vec![],
+            relationships,
             cluster,
             namespace,
             labels: event.metadata.clone(),
             error: None,
             data,
         }
+    }
+
+    /// Extract duration in microseconds from event metadata or typed data.
+    /// Checks metadata["duration_us"], metadata["duration_ms"], or network latency.
+    fn extract_duration_us(event: &Event) -> u64 {
+        // First check explicit duration in metadata
+        if let Some(duration_us) = event.metadata.get("duration_us") {
+            if let Ok(us) = duration_us.parse::<u64>() {
+                return us;
+            }
+        }
+        if let Some(duration_ms) = event.metadata.get("duration_ms") {
+            if let Ok(ms) = duration_ms.parse::<u64>() {
+                return ms * 1000;
+            }
+        }
+
+        // Fall back to typed data latency (network events have latency_ms)
+        if let Some(PolkuEventData::Network(n)) = &event.data {
+            if n.latency_ms > 0.0 {
+                return (n.latency_ms * 1000.0) as u64;
+            }
+        }
+
+        0
+    }
+
+    /// Extract entity relationships from event metadata.
+    /// Looks for owner references, pod-to-node, deployment-to-replicaset, etc.
+    fn extract_relationships(event: &Event) -> Vec<Relationship> {
+        let mut relationships = Vec::new();
+        let cluster_id = event
+            .metadata
+            .get("cluster_id")
+            .or_else(|| event.metadata.get("cluster"))
+            .cloned()
+            .unwrap_or_default();
+
+        // Pod -> Node relationship (ScheduledOn)
+        if let (Some(_pod_name), Some(node_name)) = (
+            event.metadata.get("pod_name").or_else(|| event.metadata.get("name")),
+            event.metadata.get("node_name"),
+        ) {
+            if event.metadata.get("resource").map(|s| s.as_str()) == Some("pod") {
+                relationships.push(Relationship {
+                    r#type: RelationshipType::ScheduledOn as i32,
+                    source: Some(EntityReference {
+                        r#type: EntityType::Pod as i32,
+                        id: event.metadata.get("uid").cloned().unwrap_or_default(),
+                        cluster_id: cluster_id.clone(),
+                    }),
+                    target: Some(EntityReference {
+                        r#type: EntityType::Node as i32,
+                        id: String::new(), // Node ID often not in metadata
+                        cluster_id: cluster_id.clone(),
+                    }),
+                    labels: [("target_name".to_string(), node_name.clone())]
+                        .into_iter()
+                        .collect(),
+                    generation: 0,
+                    state: 1, // Active
+                    deleted_at: None,
+                    delete_reason: String::new(),
+                    created_at: None,
+                });
+            }
+        }
+
+        // Owner reference (e.g., Pod -> ReplicaSet -> Deployment) uses Owns relationship
+        if let (Some(owner_kind), Some(_owner_name)) = (
+            event.metadata.get("owner_kind"),
+            event.metadata.get("owner_name"),
+        ) {
+            // Note: Ahti EntityType doesn't have ReplicaSet or Job, map to closest
+            let owner_type = match owner_kind.as_str() {
+                "Deployment" => EntityType::Deployment,
+                "StatefulSet" => EntityType::Statefulset,
+                "DaemonSet" => EntityType::Daemonset,
+                // ReplicaSet and Job don't exist in EntityType, skip them
+                _ => EntityType::Unspecified,
+            };
+
+            if owner_type != EntityType::Unspecified {
+                let source_type = match event.metadata.get("resource").map(|s| s.as_str()) {
+                    Some("pod") => EntityType::Pod,
+                    _ => EntityType::Unspecified,
+                };
+
+                if source_type != EntityType::Unspecified {
+                    // Note: We express "owned_by" as the owner "Owns" the resource
+                    relationships.push(Relationship {
+                        r#type: RelationshipType::Owns as i32,
+                        source: Some(EntityReference {
+                            r#type: owner_type as i32,
+                            id: event.metadata.get("owner_uid").cloned().unwrap_or_default(),
+                            cluster_id: cluster_id.clone(),
+                        }),
+                        target: Some(EntityReference {
+                            r#type: source_type as i32,
+                            id: event.metadata.get("uid").cloned().unwrap_or_default(),
+                            cluster_id: cluster_id.clone(),
+                        }),
+                        labels: Default::default(),
+                        generation: 0,
+                        state: 1, // Active
+                        deleted_at: None,
+                        delete_reason: String::new(),
+                        created_at: None,
+                    });
+                }
+            }
+        }
+
+        relationships
     }
 
     /// Map polku severity enum to ahti severity
@@ -508,11 +666,12 @@ impl Emitter for AhtiEmitter {
         let mut tried = vec![false; self.clients.len()];
         let mut last_error = None;
 
+        // Try healthy endpoints first (sorted by latency)
         while let Some(idx) = self.select_endpoint(&tried) {
             tried[idx] = true;
 
             match self.try_emit_to(idx, events).await {
-                Ok(()) => return Ok(()),
+                Ok(_latency_us) => return Ok(()),
                 Err(e) => {
                     warn!(endpoint = %self.endpoints[idx], error = %e, "Emit failed, trying next endpoint");
                     last_error = Some(e);
@@ -520,11 +679,12 @@ impl Emitter for AhtiEmitter {
             }
         }
 
+        // Fall back to unhealthy endpoints (they might have recovered)
         while let Some(idx) = self.select_any_untried(&tried) {
             tried[idx] = true;
 
             match self.try_emit_to(idx, events).await {
-                Ok(()) => {
+                Ok(_latency_us) => {
                     info!(endpoint = %self.endpoints[idx], "Unhealthy endpoint recovered");
                     return Ok(());
                 }
