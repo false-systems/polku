@@ -6,8 +6,9 @@
 //! # Memory Management
 //!
 //! To prevent unbounded memory growth from ephemeral sources, buckets are
-//! evicted LRU-style when `max_sources` is reached. Configure this based
-//! on your expected source cardinality.
+//! evicted LRU-style when capacity is exceeded. Eviction is batched (10% at
+//! a time) to amortize the O(n) scan cost. Configure `max_sources` based on
+//! your expected source cardinality.
 
 use crate::message::Message;
 use crate::middleware::Middleware;
@@ -24,8 +25,9 @@ use std::time::Instant;
 ///
 /// # Memory Bounds
 ///
-/// Set `max_sources` to limit memory usage. When exceeded, the least
-/// recently used bucket is evicted. Default is 10,000 sources.
+/// Set `max_sources` to limit memory usage. When exceeded, the oldest 10%
+/// of buckets are evicted in batch to amortize the O(n) scan cost.
+/// Default is 10,000 sources.
 pub struct Throttle {
     /// Rate per second for each source
     rate: u64,
@@ -35,6 +37,8 @@ pub struct Throttle {
     max_sources: usize,
     /// Per-source buckets with last-access time
     buckets: RwLock<HashMap<String, TrackedBucket>>,
+    /// Count of messages dropped due to rate limiting
+    dropped: AtomicU64,
 }
 
 /// Token bucket with last-access tracking for LRU eviction
@@ -183,6 +187,7 @@ impl Throttle {
             burst,
             max_sources: 10_000,
             buckets: RwLock::new(HashMap::new()),
+            dropped: AtomicU64::new(0),
         }
     }
 
@@ -213,9 +218,9 @@ impl Throttle {
                 return tracked.try_acquire();
             }
 
-            // Evict LRU bucket if at capacity
+            // Evict LRU buckets in batch if at capacity
             if buckets.len() >= self.max_sources {
-                self.evict_lru(&mut buckets);
+                self.evict_lru_batch(&mut buckets);
             }
 
             // Insert new bucket
@@ -226,19 +231,30 @@ impl Throttle {
         }
     }
 
-    /// Evict the least recently used bucket
-    fn evict_lru(&self, buckets: &mut HashMap<String, TrackedBucket>) {
+    /// Evict the least recently used buckets in batch
+    ///
+    /// Evicts 10% of buckets (min 1) to amortize the O(n) scan cost.
+    /// This means we don't scan on every insert, only when over capacity.
+    fn evict_lru_batch(&self, buckets: &mut HashMap<String, TrackedBucket>) {
         if buckets.is_empty() {
             return;
         }
 
-        // Find LRU bucket
-        let lru_source = buckets
-            .iter()
-            .min_by_key(|(_, tracked)| tracked.last_access())
-            .map(|(source, _)| source.clone());
+        // Evict 10% of max_sources, minimum 1
+        let evict_count = (self.max_sources / 10).max(1);
 
-        if let Some(source) = lru_source {
+        // Collect all sources with their last access times
+        let mut sources_by_access: Vec<_> = buckets
+            .iter()
+            .map(|(source, tracked)| (source.clone(), tracked.last_access()))
+            .collect();
+
+        // Sort by access time (oldest first)
+        sources_by_access.sort_by_key(|(_, access)| *access);
+
+        // Evict the oldest N
+        let to_evict = sources_by_access.into_iter().take(evict_count);
+        for (source, _) in to_evict {
             tracing::debug!(source = %source, "evicting LRU throttle bucket");
             buckets.remove(&source);
         }
@@ -253,6 +269,11 @@ impl Throttle {
     pub fn max_sources_limit(&self) -> usize {
         self.max_sources
     }
+
+    /// Get the count of dropped messages
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
 }
 
 #[async_trait]
@@ -265,6 +286,7 @@ impl Middleware for Throttle {
         if self.get_or_create_bucket(&msg.source) {
             Some(msg)
         } else {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(
                 source = %msg.source,
                 message_type = %msg.message_type,
@@ -385,42 +407,61 @@ mod tests {
 
     #[tokio::test]
     async fn test_throttle_lru_eviction() {
-        // max_sources = 3, so 4th source should trigger eviction
-        let throttle = Throttle::new(100, 10).max_sources(3);
+        // max_sources = 10, so 11th source should trigger batch eviction (10% = 1)
+        let throttle = Throttle::new(100, 10).max_sources(10);
 
-        // Add 3 sources
-        for i in 0..3 {
+        // Add 10 sources
+        for i in 0..10 {
             let msg = Message::new(format!("source-{}", i), "evt", Bytes::new());
             throttle.process(msg).await;
         }
-        assert_eq!(throttle.source_count(), 3);
+        assert_eq!(throttle.source_count(), 10);
 
-        // Wait a bit, then access source-1 and source-2 to update their LRU time
+        // Wait a bit, then access sources 5-9 to update their LRU time
         tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-        let msg = Message::new("source-1", "evt", Bytes::new());
-        throttle.process(msg).await;
-        let msg = Message::new("source-2", "evt", Bytes::new());
+        for i in 5..10 {
+            let msg = Message::new(format!("source-{}", i), "evt", Bytes::new());
+            throttle.process(msg).await;
+        }
+
+        // Add an 11th source - should trigger batch eviction (1 source evicted)
+        let msg = Message::new("source-10", "evt", Bytes::new());
         throttle.process(msg).await;
 
-        // Add a 4th source - should evict source-0 (least recently used)
-        let msg = Message::new("source-3", "evt", Bytes::new());
-        throttle.process(msg).await;
+        // Should have evicted 1 (10% of 10), so 10 remain
+        assert_eq!(throttle.source_count(), 10);
 
-        // Still only 3 sources (one was evicted)
-        assert_eq!(throttle.source_count(), 3);
-
-        // source-0 should have been evicted, source-1, source-2, source-3 remain
-        // Adding source-0 again creates a new bucket
+        // source-0 was oldest, so it should be evicted
+        // Adding it again will create a new bucket (triggering another eviction)
         let msg = Message::new("source-0", "evt", Bytes::new());
         throttle.process(msg).await;
 
-        // Now we have 3 again (evicted another LRU)
-        assert_eq!(throttle.source_count(), 3);
+        // Still 10 after another eviction
+        assert_eq!(throttle.source_count(), 10);
     }
 
     #[test]
     fn test_throttle_max_sources_builder() {
         let throttle = Throttle::new(100, 10).max_sources(500);
         assert_eq!(throttle.max_sources_limit(), 500);
+    }
+
+    #[tokio::test]
+    async fn test_throttle_dropped_count() {
+        let throttle = Throttle::new(100, 2); // burst 2
+
+        // First two pass
+        for _ in 0..2 {
+            let msg = Message::new("source-a", "evt", Bytes::new());
+            assert!(throttle.process(msg).await.is_some());
+        }
+        assert_eq!(throttle.dropped_count(), 0);
+
+        // Next 3 get dropped
+        for _ in 0..3 {
+            let msg = Message::new("source-a", "evt", Bytes::new());
+            assert!(throttle.process(msg).await.is_none());
+        }
+        assert_eq!(throttle.dropped_count(), 3);
     }
 }

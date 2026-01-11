@@ -27,6 +27,8 @@ pub struct RateLimiter {
     last_refill: AtomicU64,
     /// Start instant for time tracking
     start: Instant,
+    /// Count of messages dropped due to rate limiting
+    dropped: AtomicU64,
 }
 
 impl RateLimiter {
@@ -52,7 +54,13 @@ impl RateLimiter {
             tokens: AtomicU64::new(scaled_burst),
             last_refill: AtomicU64::new(0),
             start: Instant::now(),
+            dropped: AtomicU64::new(0),
         }
+    }
+
+    /// Get the count of dropped messages
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     /// Try to acquire a token
@@ -156,6 +164,7 @@ impl Middleware for RateLimiter {
         if self.try_acquire() {
             Some(msg)
         } else {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(
                 source = %msg.source,
                 message_type = %msg.message_type,
@@ -250,5 +259,24 @@ mod tests {
     fn test_zero_burst_blocks_all() {
         let limiter = RateLimiter::new(1000, 0);
         assert!(!limiter.try_acquire());
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_dropped_count() {
+        let limiter = RateLimiter::new(100, 2); // burst 2
+
+        // First two pass
+        for _ in 0..2 {
+            let msg = Message::new("test", "evt", Bytes::new());
+            assert!(limiter.process(msg).await.is_some());
+        }
+        assert_eq!(limiter.dropped_count(), 0);
+
+        // Next 3 get dropped
+        for _ in 0..3 {
+            let msg = Message::new("test", "evt", Bytes::new());
+            assert!(limiter.process(msg).await.is_none());
+        }
+        assert_eq!(limiter.dropped_count(), 3);
     }
 }

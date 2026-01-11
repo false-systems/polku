@@ -169,9 +169,15 @@ impl Aggregator {
         routes.sort();
         routes.dedup();
 
+        // Use milliseconds * 1_000_000 for nanosecond-scale timestamp
+        // This avoids the i64 overflow issue with timestamp_nanos_opt() (overflows ~2262)
+        // Milliseconds won't overflow until year 292M+
+        let timestamp_ms = chrono::Utc::now().timestamp_millis();
+        let timestamp_ns = timestamp_ms.saturating_mul(1_000_000);
+
         Message {
             id: MessageId::new(),
-            timestamp: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            timestamp: timestamp_ns,
             source: source.into(),
             message_type: format!("{}.aggregate", first.message_type).into(),
             metadata: Some(Box::new(metadata)),

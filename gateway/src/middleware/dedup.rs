@@ -15,7 +15,7 @@ use crate::middleware::Middleware;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Time-windowed deduplicator
@@ -37,6 +37,8 @@ pub struct Deduplicator {
     ops_since_cleanup: AtomicU32,
     /// Cleanup every N operations (minimum 1)
     cleanup_interval: u32,
+    /// Count of duplicate messages dropped
+    dropped: AtomicU64,
 }
 
 impl Deduplicator {
@@ -52,6 +54,7 @@ impl Deduplicator {
             ttl,
             ops_since_cleanup: AtomicU32::new(0),
             cleanup_interval: 1000,
+            dropped: AtomicU64::new(0),
         }
     }
 
@@ -69,6 +72,7 @@ impl Deduplicator {
             ttl,
             ops_since_cleanup: AtomicU32::new(0),
             cleanup_interval: cleanup_interval.max(1), // Ensure at least 1
+            dropped: AtomicU64::new(0),
         }
     }
 
@@ -105,9 +109,36 @@ impl Deduplicator {
     }
 
     /// Remove expired entries
+    ///
+    /// Collects expired (key, timestamp) pairs first, then only removes
+    /// entries if the timestamp still matches (to avoid removing fresh entries
+    /// that arrived between the two passes).
     fn cleanup(&self, now: Instant) {
-        let mut seen = self.seen.lock();
-        seen.retain(|_, last_seen| now.duration_since(*last_seen) < self.ttl);
+        // First pass: collect expired keys WITH their timestamps (short lock)
+        let expired: Vec<(String, Instant)> = {
+            let seen = self.seen.lock();
+            seen.iter()
+                .filter(|(_, last_seen)| now.duration_since(**last_seen) >= self.ttl)
+                .map(|(k, ts)| (k.clone(), *ts))
+                .collect()
+        };
+
+        if expired.is_empty() {
+            return;
+        }
+
+        // Second pass: remove only if timestamp still matches (short lock)
+        // This prevents removing a fresh entry that arrived between passes
+        {
+            let mut seen = self.seen.lock();
+            for (key, old_ts) in expired {
+                if let Some(current_ts) = seen.get(&key) {
+                    if *current_ts == old_ts {
+                        seen.remove(&key);
+                    }
+                }
+            }
+        }
     }
 
     /// Get current number of tracked IDs
@@ -125,6 +156,11 @@ impl Deduplicator {
     pub fn is_empty(&self) -> bool {
         self.seen.lock().is_empty()
     }
+
+    /// Get the count of dropped duplicate messages
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
 }
 
 #[async_trait]
@@ -137,6 +173,7 @@ impl Middleware for Deduplicator {
         if self.check(&msg.id.to_string()) {
             Some(msg)
         } else {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(
                 id = %msg.id,
                 "duplicate message dropped"
@@ -280,5 +317,28 @@ mod tests {
         // cleanup_interval of 0 should be treated as 1
         let dedup = Deduplicator::with_cleanup_interval(Duration::from_secs(1), 0);
         assert!(dedup.check("test")); // Should not panic
+    }
+
+    #[tokio::test]
+    async fn test_dedup_dropped_count() {
+        let dedup = Deduplicator::new(Duration::from_secs(60));
+
+        // First message passes
+        let mut msg1 = Message::new("test", "evt", Bytes::new());
+        msg1.id = "dup-test".into();
+        assert!(dedup.process(msg1).await.is_some());
+        assert_eq!(dedup.dropped_count(), 0);
+
+        // Duplicate is dropped
+        let mut msg2 = Message::new("test", "evt", Bytes::new());
+        msg2.id = "dup-test".into();
+        assert!(dedup.process(msg2).await.is_none());
+        assert_eq!(dedup.dropped_count(), 1);
+
+        // Another duplicate
+        let mut msg3 = Message::new("test", "evt", Bytes::new());
+        msg3.id = "dup-test".into();
+        assert!(dedup.process(msg3).await.is_none());
+        assert_eq!(dedup.dropped_count(), 2);
     }
 }

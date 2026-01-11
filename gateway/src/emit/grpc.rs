@@ -27,6 +27,7 @@
 
 use crate::emit::Emitter;
 use crate::error::PluginError;
+use crate::metrics::Metrics;
 use crate::proto::gateway_client::GatewayClient;
 use crate::proto::{Event, EventPayload, HealthRequest, IngestBatch, ingest_batch};
 use async_trait::async_trait;
@@ -67,19 +68,30 @@ impl EndpointState {
         }
     }
 
-    /// Update fill ratio from Ack response
-    fn update_fill_ratio(&self, buffer_size: i64, buffer_capacity: i64) {
+    /// Update fill ratio from Ack response and report to metrics
+    fn update_fill_ratio(&self, buffer_size: i64, buffer_capacity: i64, endpoint: &str) {
         if buffer_capacity > 0 {
             let ratio = ((buffer_size as f64 / buffer_capacity as f64) * 1000.0) as u32;
             self.fill_ratio.store(ratio.min(1000), Ordering::Relaxed);
+
+            // Report to Prometheus
+            if let Some(m) = Metrics::get() {
+                m.set_grpc_endpoint_fill_ratio(endpoint, ratio as f64 / 1000.0);
+            }
         }
         // Success - reset failures
         self.consecutive_failures.store(0, Ordering::Relaxed);
         self.unhealthy_until.store(0, Ordering::Relaxed);
+
+        // Report health restored
+        if let Some(m) = Metrics::get() {
+            m.set_grpc_endpoint_health(endpoint, true);
+            m.set_grpc_endpoint_failures(endpoint, 0);
+        }
     }
 
     /// Record a failure, possibly marking endpoint unhealthy
-    fn record_failure(&self) {
+    fn record_failure(&self, endpoint: &str) {
         let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
         if failures >= FAILURE_THRESHOLD {
             let now = std::time::SystemTime::now()
@@ -88,6 +100,16 @@ impl EndpointState {
                 .unwrap_or(0);
             self.unhealthy_until
                 .store(now + UNHEALTHY_DURATION_MS, Ordering::Relaxed);
+
+            // Report unhealthy to Prometheus
+            if let Some(m) = Metrics::get() {
+                m.set_grpc_endpoint_health(endpoint, false);
+            }
+        }
+
+        // Report failure count
+        if let Some(m) = Metrics::get() {
+            m.set_grpc_endpoint_failures(endpoint, failures);
         }
     }
 
@@ -258,6 +280,11 @@ impl GrpcEmitter {
                 fill_ratio = %format!("{:.1}%", best_ratio * 100.0),
                 "Selected least-loaded endpoint"
             );
+
+            // Record selection to metrics
+            if let Some(m) = Metrics::get() {
+                m.record_grpc_endpoint_selected(&self.endpoints[idx]);
+            }
         }
 
         best_idx
@@ -306,7 +333,7 @@ impl GrpcEmitter {
                             );
 
                             // Update endpoint state from Ack
-                            state.update_fill_ratio(ack.buffer_size, ack.buffer_capacity);
+                            state.update_fill_ratio(ack.buffer_size, ack.buffer_capacity, endpoint);
 
                             // Log backpressure warning
                             if ack.buffer_size > 0 && ack.buffer_capacity > 0 {
@@ -327,7 +354,7 @@ impl GrpcEmitter {
                         }
                         Err(e) => {
                             // Mid-stream error - record failure
-                            state.record_failure();
+                            state.record_failure(endpoint);
                             return Err(PluginError::Send(format!(
                                 "Stream error from {}: {}",
                                 endpoint, e
@@ -335,10 +362,16 @@ impl GrpcEmitter {
                         }
                     }
                 }
+
+                // Record successful emit to metrics
+                if let Some(m) = Metrics::get() {
+                    m.record_grpc_endpoint_events(endpoint, events.len() as u64);
+                }
+
                 Ok(())
             }
             Err(e) => {
-                state.record_failure();
+                state.record_failure(endpoint);
                 Err(PluginError::Send(format!(
                     "Failed to send to {}: {}",
                     endpoint, e
@@ -362,10 +395,12 @@ impl Emitter for GrpcEmitter {
         // Track which endpoints we've tried
         let mut tried = vec![false; self.clients.len()];
         let mut last_error = None;
+        let mut attempts = 0;
 
         // Try healthy endpoints first (least-loaded order)
         while let Some(idx) = self.select_endpoint(&tried) {
             tried[idx] = true;
+            attempts += 1;
 
             match self.try_emit_to(idx, events).await {
                 Ok(()) => return Ok(()),
@@ -376,6 +411,13 @@ impl Emitter for GrpcEmitter {
                         "Emit failed, trying next endpoint"
                     );
                     last_error = Some(e);
+
+                    // Record failover (not first attempt)
+                    if attempts > 1 {
+                        if let Some(m) = Metrics::get() {
+                            m.record_grpc_failover();
+                        }
+                    }
                 }
             }
         }
@@ -384,6 +426,12 @@ impl Emitter for GrpcEmitter {
         // (they might have recovered)
         while let Some(idx) = self.select_any_untried(&tried) {
             tried[idx] = true;
+            attempts += 1;
+
+            // Record failover for trying unhealthy endpoints
+            if let Some(m) = Metrics::get() {
+                m.record_grpc_failover();
+            }
 
             match self.try_emit_to(idx, events).await {
                 Ok(()) => {
