@@ -656,5 +656,8 @@ fn make_test_event(id: &str) -> polku_gateway::Event {
         metadata: std::collections::HashMap::new(),
         payload: vec![],
         route_to: vec![],
+        severity: 0,
+        outcome: 0,
+        data: None,
     }
 }

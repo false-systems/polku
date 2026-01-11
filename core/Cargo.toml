@@ -1,0 +1,31 @@
+[package]
+name = "polku-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core types for POLKU event gateway - Emitter trait, Event proto, PluginError"
+keywords = ["event", "gateway", "grpc", "observability"]
+categories = ["network-programming"]
+
+[dependencies]
+# Async runtime
+async-trait = "0.1"
+
+# Error handling
+thiserror = "1.0"
+
+# Proto/gRPC (only what we need for Event type)
+prost = "0.13"
+prost-types = "0.13"
+
+[dev-dependencies]
+tokio = { version = "1.43", features = ["rt", "macros"] }
+
+[build-dependencies]
+tonic-build = "0.12"
+prost-build = "0.13"
+
+[lints]
+workspace = true

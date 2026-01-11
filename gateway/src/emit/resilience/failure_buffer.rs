@@ -18,7 +18,7 @@
 
 use crate::emit::Emitter;
 use crate::error::PluginError;
-use crate::proto::Event;
+use polku_core::Event;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -293,6 +293,9 @@ mod tests {
             metadata: std::collections::HashMap::new(),
             payload: vec![],
             route_to: vec![],
+            severity: 0,
+            outcome: 0,
+            data: None,
         }
     }
 

@@ -3,8 +3,8 @@
 //! Ingestors decode raw bytes from various protocols into unified Messages.
 //! Each source registers an Ingestor that knows how to deserialize that format.
 
+use crate::emit::Event;
 use crate::error::PluginError;
-use crate::proto::Event;
 
 /// Context for ingestion
 #[derive(Debug, Clone)]

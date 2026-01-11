@@ -66,5 +66,5 @@ pub use middleware::{
     MiddlewareChain, PassThrough, RateLimiter, Router, Sampler, Throttle, Transform,
     ValidationResult, Validator,
 };
-pub use proto::Event;
+pub use emit::Event;
 pub use registry::PluginRegistry;

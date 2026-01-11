@@ -5,7 +5,7 @@
 
 use crate::emit::Emitter;
 use crate::error::PluginError;
-use crate::proto::Event;
+use polku_core::Event;
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -118,6 +118,9 @@ mod tests {
             metadata: Default::default(),
             payload: vec![1, 2, 3],
             route_to: vec![],
+            severity: 0,
+            outcome: 0,
+            data: None,
         }
     }
 

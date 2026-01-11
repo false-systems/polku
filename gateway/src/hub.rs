@@ -35,7 +35,7 @@
 use crate::buffer_lockfree::LockFreeBuffer;
 use crate::buffer_tiered::TieredBuffer;
 use crate::checkpoint::CheckpointStore;
-use crate::emit::Emitter;
+use crate::emit::{Emitter, Event};
 use crate::error::PluginError;
 use crate::message::Message;
 use crate::metrics::Metrics;
@@ -572,9 +572,9 @@ impl HubRunner {
             .fetch_add(messages.len() as u64, Ordering::SeqCst);
 
         // Convert Messages to proto Events for outputs
-        let events: Vec<crate::proto::Event> = messages
+        let events: Vec<Event> = messages
             .into_iter()
-            .map(crate::proto::Event::from)
+            .map(Event::from)
             .collect();
 
         // Partition events by destination with zero-copy optimization
@@ -673,14 +673,14 @@ impl HubRunner {
 /// - Second pass to distribute: O(events × avg_destinations)
 /// - Multi-destination events: N-1 clones instead of N (last destination gets moved value)
 fn partition_by_destination_owned(
-    events: Vec<crate::proto::Event>,
+    events: Vec<Event>,
     emitters: &[Arc<dyn Emitter>],
-) -> std::collections::HashMap<&'static str, Vec<crate::proto::Event>> {
+) -> std::collections::HashMap<&'static str, Vec<Event>> {
     if emitters.is_empty() || events.is_empty() {
         return std::collections::HashMap::new();
     }
 
-    let mut batches: std::collections::HashMap<&'static str, Vec<crate::proto::Event>> =
+    let mut batches: std::collections::HashMap<&'static str, Vec<Event>> =
         std::collections::HashMap::new();
 
     // Pre-allocate for each emitter
@@ -793,9 +793,9 @@ async fn flush_loop(
         let batch_start_seq = sequence.fetch_add(messages.len() as u64, Ordering::SeqCst);
 
         // Convert Messages to proto Events for outputs
-        let events: Vec<crate::proto::Event> = messages
+        let events: Vec<Event> = messages
             .into_iter()
-            .map(crate::proto::Event::from)
+            .map(Event::from)
             .collect();
 
         // Partition events by destination with zero-copy optimization
@@ -983,7 +983,7 @@ mod tests {
             }
             async fn emit(
                 &self,
-                events: &[crate::proto::Event],
+                events: &[Event],
             ) -> Result<(), crate::error::PluginError> {
                 self.0.fetch_add(events.len() as u64, Ordering::SeqCst);
                 Ok(())
@@ -1054,7 +1054,7 @@ mod tests {
 
             async fn emit(
                 &self,
-                events: &[crate::proto::Event],
+                events: &[Event],
             ) -> Result<(), crate::error::PluginError> {
                 self.count.fetch_add(events.len() as u64, Ordering::SeqCst);
                 Ok(())
@@ -1106,7 +1106,7 @@ mod tests {
         fn name(&self) -> &'static str {
             self.name
         }
-        async fn emit(&self, _: &[crate::proto::Event]) -> Result<(), crate::error::PluginError> {
+        async fn emit(&self, _: &[Event]) -> Result<(), crate::error::PluginError> {
             Ok(())
         }
         async fn health(&self) -> bool {
@@ -1124,8 +1124,8 @@ mod tests {
         ];
 
         // 5 broadcast messages (empty route_to = goes everywhere)
-        let events: Vec<crate::proto::Event> = (0..5)
-            .map(|i| crate::proto::Event {
+        let events: Vec<Event> = (0..5)
+            .map(|i| Event {
                 id: format!("msg-{i}"),
                 route_to: vec![], // broadcast
                 ..Default::default()
@@ -1154,22 +1154,22 @@ mod tests {
         // - msg-2: kafka + webhook
         // - msg-3: broadcast (empty)
         let events = vec![
-            crate::proto::Event {
+            Event {
                 id: "msg-0".into(),
                 route_to: vec!["kafka".into()],
                 ..Default::default()
             },
-            crate::proto::Event {
+            Event {
                 id: "msg-1".into(),
                 route_to: vec!["stdout".into()],
                 ..Default::default()
             },
-            crate::proto::Event {
+            Event {
                 id: "msg-2".into(),
                 route_to: vec!["kafka".into(), "webhook".into()],
                 ..Default::default()
             },
-            crate::proto::Event {
+            Event {
                 id: "msg-3".into(),
                 route_to: vec![], // broadcast
                 ..Default::default()
@@ -1200,7 +1200,7 @@ mod tests {
             vec![Arc::new(NamedEmitter { name: "kafka" })];
 
         // Message routed to non-existent emitter
-        let events = vec![crate::proto::Event {
+        let events = vec![Event {
             id: "msg-0".into(),
             route_to: vec!["nonexistent".into()],
             ..Default::default()
@@ -1221,8 +1221,8 @@ mod tests {
         ];
 
         // Create events with large payloads to make clone cost visible
-        let events: Vec<crate::proto::Event> = (0..3)
-            .map(|i| crate::proto::Event {
+        let events: Vec<Event> = (0..3)
+            .map(|i| Event {
                 id: format!("msg-{i}"),
                 // Each goes to only one destination
                 route_to: if i % 2 == 0 {
@@ -1258,7 +1258,7 @@ mod tests {
         ];
 
         // One event going to all 3 destinations
-        let events = vec![crate::proto::Event {
+        let events = vec![Event {
             id: "broadcast-msg".into(),
             route_to: vec![], // broadcast = all destinations
             payload: vec![42u8; 100],
@@ -1294,7 +1294,7 @@ mod tests {
             fn name(&self) -> &'static str {
                 "counter"
             }
-            async fn emit(&self, events: &[crate::proto::Event]) -> Result<(), PluginError> {
+            async fn emit(&self, events: &[Event]) -> Result<(), PluginError> {
                 self.count
                     .fetch_add(events.len(), std::sync::atomic::Ordering::SeqCst);
                 Ok(())
@@ -1362,7 +1362,7 @@ mod tests {
             fn name(&self) -> &'static str {
                 "failing"
             }
-            async fn emit(&self, _events: &[crate::proto::Event]) -> Result<(), PluginError> {
+            async fn emit(&self, _events: &[Event]) -> Result<(), PluginError> {
                 Err(PluginError::Send("intentional failure".into()))
             }
             async fn health(&self) -> bool {
@@ -1431,7 +1431,7 @@ mod tests {
 
             async fn emit(
                 &self,
-                events: &[crate::proto::Event],
+                events: &[Event],
             ) -> Result<(), crate::error::PluginError> {
                 self.count.fetch_add(events.len() as u64, Ordering::SeqCst);
                 let mut first = self.first_emit_time.lock();
@@ -1546,7 +1546,7 @@ mod tests {
 
             async fn emit(
                 &self,
-                events: &[crate::proto::Event],
+                events: &[Event],
             ) -> Result<(), crate::error::PluginError> {
                 self.count.fetch_add(events.len() as u64, Ordering::SeqCst);
                 Ok(())

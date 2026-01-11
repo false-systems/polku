@@ -10,8 +10,9 @@ use crate::buffer::RingBuffer;
 use crate::hub::MessageSender;
 use crate::ingest::IngestContext;
 use crate::message::Message;
+use crate::emit::Event;
 use crate::proto::{
-    Ack, ComponentHealth, Event, HealthRequest, HealthResponse, IngestBatch, IngestEvent,
+    Ack, ComponentHealth, HealthRequest, HealthResponse, IngestBatch, IngestEvent,
     gateway_server::{Gateway, GatewayServer},
     ingest_batch, ingest_event,
 };
@@ -164,6 +165,7 @@ impl Gateway for GatewayService {
                         errors: vec![],
                         buffer_size: buffer.len() as i64,
                         buffer_capacity: buffer.capacity() as i64,
+                        middleware_stats: None,
                     };
                     if tx.send(Ok(ack)).await.is_err() {
                         break;
@@ -203,6 +205,7 @@ impl Gateway for GatewayService {
                     errors: vec![],
                     buffer_size: buffer.len() as i64,
                     buffer_capacity: buffer.capacity() as i64,
+                    middleware_stats: None,
                 };
 
                 if tx.send(Ok(ack)).await.is_err() {
@@ -241,6 +244,7 @@ impl Gateway for GatewayService {
             errors: vec![],
             buffer_size: self.buffer.len() as i64,
             buffer_capacity: self.buffer.capacity() as i64,
+            middleware_stats: None,
         }))
     }
 
@@ -330,6 +334,9 @@ mod tests {
             metadata: HashMap::new(),
             payload: vec![1, 2, 3],
             route_to: vec![],
+            severity: 0,
+            outcome: 0,
+            data: None,
         };
 
         let ingest = IngestEvent {
@@ -372,6 +379,9 @@ mod tests {
                 metadata: HashMap::new(),
                 payload: vec![],
                 route_to: vec![],
+                severity: 0,
+                outcome: 0,
+                data: None,
             },
             Event {
                 id: "e2".into(),
@@ -381,6 +391,9 @@ mod tests {
                 metadata: HashMap::new(),
                 payload: vec![],
                 route_to: vec![],
+                severity: 0,
+                outcome: 0,
+                data: None,
             },
         ];
 

@@ -35,6 +35,10 @@ pub struct Config {
     /// Whether to use lazy connection for gRPC emitter
     /// Useful when not all endpoints are available at startup
     pub emit_grpc_lazy: bool,
+
+    /// AHTI endpoint for causality analysis (requires --features ahti)
+    /// When set, events are forwarded to AHTI for causal pattern learning
+    pub emit_ahti_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +61,7 @@ impl Default for Config {
             log_format: LogFormat::Pretty,
             emit_grpc_endpoints: Vec::new(),
             emit_grpc_lazy: false,
+            emit_ahti_endpoint: None,
         }
     }
 }
@@ -123,6 +128,12 @@ impl Config {
 
         if let Ok(lazy) = env::var("POLKU_EMIT_GRPC_LAZY") {
             config.emit_grpc_lazy = lazy.to_lowercase() == "true" || lazy == "1";
+        }
+
+        if let Ok(endpoint) = env::var("POLKU_EMIT_AHTI_ENDPOINT") {
+            if !endpoint.is_empty() {
+                config.emit_ahti_endpoint = Some(endpoint);
+            }
         }
 
         Ok(config)

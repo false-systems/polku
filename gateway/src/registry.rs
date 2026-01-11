@@ -3,10 +3,9 @@
 //! Manages ingestors and emitters. Ingestors are keyed by source name for O(1) lookup
 //! during ingestion. Emitters are stored in a vector for fan-out delivery.
 
-use crate::emit::Emitter;
+use crate::emit::{Emitter, Event};
 use crate::error::PluginError;
 use crate::ingest::{IngestContext, Ingestor};
-use crate::proto::Event;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -245,6 +244,9 @@ mod tests {
                 metadata: Default::default(),
                 payload: data.to_vec(),
                 route_to: vec![],
+                severity: 0,
+                outcome: 0,
+                data: None,
             }])
         }
     }
@@ -341,6 +343,9 @@ mod tests {
             metadata: Default::default(),
             payload: vec![],
             route_to: vec![],
+            severity: 0,
+            outcome: 0,
+            data: None,
         }];
 
         let success = registry.emit_to_all(&events).await;

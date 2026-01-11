@@ -125,8 +125,8 @@ impl ResilientEmitter {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::emit::Event;
     use crate::error::PluginError;
-    use crate::proto::Event;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
@@ -189,6 +189,9 @@ mod tests {
             metadata: std::collections::HashMap::new(),
             payload: vec![],
             route_to: vec![],
+            severity: 0,
+            outcome: 0,
+            data: None,
         }
     }
 

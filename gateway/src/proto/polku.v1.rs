@@ -37,7 +37,7 @@ pub struct RawPayload {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct EventPayload {
     #[prost(message, repeated, tag = "1")]
-    pub events: ::prost::alloc::vec::Vec<Event>,
+    pub events: ::prost::alloc::vec::Vec<::polku_core::Event>,
 }
 /// Single event for unary ingestion
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -61,40 +61,8 @@ pub mod ingest_event {
         Raw(::prost::alloc::vec::Vec<u8>),
         /// Pre-formatted event (pass-through)
         #[prost(message, tag = "4")]
-        Event(super::Event),
+        Event(::polku_core::Event),
     }
-}
-/// POLKU's internal event envelope
-/// This is what InputPlugins produce and OutputPlugins consume.
-/// The payload is opaque bytes - POLKU doesn't interpret it.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct Event {
-    /// Unique event ID (ULID recommended)
-    #[prost(string, tag = "1")]
-    pub id: ::prost::alloc::string::String,
-    /// Unix timestamp in nanoseconds
-    #[prost(int64, tag = "2")]
-    pub timestamp_unix_ns: i64,
-    /// Source that produced this event
-    #[prost(string, tag = "3")]
-    pub source: ::prost::alloc::string::String,
-    /// User-defined event type (e.g., "network", "log")
-    #[prost(string, tag = "4")]
-    pub event_type: ::prost::alloc::string::String,
-    /// Arbitrary key-value metadata
-    #[prost(map = "string, string", tag = "5")]
-    pub metadata: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
-    /// The actual event payload - opaque to POLKU
-    #[prost(bytes = "vec", tag = "6")]
-    pub payload: ::prost::alloc::vec::Vec<u8>,
-    /// Optional routing hints for OutputPlugins
-    ///
-    /// Which outputs to send to (empty = all)
-    #[prost(string, repeated, tag = "7")]
-    pub route_to: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// Acknowledgment response
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -111,6 +79,39 @@ pub struct Ack {
     /// Max buffer capacity
     #[prost(int64, tag = "4")]
     pub buffer_capacity: i64,
+    /// Middleware drop statistics (helps clients understand WHY events aren't processed)
+    /// These are cumulative counts since connection start.
+    #[prost(message, optional, tag = "5")]
+    pub middleware_stats: ::core::option::Option<MiddlewareStats>,
+}
+/// MiddlewareStats provides visibility into the middleware pipeline.
+/// Clients can use this to distinguish between:
+///    - Backpressure (buffer full) → slow down, events will be processed
+///    - Rate limiting → you're sending too fast, events are dropped
+///    - Sampling → intentional drops by policy, expected behavior
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct MiddlewareStats {
+    /// Rate limiter drops (client exceeding allowed rate)
+    #[prost(int64, tag = "1")]
+    pub rate_limited_count: i64,
+    /// Sampler drops (intentional sampling, e.g., 10% of network events)
+    #[prost(int64, tag = "2")]
+    pub sampled_out_count: i64,
+    /// Dedup drops (duplicate event IDs within window)
+    #[prost(int64, tag = "3")]
+    pub dedup_count: i64,
+    /// Filter drops (events filtered by CEL rules)
+    #[prost(int64, tag = "4")]
+    pub filtered_count: i64,
+    /// Buffer full drops (backpressure overflow)
+    #[prost(int64, tag = "5")]
+    pub buffer_overflow_count: i64,
+    /// Total events received (before any middleware)
+    #[prost(int64, tag = "6")]
+    pub total_received: i64,
+    /// Total events forwarded to Ahti (after all middleware)
+    #[prost(int64, tag = "7")]
+    pub total_forwarded: i64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AckError {
