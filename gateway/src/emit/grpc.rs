@@ -29,7 +29,8 @@ use crate::emit::Emitter;
 use crate::error::PluginError;
 use crate::metrics::Metrics;
 use crate::proto::gateway_client::GatewayClient;
-use crate::proto::{Event, EventPayload, HealthRequest, IngestBatch, ingest_batch};
+use crate::proto::{EventPayload, HealthRequest, IngestBatch, ingest_batch};
+use polku_core::Event;
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
@@ -501,6 +502,9 @@ mod tests {
             metadata: HashMap::new(),
             payload: vec![1, 2, 3],
             route_to: vec![],
+            severity: 0,
+            outcome: 0,
+            data: None,
         }
     }
 

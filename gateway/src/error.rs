@@ -2,6 +2,9 @@
 
 use thiserror::Error;
 
+// Re-export PluginError from polku-core
+pub use polku_core::PluginError;
+
 /// Result type alias for POLKU operations
 pub type Result<T> = std::result::Result<T, PolkuError>;
 
@@ -44,34 +47,6 @@ pub enum PolkuError {
     /// Shutdown requested
     #[error("shutdown requested")]
     Shutdown,
-}
-
-/// Error type for plugin operations
-#[derive(Error, Debug)]
-pub enum PluginError {
-    /// Initialization failed
-    #[error("initialization failed: {0}")]
-    Init(String),
-
-    /// Transform failed
-    #[error("transform failed: {0}")]
-    Transform(String),
-
-    /// Send failed
-    #[error("send failed: {0}")]
-    Send(String),
-
-    /// Connection error
-    #[error("connection error: {0}")]
-    Connection(String),
-
-    /// Not ready
-    #[error("plugin not ready")]
-    NotReady,
-
-    /// Shutdown error
-    #[error("shutdown error: {0}")]
-    Shutdown(String),
 }
 
 impl From<PluginError> for PolkuError {

@@ -35,6 +35,9 @@ fn make_event() -> Event {
             .as_bytes()
             .to_vec(),
         route_to: vec!["output-1".to_string(), "output-2".to_string()],
+        severity: 0,
+        outcome: 0,
+        data: None,
     }
 }
 

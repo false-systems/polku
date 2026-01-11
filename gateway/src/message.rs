@@ -29,6 +29,7 @@
 //! The `id` field uses a compact 16-byte representation instead of a 26-char string.
 //! This saves ~34 bytes per message and makes cloning O(1) (Copy).
 
+use crate::emit::Event;
 use crate::intern::InternedStr;
 use bytes::Bytes;
 use smallvec::SmallVec;
@@ -352,8 +353,8 @@ impl Message {
 }
 
 /// Convert from proto Event to Message
-impl From<crate::proto::Event> for Message {
-    fn from(event: crate::proto::Event) -> Self {
+impl From<Event> for Message {
+    fn from(event: Event) -> Self {
         Self {
             id: MessageId::from_string(&event.id),
             timestamp: event.timestamp_unix_ns,
@@ -371,7 +372,7 @@ impl From<crate::proto::Event> for Message {
 }
 
 /// Convert from Message to proto Event
-impl From<Message> for crate::proto::Event {
+impl From<Message> for Event {
     fn from(msg: Message) -> Self {
         Self {
             id: msg.id.to_string(),
@@ -381,6 +382,10 @@ impl From<Message> for crate::proto::Event {
             metadata: msg.metadata.map(|b| *b).unwrap_or_default(),
             payload: msg.payload.to_vec(),
             route_to: msg.route_to.into_vec(),
+            // New typed fields - defaults for legacy messages
+            severity: 0, // SEVERITY_UNSPECIFIED
+            outcome: 0,  // OUTCOME_UNSPECIFIED
+            data: None,  // No typed data for messages converted from internal format
         }
     }
 }
@@ -458,7 +463,7 @@ mod tests {
             .with_routes(vec!["out1".into()]);
 
         // Convert to proto
-        let proto: crate::proto::Event = msg.clone().into();
+        let proto: Event = msg.clone().into();
         assert_eq!(msg.id.to_string(), proto.id);
         assert_eq!(proto.source, "svc");
         assert_eq!(proto.event_type, "user.created");

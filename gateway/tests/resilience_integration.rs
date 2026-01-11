@@ -128,6 +128,38 @@ impl Emitter for TrackingEmitter {
 }
 
 // ============================================================================
+// Integration Tests: Typed Event Data
+// ============================================================================
+
+#[tokio::test]
+async fn test_typed_event_data_flows_through_resilient_emitter() {
+    // Verify that typed event data (network, kernel, etc.) flows correctly
+    // through the resilience layer without corruption
+    let inner = Arc::new(TrackingEmitter::new());
+
+    let resilient = ResilientEmitter::wrap_arc(inner.clone())
+        .with_retry(BackoffConfig {
+            max_attempts: 2,
+            initial_delay: Duration::from_millis(1),
+            ..Default::default()
+        })
+        .build();
+
+    // Create event with typed network data
+    let event = make_typed_network_event("typed-net-1");
+
+    // Verify the event has typed data populated
+    assert!(event.data.is_some(), "Event should have typed data");
+    assert_eq!(event.severity, 2, "Severity should be Info (2)");
+    assert_eq!(event.outcome, 1, "Outcome should be Success (1)");
+
+    // Emit through resilient wrapper
+    let result = resilient.emit(&[event]).await;
+    assert!(result.is_ok(), "Emit should succeed");
+    assert_eq!(inner.event_count(), 1, "One event should be tracked");
+}
+
+// ============================================================================
 // Integration Tests: Retry + Circuit Breaker
 // ============================================================================
 
@@ -656,5 +688,43 @@ fn make_test_event(id: &str) -> polku_gateway::Event {
         metadata: std::collections::HashMap::new(),
         payload: vec![],
         route_to: vec![],
+        severity: 0,
+        outcome: 0,
+        data: None,
+    }
+}
+
+/// Create a test event with typed network data
+fn make_typed_network_event(id: &str) -> polku_gateway::Event {
+    use polku_core::proto::event::Data as EventData;
+    use polku_core::NetworkEventData;
+
+    polku_gateway::Event {
+        id: id.to_string(),
+        timestamp_unix_ns: 1704067200_000_000_000, // 2024-01-01T00:00:00Z
+        source: "tapio".to_string(),
+        event_type: "network.connection".to_string(),
+        metadata: [
+            ("cluster".to_string(), "prod".to_string()),
+            ("namespace".to_string(), "default".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+        payload: vec![],
+        route_to: vec![],
+        severity: 2, // Info
+        outcome: 1,  // Success
+        data: Some(EventData::Network(NetworkEventData {
+            protocol: "TCP".to_string(),
+            src_ip: "10.0.0.1".to_string(),
+            dst_ip: "10.0.0.2".to_string(),
+            src_port: 54321,
+            dst_port: 443,
+            direction: "outbound".to_string(),
+            latency_ms: 15.5,
+            bytes_sent: 1024,
+            bytes_received: 2048,
+            ..Default::default()
+        })),
     }
 }

@@ -12,7 +12,7 @@
 
 use crate::emit::Emitter;
 use crate::error::PluginError;
-use crate::proto::Event;
+use polku_core::Event;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Serialize;
@@ -299,6 +299,9 @@ mod tests {
             metadata: HashMap::new(),
             payload: vec![1, 2, 3],
             route_to: vec![],
+            severity: 0,
+            outcome: 0,
+            data: None,
         }
     }
 

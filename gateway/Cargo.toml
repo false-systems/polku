@@ -19,6 +19,9 @@ path = "src/bin/memory_profile.rs"
 required-features = ["dhat-heap"]
 
 [dependencies]
+# Core types (Emitter trait, PluginError, Event proto)
+polku-core = { path = "../core" }
+
 # gRPC
 tonic = "0.12"
 prost = "0.13"
@@ -72,6 +75,8 @@ prost-build = "0.13"
 sykli = []
 # Enable dhat heap profiling
 dhat-heap = ["dhat"]
+# Enable AHTI emitter (inlined to avoid cyclic dep with false-systems-plugins)
+ahti = []
 
 [dev-dependencies]
 tokio-test = "0.4"

@@ -20,9 +20,12 @@
 //! - `POLKU_LOG_LEVEL`: Log level (default: "info")
 //! - `POLKU_EMIT_GRPC_ENDPOINTS`: Comma-separated gRPC endpoints for router mode
 //! - `POLKU_EMIT_GRPC_LAZY`: Use lazy connections (true/false)
+//! - `POLKU_EMIT_AHTI_ENDPOINT`: AHTI endpoint (requires --features ahti)
 
 use polku_gateway::buffer::RingBuffer;
 use polku_gateway::config::Config;
+#[cfg(feature = "ahti")]
+use polku_gateway::emit::AhtiEmitter;
 use polku_gateway::emit::{GrpcEmitter, StdoutEmitter};
 use polku_gateway::hub::Hub;
 use polku_gateway::metrics::Metrics;
@@ -63,6 +66,44 @@ async fn main() -> anyhow::Result<()> {
     let buffer = Arc::new(RingBuffer::new(config.buffer_capacity));
 
     // Build Hub with appropriate emitter
+    #[cfg(feature = "ahti")]
+    let hub = if let Some(ref ahti_endpoint) = config.emit_ahti_endpoint {
+        // AHTI mode: forward to AHTI for analysis
+        let ahti_emitter = AhtiEmitter::new(ahti_endpoint).await?;
+        info!(endpoint = %ahti_endpoint, "AHTI mode: forwarding to AHTI");
+        Hub::new()
+            .buffer_capacity(config.buffer_capacity)
+            .batch_size(config.batch_size)
+            .flush_interval_ms(config.flush_interval_ms)
+            .emitter(ahti_emitter)
+    } else if !config.emit_grpc_endpoints.is_empty() {
+        // Router mode: forward to downstream POLKU instances
+        let grpc_emitter = if config.emit_grpc_lazy {
+            GrpcEmitter::with_endpoints_lazy(config.emit_grpc_endpoints.clone()).await?
+        } else {
+            GrpcEmitter::with_endpoints(config.emit_grpc_endpoints.clone()).await?
+        };
+        info!(
+            endpoints = ?config.emit_grpc_endpoints,
+            lazy = config.emit_grpc_lazy,
+            "Router mode: forwarding to gRPC endpoints"
+        );
+        Hub::new()
+            .buffer_capacity(config.buffer_capacity)
+            .batch_size(config.batch_size)
+            .flush_interval_ms(config.flush_interval_ms)
+            .emitter(grpc_emitter)
+    } else {
+        // Debug mode: print to stdout
+        info!("Debug mode: emitting to stdout");
+        Hub::new()
+            .buffer_capacity(config.buffer_capacity)
+            .batch_size(config.batch_size)
+            .flush_interval_ms(config.flush_interval_ms)
+            .emitter(StdoutEmitter::pretty())
+    };
+
+    #[cfg(not(feature = "ahti"))]
     let hub = if !config.emit_grpc_endpoints.is_empty() {
         // Router mode: forward to downstream POLKU instances
         let grpc_emitter = if config.emit_grpc_lazy {
