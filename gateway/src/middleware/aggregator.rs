@@ -434,44 +434,6 @@ mod tests {
         let _ = Aggregator::new(0);
     }
 
-    // ==========================================================================
-    // FIXED BUG TESTS
-    // ==========================================================================
-
-    /// FIXED: Aggregator now implements Drop to warn about lost messages.
-    ///
-    /// When an Aggregator is dropped with pending messages, it logs a warning.
-    /// Users should call flush() before dropping to process remaining messages.
-    #[tokio::test]
-    async fn test_aggregator_drop_warns_about_pending() {
-        let aggregator = Aggregator::new(10);
-
-        // Add 7 messages (less than batch size of 10)
-        for i in 0..7 {
-            let msg = Message::new("test", "evt", Bytes::from(format!("msg-{}", i)));
-            let result = aggregator.process(msg).await;
-            assert!(result.is_none()); // Held in buffer
-        }
-
-        assert_eq!(aggregator.pending(), 7, "Should have 7 pending messages");
-
-        // FIXED: Aggregator implements Drop that warns about pending messages.
-        // The warning is logged when aggregator goes out of scope with pending > 0.
-        let has_drop_with_pending_handling = true;
-
-        assert!(
-            has_drop_with_pending_handling,
-            "Aggregator should implement Drop to warn about pending messages."
-        );
-
-        // Flush before dropping to avoid the warning in tests
-        let _ = aggregator.flush();
-    }
-
-    /// FIXED: MiddlewareChain now has flush() lifecycle hook.
-    ///
-    /// MiddlewareChain.flush() calls flush() on all middleware in the chain,
-    /// allowing stateful middleware like Aggregator to flush their buffers.
     #[tokio::test]
     async fn test_middleware_chain_flush() {
         use crate::middleware::MiddlewareChain;
@@ -487,7 +449,7 @@ mod tests {
             assert!(result.is_none()); // Held by aggregator
         }
 
-        // FIXED: MiddlewareChain now has flush() method
+        // MiddlewareChain.flush() returns pending messages from all middleware
         let flushed = chain.flush();
         assert_eq!(flushed.len(), 1, "Should flush 1 combined message from aggregator");
 
@@ -499,65 +461,21 @@ mod tests {
         );
     }
 
-    /// FIXED: Middleware trait now has flush() lifecycle method.
-    ///
-    /// The Middleware trait defines flush() with a default no-op implementation.
-    /// Stateful middleware like Aggregator override it to return pending messages.
     #[tokio::test]
-    async fn test_middleware_trait_has_flush() {
-        use crate::middleware::Middleware;
-
+    async fn test_aggregator_flush_returns_pending() {
         let aggregator = Aggregator::new(5);
 
-        // Add 2 messages
+        // Add 2 messages (less than batch size)
         for i in 0..2 {
             let msg = Message::new("test", "evt", Bytes::from(format!("msg-{}", i)));
             aggregator.process(msg).await;
         }
 
-        // FIXED: Middleware trait has flush() method
+        // flush() returns combined message with pending items
         let flushed = aggregator.flush();
         assert!(flushed.is_some(), "Should return combined message");
-    }
 
-    /// FIXED: Aggregator sorts messages by timestamp before combining.
-    ///
-    /// This ensures deterministic batch ordering regardless of thread scheduling.
-    #[tokio::test]
-    async fn test_aggregator_sorts_by_timestamp() {
-        use std::sync::Arc;
-
-        let aggregator = Arc::new(Aggregator::new(4));
-
-        // Two tasks adding messages concurrently
-        let a1 = Arc::clone(&aggregator);
-        let t1 = tokio::spawn(async move {
-            for i in 0..2 {
-                let msg = Message::new("test", "evt", Bytes::from(format!("A-{}", i)));
-                a1.process(msg).await;
-            }
-        });
-
-        let a2 = Arc::clone(&aggregator);
-        let t2 = tokio::spawn(async move {
-            for i in 0..2 {
-                let msg = Message::new("test", "evt", Bytes::from(format!("B-{}", i)));
-                a2.process(msg).await;
-            }
-        });
-
-        t1.await.unwrap();
-        t2.await.unwrap();
-
-        // All 4 messages were processed, triggering a batch
-        assert_eq!(aggregator.pending(), 0, "All 4 messages should have been batched");
-
-        // FIXED: Messages are now sorted by timestamp before combining
-        let batches_are_ordered_by_timestamp = true;
-
-        assert!(
-            batches_are_ordered_by_timestamp,
-            "Aggregated batches should be ordered by message timestamp."
-        );
+        // After flush, pending should be 0
+        assert_eq!(aggregator.pending(), 0);
     }
 }
