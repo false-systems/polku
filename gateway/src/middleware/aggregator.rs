@@ -516,8 +516,8 @@ mod tests {
         }
 
         // FIXED: Middleware trait has flush() method
-        let flushed: Vec<Message> = aggregator.flush().into_iter().collect();
-        assert_eq!(flushed.len(), 1, "Should return combined message");
+        let flushed = aggregator.flush();
+        assert!(flushed.is_some(), "Should return combined message");
     }
 
     /// FIXED: Aggregator sorts messages by timestamp before combining.

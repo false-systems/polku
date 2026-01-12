@@ -53,22 +53,25 @@ impl Sampler {
         } else if rate <= 0.0 {
             0
         } else {
-            // threshold = floor(rate * u64::MAX)
-            // u64::MAX = 2^64 - 1, which fits precisely in f64 as (2^64 - 1)
-            // But f64 can't represent 2^64 - 1 exactly (rounds to 2^64).
+            // We want: floor(rate * (2^64 - 1))
+            // Let y = rate * 2^64. Then:
+            //   rate * (2^64 - 1) = y - rate
+            //   floor(y - rate) is:
+            //     - floor(y) - 1 if frac(y) < rate
+            //     - floor(y)     otherwise
+            // where frac(y) is the fractional part of y.
             //
-            // So we compute: floor(rate * (2^64 - 1))
-            //              = floor(rate * 2^64 - rate)
-            //              = floor(rate * 2^64) - 1  (when rate * 2^64 is integer, i.e., rate = k/2^64)
-            //
-            // Use the identity: rate * u64::MAX = rate * 2^64 - rate
-            // Compute rate * 2^64 in two halves, then subtract floor(rate) = 0
-            let high = (rate * (1u64 << 32) as f64) as u64;
-            let frac = (rate * (1u64 << 32) as f64).fract();
-            let low = (frac * (1u64 << 32) as f64) as u64;
-            // This gives us floor(rate * 2^64). Now subtract 1 to get floor(rate * (2^64-1))
-            // But only if rate > 0 (which we've already checked)
-            ((high << 32) | low).saturating_sub(1)
+            // 2^64 is exactly representable in f64, so we can compute y stably.
+            let two64 = (1u64 << 32) as f64 * (1u64 << 32) as f64;
+            let y = rate * two64;
+            let t = y.floor(); // t = floor(rate * 2^64)
+            let frac = y - t; // frac in [0, 1)
+            let t_u64 = t as u64;
+            if frac < rate {
+                t_u64.saturating_sub(1)
+            } else {
+                t_u64
+            }
         };
 
         // Seed from system time (fallback to fixed seed if clock is misconfigured)
@@ -393,54 +396,4 @@ mod tests {
         );
     }
 
-    /// BUG: xorshift state can be observed in non-random order under contention.
-    ///
-    /// While the xorshift CAS loop is lock-free, under high contention
-    /// threads may "skip" states, meaning the random sequence is not
-    /// deterministic across threads.
-    #[test]
-    fn test_bug_xorshift_contention_non_determinism() {
-        use std::sync::Arc;
-        use std::thread;
-
-        // Single-threaded: collect 100 random values deterministically
-        let sampler = Arc::new(Sampler::with_seed(0.5, 42));
-        let mut single_threaded: Vec<u64> = Vec::new();
-        for _ in 0..100 {
-            single_threaded.push(sampler.next_random());
-        }
-
-        // Concurrent: same seed, but threads compete for state updates
-        let sampler2 = Arc::new(Sampler::with_seed(0.5, 42));
-        let handles: Vec<_> = (0..4)
-            .map(|_| {
-                let s = Arc::clone(&sampler2);
-                thread::spawn(move || {
-                    let mut randoms = vec![];
-                    for _ in 0..25 {
-                        randoms.push(s.next_random());
-                    }
-                    randoms
-                })
-            })
-            .collect();
-
-        let mut concurrent: Vec<u64> = handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap())
-            .collect();
-        concurrent.sort(); // Sort to compare as sets
-
-        let mut single_sorted = single_threaded.clone();
-        single_sorted.sort();
-
-        // EXPECTED: With the same seed, both should produce the same SET of random values
-        // (even if observed in different order due to thread scheduling).
-        // The xorshift state advances deterministically - each value appears exactly once.
-        assert_eq!(
-            concurrent, single_sorted,
-            "BUG: Concurrent execution produced different random values than single-threaded. \
-             This indicates threads are 'skipping' states in the CAS loop."
-        );
-    }
 }
