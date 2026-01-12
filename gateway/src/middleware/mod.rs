@@ -42,6 +42,12 @@ use async_trait::async_trait;
 ///
 /// - `Some(message)` - Pass the message through (possibly modified)
 /// - `None` - Drop/filter the message
+///
+/// # Lifecycle
+///
+/// Stateful middleware (like Aggregator) should override `flush()` to return
+/// any pending messages before shutdown. Call `flush()` on all middleware
+/// before dropping to avoid data loss.
 #[async_trait]
 pub trait Middleware: Send + Sync {
     /// Middleware name for identification and logging
@@ -56,6 +62,18 @@ pub trait Middleware: Send + Sync {
     /// - `Some(Message)` to continue processing
     /// - `None` to drop the message
     async fn process(&self, msg: Message) -> Option<Message>;
+
+    /// Flush any pending messages
+    ///
+    /// Stateful middleware (e.g., Aggregator) should override this to return
+    /// buffered messages. Default implementation returns None (no pending messages).
+    ///
+    /// # Returns
+    /// - `Some(Message)` if there were pending messages to flush
+    /// - `None` if no pending messages
+    fn flush(&self) -> Option<Message> {
+        None
+    }
 }
 
 /// A middleware chain that processes messages through multiple middleware in order
@@ -94,6 +112,20 @@ impl MiddlewareChain {
     /// Get number of middleware in the chain
     pub fn len(&self) -> usize {
         self.middlewares.len()
+    }
+
+    /// Flush all middleware in the chain
+    ///
+    /// Calls `flush()` on each middleware and collects any pending messages.
+    /// Use this before shutdown to avoid losing buffered messages.
+    ///
+    /// # Returns
+    /// A vector of messages flushed from all middleware (may be empty).
+    pub fn flush(&self) -> Vec<Message> {
+        self.middlewares
+            .iter()
+            .filter_map(|mw| mw.flush())
+            .collect()
     }
 }
 
