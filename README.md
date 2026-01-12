@@ -256,7 +256,10 @@ polku/
 ├── gateway/              # polku-gateway crate
 │   └── src/
 │       ├── main.rs       # Entry point (you own this)
-│       ├── hub.rs        # Hub builder
+│       ├── hub/          # Hub module
+│       │   ├── mod.rs    # Hub builder, MessageSender
+│       │   ├── buffer.rs # HubBuffer trait, BufferStrategy
+│       │   └── runner.rs # HubRunner, flush loop
 │       ├── buffer.rs     # Ring buffer
 │       ├── ingest/       # Ingestor trait
 │       ├── emit/         # Built-in emitters
