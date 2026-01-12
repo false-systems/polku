@@ -40,11 +40,38 @@ impl Sampler {
             "sample rate must be between 0.0 and 1.0"
         );
 
-        // Convert rate to threshold
+        // Convert rate to threshold.
+        // We want: threshold such that (threshold + 1) / 2^64 ≈ rate
+        // Which means: threshold ≈ rate * 2^64 - 1 = rate * u64::MAX + rate - 1
+        //
+        // For rate = 0.5: threshold = 0.5 * u64::MAX = 0x7FFF_FFFF_FFFF_FFFF
+        // For rate = 1.0: threshold = u64::MAX
+        //
+        // Simple approach: use saturating arithmetic on u64::MAX
         let threshold = if rate >= 1.0 {
             u64::MAX
+        } else if rate <= 0.0 {
+            0
         } else {
-            (rate * u64::MAX as f64) as u64
+            // We want: floor(rate * (2^64 - 1))
+            // Let y = rate * 2^64. Then:
+            //   rate * (2^64 - 1) = y - rate
+            //   floor(y - rate) is:
+            //     - floor(y) - 1 if frac(y) < rate
+            //     - floor(y)     otherwise
+            // where frac(y) is the fractional part of y.
+            //
+            // 2^64 is exactly representable in f64, so we can compute y stably.
+            let two64 = (1u64 << 32) as f64 * (1u64 << 32) as f64;
+            let y = rate * two64;
+            let t = y.floor(); // t = floor(rate * 2^64)
+            let frac = y - t; // frac in [0, 1)
+            let t_u64 = t as u64;
+            if frac < rate {
+                t_u64.saturating_sub(1)
+            } else {
+                t_u64
+            }
         };
 
         // Seed from system time (fallback to fixed seed if clock is misconfigured)
@@ -249,4 +276,5 @@ mod tests {
         }
         assert_eq!(sampler.dropped_count(), 5);
     }
+
 }

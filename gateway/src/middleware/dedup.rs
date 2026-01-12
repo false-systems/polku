@@ -84,12 +84,17 @@ impl Deduplicator {
         let now = Instant::now();
 
         // Increment op counter and maybe trigger cleanup
-        // Note: multiple threads may trigger cleanup concurrently, but this is safe
-        // (just slightly inefficient). The atomic ensures counter doesn't overflow.
+        // Use compare_exchange to ensure exactly one thread resets and runs cleanup
         let ops = self.ops_since_cleanup.fetch_add(1, Ordering::Relaxed);
         if ops >= self.cleanup_interval {
-            self.ops_since_cleanup.store(0, Ordering::Relaxed);
-            self.cleanup(now);
+            // Only reset if counter is still at ops+1 (we were the one who crossed threshold)
+            if self
+                .ops_since_cleanup
+                .compare_exchange(ops + 1, 0, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.cleanup(now);
+            }
         }
 
         let mut seen = self.seen.lock();
@@ -341,4 +346,5 @@ mod tests {
         assert!(dedup.process(msg3).await.is_none());
         assert_eq!(dedup.dropped_count(), 2);
     }
+
 }

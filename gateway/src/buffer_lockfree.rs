@@ -84,21 +84,27 @@ impl LockFreeBuffer {
     ///
     /// Returns true if pushed successfully, false if dropped due to overflow.
     pub fn push(&self, msg: Message) -> bool {
+        self.try_push(msg).is_ok()
+    }
+
+    /// Try to push a message, returning the message back on failure
+    ///
+    /// Returns Ok(()) if pushed successfully, Err(msg) if buffer is full.
+    /// This allows callers to handle overflow without cloning upfront.
+    pub fn try_push(&self, msg: Message) -> Result<(), Message> {
         match self.queue.push(msg) {
             Ok(()) => {
                 self.metrics.pushed.fetch_add(1, Ordering::Relaxed);
-                true
+                Ok(())
             }
-            Err(_rejected) => {
-                // Buffer full - message dropped
-                // Note: In a more sophisticated implementation, we could
-                // pop the oldest and retry, but for now we just drop.
+            Err(rejected) => {
+                // Buffer full - return message to caller
                 self.metrics.dropped.fetch_add(1, Ordering::Relaxed);
                 // Export overflow to Prometheus
                 if let Some(m) = Metrics::get() {
                     m.record_buffer_overflow(1);
                 }
-                false
+                Err(rejected)
             }
         }
     }

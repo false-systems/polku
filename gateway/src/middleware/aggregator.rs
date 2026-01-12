@@ -90,17 +90,23 @@ impl Aggregator {
 
     /// Combine buffered messages into a single message
     ///
+    /// Messages are sorted by timestamp before combining to ensure deterministic
+    /// ordering regardless of thread scheduling in concurrent scenarios.
+    ///
     /// # Panics
     ///
     /// Debug builds will panic if called with an empty vector.
     /// This invariant is enforced by `process()` and `flush()`.
-    fn combine(&self, messages: Vec<Message>) -> Message {
+    fn combine(&self, mut messages: Vec<Message>) -> Message {
         debug_assert!(
             !messages.is_empty(),
             "Aggregator::combine called with empty messages"
         );
 
-        // Use first message as template (safe due to debug_assert)
+        // Sort by timestamp for deterministic ordering under concurrent access
+        messages.sort_by_key(|m| m.timestamp);
+
+        // Use first message (earliest timestamp) as template
         let first = &messages[0];
 
         // Combine payloads based on strategy
@@ -202,6 +208,18 @@ impl Aggregator {
     }
 }
 
+impl Drop for Aggregator {
+    fn drop(&mut self) {
+        let pending = self.buffer.lock().len();
+        if pending > 0 {
+            tracing::warn!(
+                pending = pending,
+                "Aggregator dropped with pending messages. Call flush() before dropping to avoid data loss."
+            );
+        }
+    }
+}
+
 #[async_trait]
 impl Middleware for Aggregator {
     fn name(&self) -> &'static str {
@@ -219,6 +237,11 @@ impl Middleware for Aggregator {
         } else {
             None // Hold message until batch is complete
         }
+    }
+
+    fn flush(&self) -> Option<Message> {
+        // Delegate to the inherent flush() method
+        Aggregator::flush(self)
     }
 }
 
@@ -409,5 +432,50 @@ mod tests {
     #[should_panic(expected = "batch_size must be > 0")]
     fn test_aggregator_zero_batch_panics() {
         let _ = Aggregator::new(0);
+    }
+
+    #[tokio::test]
+    async fn test_middleware_chain_flush() {
+        use crate::middleware::MiddlewareChain;
+
+        let aggregator = Aggregator::new(5);
+        let mut chain = MiddlewareChain::new();
+        chain.add(aggregator);
+
+        // Process 3 messages through the chain
+        for i in 0..3 {
+            let msg = Message::new("test", "evt", Bytes::from(format!("msg-{}", i)));
+            let result = chain.process(msg).await;
+            assert!(result.is_none()); // Held by aggregator
+        }
+
+        // MiddlewareChain.flush() returns pending messages from all middleware
+        let flushed = chain.flush();
+        assert_eq!(flushed.len(), 1, "Should flush 1 combined message from aggregator");
+
+        // Verify the flushed message contains all 3 original messages
+        let msg = &flushed[0];
+        assert_eq!(
+            msg.metadata().get("polku.aggregator.count"),
+            Some(&"3".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_aggregator_flush_returns_pending() {
+        let aggregator = Aggregator::new(5);
+
+        // Add 2 messages (less than batch size)
+        for i in 0..2 {
+            let msg = Message::new("test", "evt", Bytes::from(format!("msg-{}", i)));
+            aggregator.process(msg).await;
+        }
+
+        // flush() returns combined message with pending items
+        let flushed = aggregator.flush();
+        assert!(flushed.is_some(), "Should return combined message");
+
+        // After flush, pending should be 0
+        assert_eq!(aggregator.pending(), 0);
     }
 }

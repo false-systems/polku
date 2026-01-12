@@ -56,30 +56,40 @@ impl Emitter for StdoutEmitter {
         use std::io::Write;
 
         let mut stdout = std::io::stdout().lock();
+        let mut emitted = 0u64;
 
         for event in events {
-            if self.pretty {
+            // Write event and propagate I/O errors
+            let result = if self.pretty {
                 writeln!(
                     stdout,
                     "┌─ Event ─────────────────────────────────────────────",
                 )
-                .ok();
-                writeln!(stdout, "│ ID:        {}", event.id).ok();
-                writeln!(stdout, "│ Source:    {}", event.source).ok();
-                writeln!(stdout, "│ Type:      {}", event.event_type).ok();
-                writeln!(stdout, "│ Timestamp: {} ns", event.timestamp_unix_ns).ok();
-                if !event.metadata.is_empty() {
-                    writeln!(stdout, "│ Metadata:  {:?}", event.metadata).ok();
-                }
-                writeln!(stdout, "│ Payload:   {} bytes", event.payload.len()).ok();
-                if !event.route_to.is_empty() {
-                    writeln!(stdout, "│ Route to:  {:?}", event.route_to).ok();
-                }
-                writeln!(
-                    stdout,
-                    "└─────────────────────────────────────────────────────",
-                )
-                .ok();
+                .and_then(|_| writeln!(stdout, "│ ID:        {}", event.id))
+                .and_then(|_| writeln!(stdout, "│ Source:    {}", event.source))
+                .and_then(|_| writeln!(stdout, "│ Type:      {}", event.event_type))
+                .and_then(|_| writeln!(stdout, "│ Timestamp: {} ns", event.timestamp_unix_ns))
+                .and_then(|_| {
+                    if !event.metadata.is_empty() {
+                        writeln!(stdout, "│ Metadata:  {:?}", event.metadata)
+                    } else {
+                        Ok(())
+                    }
+                })
+                .and_then(|_| writeln!(stdout, "│ Payload:   {} bytes", event.payload.len()))
+                .and_then(|_| {
+                    if !event.route_to.is_empty() {
+                        writeln!(stdout, "│ Route to:  {:?}", event.route_to)
+                    } else {
+                        Ok(())
+                    }
+                })
+                .and_then(|_| {
+                    writeln!(
+                        stdout,
+                        "└─────────────────────────────────────────────────────",
+                    )
+                })
             } else {
                 writeln!(
                     stdout,
@@ -89,13 +99,20 @@ impl Emitter for StdoutEmitter {
                     event.id,
                     event.payload.len()
                 )
-                .ok();
+            };
+
+            // Only count successfully written events
+            match result {
+                Ok(()) => emitted += 1,
+                Err(e) => {
+                    // Update metric with what we've written so far, then return error
+                    self.emitted_count.fetch_add(emitted, Ordering::Relaxed);
+                    return Err(PluginError::Send(format!("stdout write failed: {}", e)));
+                }
             }
         }
 
-        self.emitted_count
-            .fetch_add(events.len() as u64, Ordering::Relaxed);
-
+        self.emitted_count.fetch_add(emitted, Ordering::Relaxed);
         Ok(())
     }
 
@@ -139,4 +156,5 @@ mod tests {
         let emitter = StdoutEmitter::new();
         assert!(emitter.health().await);
     }
+
 }

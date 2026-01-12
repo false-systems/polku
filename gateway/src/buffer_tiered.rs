@@ -104,16 +104,17 @@ impl TieredBuffer {
     ///
     /// Returns true if stored (primary or secondary), false if dropped.
     ///
-    /// Note: Clones the message before trying primary because LockFreeBuffer
-    /// consumes the message on push. If we need zero-copy for the success path,
-    /// LockFreeBuffer would need to return Result<(), Message> on failure.
+    /// Uses try_push to avoid cloning on the success path - only clones
+    /// when overflow to secondary is needed.
     pub fn push(&self, msg: Message) -> bool {
-        // Clone needed because we may need msg for compression if primary fails.
-        // This is a tradeoff: we pay one clone per message to enable overflow.
-        if self.primary.push(msg.clone()) {
-            self.metrics.primary_pushed.fetch_add(1, Ordering::Relaxed);
-            return true;
-        }
+        // Try primary first - no clone needed on success path
+        let msg = match self.primary.try_push(msg) {
+            Ok(()) => {
+                self.metrics.primary_pushed.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+            Err(rejected) => rejected, // Primary full, got message back
+        };
 
         // Primary full - compress and overflow to secondary
         match self.compress_message(&msg) {
@@ -557,5 +558,121 @@ mod tests {
         // Both should compress, but level 19 might save more (or same for simple data)
         assert!(buffer_fast.bytes_saved() > 0);
         assert!(buffer_best.bytes_saved() > 0);
+    }
+
+    // ==========================================================================
+    // BUG-EXPOSING TESTS
+    // ==========================================================================
+
+    /// BUG: TieredBuffer clones message on EVERY push, even when primary succeeds.
+    ///
+    /// The code does: `self.primary.push(msg.clone())` which means every single
+    /// message is cloned, regardless of whether it goes to primary or overflows.
+    ///
+    /// EXPECTED: When primary has space, push should consume the message directly
+    /// without cloning. Clone should only happen on overflow to secondary.
+    #[test]
+    fn test_bug_unnecessary_clone_on_every_push() {
+        use crate::buffer_lockfree::LockFreeBuffer;
+        use std::time::Instant;
+
+        let iterations = 1000;
+        let payload_size = 10_000; // 10KB
+
+        // Prepare messages for LockFreeBuffer
+        let lockfree_msgs: Vec<_> = (0..iterations)
+            .map(|i| make_message(&format!("lf-{i}"), payload_size))
+            .collect();
+
+        // Prepare messages for TieredBuffer
+        let tiered_msgs: Vec<_> = (0..iterations)
+            .map(|i| make_message(&format!("tb-{i}"), payload_size))
+            .collect();
+
+        // Time LockFreeBuffer (no clone)
+        let lockfree = LockFreeBuffer::new(iterations + 100);
+        let start = Instant::now();
+        for msg in lockfree_msgs {
+            lockfree.push(msg);
+        }
+        let lockfree_time = start.elapsed();
+
+        // Time TieredBuffer (BUG: clones every message)
+        let tiered = TieredBuffer::new(iterations + 100, 100, 5);
+        let start = Instant::now();
+        for msg in tiered_msgs {
+            tiered.push(msg);
+        }
+        let tiered_time = start.elapsed();
+
+        // EXPECTED: TieredBuffer should be about the same speed as LockFreeBuffer
+        // for primary-only pushes (no overflow, no compression needed).
+        //
+        // BUG: TieredBuffer is slower because it clones every message unnecessarily.
+        // We expect tiered_time to be noticeably higher than lockfree_time.
+        //
+        // Allow 50% overhead tolerance for non-clone factors
+        let max_acceptable_overhead = lockfree_time.as_nanos() as f64 * 1.5;
+
+        assert!(
+            (tiered_time.as_nanos() as f64) <= max_acceptable_overhead,
+            "BUG: TieredBuffer took {:?} vs LockFreeBuffer {:?}. \
+             TieredBuffer should not be >50% slower for primary-only pushes. \
+             The extra time is due to unnecessary cloning on every push.",
+            tiered_time,
+            lockfree_time
+        );
+    }
+
+    /// BUG: Clone overhead compounds with message size.
+    ///
+    /// EXPECTED: Push time should be O(1) regardless of payload size when going to primary.
+    /// BUG: Push time scales with payload size because of the unnecessary clone.
+    #[test]
+    fn test_bug_clone_overhead_scales_with_size() {
+        use std::time::Instant;
+
+        // Test with small payloads
+        let small_msgs: Vec<_> = (0..1000)
+            .map(|i| make_message(&format!("s-{i}"), 100)) // 100 bytes each
+            .collect();
+
+        // Test with large payloads
+        let large_msgs: Vec<_> = (0..1000)
+            .map(|i| make_message(&format!("l-{i}"), 10_000)) // 10KB each
+            .collect();
+
+        let small_buffer = TieredBuffer::new(2000, 100, 5);
+        let start = Instant::now();
+        for msg in small_msgs {
+            small_buffer.push(msg);
+        }
+        let small_time = start.elapsed();
+
+        let large_buffer = TieredBuffer::new(2000, 100, 5);
+        let start = Instant::now();
+        for msg in large_msgs {
+            large_buffer.push(msg);
+        }
+        let large_time = start.elapsed();
+
+        // EXPECTED: Push time should be roughly the same regardless of payload size,
+        // because Bytes uses refcounting and moving a message is O(1).
+        //
+        // BUG: Large payloads take much longer because clone() copies the entire payload.
+        // We expect large_time >> small_time (100x larger payload = much slower)
+        //
+        // Allow 3x difference for legitimate overhead
+        let ratio = large_time.as_nanos() as f64 / small_time.as_nanos() as f64;
+
+        assert!(
+            ratio <= 3.0,
+            "BUG: Large payload push took {:?} vs small payload {:?} (ratio: {:.1}x). \
+             Push time should be O(1) regardless of payload size. \
+             The scaling is due to unnecessary cloning of payload data.",
+            large_time,
+            small_time,
+            ratio
+        );
     }
 }
