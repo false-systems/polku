@@ -49,6 +49,7 @@ impl RingBuffer {
     ///
     /// Returns the number of messages dropped due to capacity limits.
     pub fn push(&self, messages: Vec<Message>) -> usize {
+        let messages_count = messages.len();
         let mut buffer = self.messages.lock();
         let mut dropped = 0;
 
@@ -63,7 +64,7 @@ impl RingBuffer {
 
         self.metrics
             .pushed
-            .fetch_add((buffer.len() + dropped) as u64, Ordering::Relaxed);
+            .fetch_add(messages_count as u64, Ordering::Relaxed);
         self.metrics
             .dropped
             .fetch_add(dropped as u64, Ordering::Relaxed);
@@ -197,5 +198,67 @@ mod tests {
         // Drain all
         buffer.drain(5);
         assert_eq!(buffer.total_drained(), 5);
+    }
+
+    // ==========================================================================
+    // BUG-EXPOSING TESTS
+    // ==========================================================================
+
+    /// BUG: `pushed` metric is wrong - it adds buffer.len() + dropped instead of input count.
+    ///
+    /// This test SHOULD pass but FAILS, exposing the bug.
+    /// The metric adds the current buffer length + dropped count, not the actual
+    /// number of messages pushed in this call.
+    #[test]
+    fn test_bug_pushed_metric_is_wrong() {
+        let buffer = RingBuffer::new(10);
+
+        // Push 3 messages
+        let messages: Vec<Message> = (0..3).map(|i| make_message(&format!("msg-{i}"))).collect();
+        buffer.push(messages);
+
+        // BUG: This should be 3, but the code adds buffer.len() + dropped = 3 + 0 = 3
+        // This case happens to work because buffer was empty...
+        assert_eq!(buffer.total_pushed(), 3);
+
+        // Push 2 more messages
+        let messages: Vec<Message> = (0..2).map(|i| make_message(&format!("msg2-{i}"))).collect();
+        buffer.push(messages);
+
+        // BUG EXPOSED: We pushed 3 + 2 = 5 total messages
+        // But the code calculated: first push = 3, second push = buffer.len() + dropped = 5 + 0 = 5
+        // Total = 3 + 5 = 8 (WRONG!)
+        //
+        // This assertion FAILS, proving the bug exists:
+        assert_eq!(
+            buffer.total_pushed(),
+            5,
+            "BUG: pushed metric should be 5 (3 + 2), but code incorrectly adds buffer.len()"
+        );
+    }
+
+    /// BUG: pushed metric gets worse with multiple push calls
+    ///
+    /// Each push adds buffer.len() instead of messages.len(), so the error compounds.
+    #[test]
+    fn test_bug_pushed_metric_compounds_error() {
+        let buffer = RingBuffer::new(100);
+
+        // Push 1 message at a time, 10 times
+        for i in 0..10 {
+            let messages = vec![make_message(&format!("msg-{i}"))];
+            buffer.push(messages);
+        }
+
+        // We pushed exactly 10 messages (1 at a time, 10 times)
+        // BUG: Code calculated: 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 = 55 (WRONG!)
+        //
+        // This assertion FAILS, proving the bug exists:
+        assert_eq!(
+            buffer.total_pushed(),
+            10,
+            "BUG: pushed 10 messages one at a time, but metric shows {} due to buffer.len() bug",
+            buffer.total_pushed()
+        );
     }
 }
