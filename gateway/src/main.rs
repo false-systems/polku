@@ -131,8 +131,8 @@ async fn main() -> anyhow::Result<()> {
             .emitter(StdoutEmitter::pretty())
     };
 
-    // Build hub and get sender + runner
-    let (hub_sender, hub_runner) = hub.build();
+    // Build hub and get senders + runner
+    let (_raw_sender, hub_sender, hub_runner) = hub.build();
 
     // Spawn Hub runner in background (processes events and calls emit)
     let hub_handle = tokio::spawn(async move {

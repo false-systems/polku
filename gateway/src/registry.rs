@@ -19,6 +19,8 @@ pub struct PluginRegistry {
     ingestors: HashMap<String, Arc<dyn Ingestor>>,
     /// Emitters (fan-out to all)
     emitters: Vec<Arc<dyn Emitter>>,
+    /// Default ingestor for unknown sources (optional)
+    default_ingestor: Option<Arc<dyn Ingestor>>,
 }
 
 impl PluginRegistry {
@@ -27,16 +29,59 @@ impl PluginRegistry {
         Self {
             ingestors: HashMap::new(),
             emitters: Vec::new(),
+            default_ingestor: None,
         }
     }
 
-    /// Register an ingestor for a source
+    /// Add an ingestor that auto-registers for all its declared sources
     ///
-    /// The source name is used to route incoming raw events to the right ingestor.
+    /// This is the preferred way to add ingestors - uses the ingestor's
+    /// `sources()` method to register for all sources it handles.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut registry = PluginRegistry::new();
+    /// registry.add_ingestor(Arc::new(JsonIngestor::new()));
+    /// // Now handles "json", "json-lines", "ndjson" sources automatically
+    /// ```
+    pub fn add_ingestor(&mut self, ingestor: Arc<dyn Ingestor>) {
+        let sources = ingestor.sources();
+        info!(
+            ingestor = ingestor.name(),
+            sources = ?sources,
+            "Auto-registering ingestor for sources"
+        );
+        for source in sources {
+            self.ingestors.insert((*source).to_string(), Arc::clone(&ingestor));
+        }
+    }
+
+    /// Register an ingestor for a specific source (manual override)
+    ///
+    /// Use this for custom source mappings that differ from the ingestor's
+    /// declared sources. Prefer `add_ingestor` for standard use.
     pub fn register_ingestor(&mut self, source: impl Into<String>, ingestor: Arc<dyn Ingestor>) {
         let source = source.into();
         info!(source = %source, ingestor = ingestor.name(), "Registered ingestor");
         self.ingestors.insert(source, ingestor);
+    }
+
+    /// Set a default ingestor for unknown sources
+    ///
+    /// When no ingestor is registered for a source, the default will be used.
+    /// Useful for graceful handling of new/unknown event sources.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut registry = PluginRegistry::new();
+    /// registry.set_default_ingestor(Arc::new(JsonIngestor::new()));
+    /// // Now unknown sources will be parsed as JSON
+    /// ```
+    pub fn set_default_ingestor(&mut self, ingestor: Arc<dyn Ingestor>) {
+        info!(ingestor = ingestor.name(), "Set default ingestor");
+        self.default_ingestor = Some(ingestor);
     }
 
     /// Register an emitter
@@ -65,14 +110,20 @@ impl PluginRegistry {
     /// Ingest raw bytes using the appropriate ingestor
     ///
     /// Looks up the ingestor by source name and calls its ingest method.
-    /// Returns an error if no ingestor is registered for the source.
+    /// Falls back to the default ingestor if one is set.
+    /// Returns an error if no ingestor is registered for the source and no default exists.
     pub fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Event>, PluginError> {
-        let ingestor = self.ingestors.get(ctx.source).ok_or_else(|| {
-            PluginError::Transform(format!(
-                "No ingestor registered for source '{}'",
-                ctx.source
-            ))
-        })?;
+        // Try source-specific ingestor first, then default
+        let ingestor = self
+            .ingestors
+            .get(ctx.source)
+            .or(self.default_ingestor.as_ref())
+            .ok_or_else(|| {
+                PluginError::Transform(format!(
+                    "No ingestor registered for source '{}' and no default ingestor set",
+                    ctx.source
+                ))
+            })?;
 
         debug!(
             source = %ctx.source,
@@ -228,11 +279,16 @@ mod tests {
 
     struct MockIngestor {
         name: &'static str,
+        sources: &'static [&'static str],
     }
 
     impl Ingestor for MockIngestor {
         fn name(&self) -> &'static str {
             self.name
+        }
+
+        fn sources(&self) -> &'static [&'static str] {
+            self.sources
         }
 
         fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Event>, PluginError> {
@@ -275,6 +331,7 @@ mod tests {
         let mut registry = PluginRegistry::new();
         let plugin = Arc::new(MockIngestor {
             name: "test-ingestor",
+            sources: &["test-source"],
         });
 
         registry.register_ingestor("test-source", plugin);
@@ -301,6 +358,7 @@ mod tests {
         let mut registry = PluginRegistry::new();
         let plugin = Arc::new(MockIngestor {
             name: "test-ingestor",
+            sources: &["test-source"],
         });
         registry.register_ingestor("test-source", plugin);
 
@@ -359,5 +417,85 @@ mod tests {
 
         let health = registry.emitter_health().await;
         assert_eq!(health.get("emitter1"), Some(&true));
+    }
+
+    // ==========================================================================
+    // New auto-registration and default ingestor tests
+    // ==========================================================================
+
+    #[test]
+    fn test_add_ingestor_registers_all_sources() {
+        let mut registry = PluginRegistry::new();
+
+        // MockIngestor with multiple sources
+        let plugin = Arc::new(MockIngestor {
+            name: "multi-source",
+            sources: &["source-a", "source-b", "source-c"],
+        });
+
+        registry.add_ingestor(plugin);
+
+        // Should be registered for all sources
+        assert!(registry.has_ingestor("source-a"));
+        assert!(registry.has_ingestor("source-b"));
+        assert!(registry.has_ingestor("source-c"));
+        assert!(!registry.has_ingestor("unknown"));
+
+        // All three sources map to the same ingestor (count is 3 entries)
+        assert_eq!(registry.ingestor_count(), 3);
+    }
+
+    #[test]
+    fn test_default_ingestor_handles_unknown_source() {
+        let mut registry = PluginRegistry::new();
+
+        // Set a default ingestor
+        let default = Arc::new(MockIngestor {
+            name: "default-ingestor",
+            sources: &["default"],
+        });
+        registry.set_default_ingestor(default);
+
+        // Ingest from an unknown source - should use default
+        let ctx = IngestContext {
+            source: "unknown-source",
+            cluster: "test-cluster",
+            format: "json",
+        };
+
+        let events = registry.ingest(&ctx, b"data").unwrap();
+        assert_eq!(events.len(), 1);
+        // The event source comes from context, not ingestor
+        assert_eq!(events[0].source, "unknown-source");
+    }
+
+    #[test]
+    fn test_specific_ingestor_takes_precedence_over_default() {
+        let mut registry = PluginRegistry::new();
+
+        // Register a specific ingestor
+        let specific = Arc::new(MockIngestor {
+            name: "specific-ingestor",
+            sources: &["my-source"],
+        });
+        registry.add_ingestor(specific);
+
+        // Set a default ingestor
+        let default = Arc::new(MockIngestor {
+            name: "default-ingestor",
+            sources: &["default"],
+        });
+        registry.set_default_ingestor(default);
+
+        // Ingest from the specific source - should use specific ingestor
+        let ctx = IngestContext {
+            source: "my-source",
+            cluster: "test-cluster",
+            format: "json",
+        };
+
+        let events = registry.ingest(&ctx, b"data").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, "my-source:4");  // Uses ctx.source in MockIngestor
     }
 }

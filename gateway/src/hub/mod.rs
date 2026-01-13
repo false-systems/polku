@@ -41,8 +41,10 @@ pub use runner::HubRunner;
 use crate::checkpoint::CheckpointStore;
 use crate::emit::Emitter;
 use crate::error::PluginError;
+use crate::ingest::{IngestContext, Ingestor};
 use crate::message::Message;
 use crate::middleware::{Middleware, MiddlewareChain};
+use crate::registry::PluginRegistry;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tokio::sync::mpsc;
@@ -76,6 +78,8 @@ pub struct Hub {
     emitters: Vec<Arc<dyn Emitter>>,
     /// Optional checkpoint store for reliable delivery tracking
     checkpoint_store: Option<Arc<dyn CheckpointStore>>,
+    /// Plugin registry for ingestors
+    registry: PluginRegistry,
 }
 
 impl Hub {
@@ -89,6 +93,7 @@ impl Hub {
             middleware: MiddlewareChain::new(),
             emitters: Vec::new(),
             checkpoint_store: None,
+            registry: PluginRegistry::new(),
         }
     }
 
@@ -159,6 +164,51 @@ impl Hub {
         self
     }
 
+    /// Add an ingestor for transforming raw bytes to Events
+    ///
+    /// Ingestors are automatically registered for all sources they declare
+    /// via their `sources()` method.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use polku_gateway::{Hub, ingest::{JsonIngestor, PassthroughIngestor}};
+    ///
+    /// Hub::new()
+    ///     .ingestor(JsonIngestor::new())          // handles "json", "json-lines", "ndjson"
+    ///     .ingestor(PassthroughIngestor::new())   // handles "passthrough", "polku"
+    ///     .build();
+    /// ```
+    pub fn ingestor<I: Ingestor + 'static>(mut self, ingestor: I) -> Self {
+        self.registry.add_ingestor(Arc::new(ingestor));
+        self
+    }
+
+    /// Add an ingestor (Arc version)
+    pub fn ingestor_arc(mut self, ingestor: Arc<dyn Ingestor>) -> Self {
+        self.registry.add_ingestor(ingestor);
+        self
+    }
+
+    /// Set a default ingestor for unknown sources
+    ///
+    /// When raw data arrives from an unregistered source, the default
+    /// ingestor will be used instead of returning an error.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use polku_gateway::{Hub, ingest::JsonIngestor};
+    ///
+    /// Hub::new()
+    ///     .default_ingestor(JsonIngestor::new())  // Unknown sources parsed as JSON
+    ///     .build();
+    /// ```
+    pub fn default_ingestor<I: Ingestor + 'static>(mut self, ingestor: I) -> Self {
+        self.registry.set_default_ingestor(Arc::new(ingestor));
+        self
+    }
+
     /// Add an emitter destination
     ///
     /// All messages are sent to all emitters (fan-out).
@@ -202,14 +252,44 @@ impl Hub {
         self
     }
 
-    /// Build a message sender for this hub
+    /// Build senders for this hub
     ///
-    /// Returns a sender that can be used to inject messages into the pipeline.
-    /// This is useful for custom inputs or testing.
-    pub fn build(self) -> (MessageSender, HubRunner) {
+    /// Returns:
+    /// - `RawSender` - for injecting raw bytes that need ingestion
+    /// - `MessageSender` - for injecting pre-built Messages
+    /// - `HubRunner` - the pipeline runner
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use polku_gateway::{Hub, ingest::JsonIngestor};
+    ///
+    /// let (raw_sender, msg_sender, runner) = Hub::new()
+    ///     .ingestor(JsonIngestor::new())
+    ///     .emitter(StdoutEmitter::new())
+    ///     .build();
+    ///
+    /// // Spawn the runner
+    /// tokio::spawn(runner.run());
+    ///
+    /// // Send raw JSON - transformed by ingestor
+    /// raw_sender.send("json", "prod", "json", br#"{"source": "svc"}"#).await?;
+    ///
+    /// // Or send a pre-built Message
+    /// msg_sender.send(Message::new("svc", "evt", Bytes::new())).await?;
+    /// ```
+    pub fn build(self) -> (RawSender, MessageSender, HubRunner) {
         let (tx, rx) = mpsc::channel(self.channel_capacity);
 
-        let sender = MessageSender { tx };
+        // Wrap registry in Arc for sharing with RawSender
+        let registry = Arc::new(self.registry);
+
+        let raw_sender = RawSender {
+            tx: tx.clone(),
+            registry,
+        };
+
+        let msg_sender = MessageSender { tx };
 
         // Initialize sequence from checkpoint store to resume after restart.
         // If checkpoints exist, start from max checkpoint + 1 to avoid conflicts.
@@ -231,7 +311,7 @@ impl Hub {
             sequence: Arc::new(AtomicU64::new(initial_sequence)),
         };
 
-        (sender, runner)
+        (raw_sender, msg_sender, runner)
     }
 }
 
@@ -264,6 +344,108 @@ impl MessageSender {
     }
 }
 
+/// Raw bytes sender for injecting data that needs ingestion
+///
+/// This sender accepts raw bytes along with context (source, cluster, format)
+/// and uses the registered ingestors to transform them into Events before
+/// sending them into the pipeline.
+///
+/// # Example
+///
+/// ```ignore
+/// use polku_gateway::{Hub, ingest::JsonIngestor};
+///
+/// let hub = Hub::new()
+///     .ingestor(JsonIngestor::new())
+///     .build();
+///
+/// let (raw_sender, msg_sender, runner) = hub;
+///
+/// // Send raw JSON bytes - will be transformed by JsonIngestor
+/// raw_sender.send("json", "prod", "json", br#"{"id": "evt-1", "source": "svc"}"#).await?;
+/// ```
+#[derive(Clone)]
+pub struct RawSender {
+    tx: mpsc::Sender<Message>,
+    registry: Arc<PluginRegistry>,
+}
+
+impl RawSender {
+    /// Send raw bytes into the pipeline after ingestion
+    ///
+    /// The ingestor for the given source will transform the raw bytes into
+    /// one or more Events, which are then converted to Messages and sent.
+    ///
+    /// # Arguments
+    /// * `source` - Source identifier (used to find the ingestor)
+    /// * `cluster` - Cluster/environment identifier
+    /// * `format` - Format hint (e.g., "protobuf", "json")
+    /// * `data` - Raw bytes to ingest
+    ///
+    /// # Returns
+    /// Number of events successfully sent, or an error
+    pub async fn send(
+        &self,
+        source: &str,
+        cluster: &str,
+        format: &str,
+        data: &[u8],
+    ) -> Result<usize, PluginError> {
+        let ctx = IngestContext {
+            source,
+            cluster,
+            format,
+        };
+
+        // Transform raw bytes to Events using the ingestor
+        let events = self.registry.ingest(&ctx, data)?;
+        let count = events.len();
+
+        // Convert Events to Messages and send
+        for event in events {
+            let msg: Message = event.into();
+            self.tx
+                .send(msg)
+                .await
+                .map_err(|e| PluginError::Send(e.to_string()))?;
+        }
+
+        Ok(count)
+    }
+
+    /// Try to send raw bytes without blocking
+    pub fn try_send(
+        &self,
+        source: &str,
+        cluster: &str,
+        format: &str,
+        data: &[u8],
+    ) -> Result<usize, PluginError> {
+        let ctx = IngestContext {
+            source,
+            cluster,
+            format,
+        };
+
+        let events = self.registry.ingest(&ctx, data)?;
+        let count = events.len();
+
+        for event in events {
+            let msg: Message = event.into();
+            self.tx
+                .try_send(msg)
+                .map_err(|e| PluginError::Send(e.to_string()))?;
+        }
+
+        Ok(count)
+    }
+
+    /// Check if an ingestor is registered for a source
+    pub fn has_ingestor(&self, source: &str) -> bool {
+        self.registry.has_ingestor(source)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -289,7 +471,7 @@ mod tests {
     fn test_hub_build() {
         let hub = Hub::new().emitter(StdoutEmitter::new());
 
-        let (sender, runner) = hub.build();
+        let (_, sender, runner) = hub.build();
 
         // Sender should be cloneable
         let _sender2 = sender.clone();
@@ -301,7 +483,7 @@ mod tests {
     #[tokio::test]
     async fn test_message_sender() {
         let hub = Hub::new();
-        let (sender, _runner) = hub.build();
+        let (_, sender, _runner) = hub.build();
 
         let msg = Message::new("test", "evt", Bytes::from("payload"));
         sender.send(msg).await.expect("should send");
@@ -328,7 +510,7 @@ mod tests {
 
         let hub = Hub::new().middleware(CountingMiddleware);
 
-        let (sender, runner) = hub.build();
+        let (_, sender, runner) = hub.build();
 
         // Send messages in background
         let sender_handle = tokio::spawn(async move {
@@ -380,7 +562,7 @@ mod tests {
             .middleware(Filter::new(|msg: &Message| msg.message_type == "keep"))
             .emitter_arc(counter.clone());
 
-        let (sender, runner) = hub.build();
+        let (_, sender, runner) = hub.build();
 
         // Send messages: 2 "keep", 1 "drop"
         sender
@@ -448,7 +630,7 @@ mod tests {
             .buffer_capacity(1000)
             .emitter_arc(counter.clone());
 
-        let (sender, runner) = hub.build();
+        let (_, sender, runner) = hub.build();
 
         // Send 100 messages as fast as possible (will pile up in buffer)
         for i in 0..100 {
@@ -692,7 +874,7 @@ mod tests {
                 count: AtomicUsize::new(0),
             });
 
-        let (sender, runner) = hub.build();
+        let (_, sender, runner) = hub.build();
 
         // Spawn the runner
         let handle = tokio::spawn(async move { runner.run().await });
@@ -756,7 +938,7 @@ mod tests {
             .checkpoint_store(checkpoint_store.clone())
             .emitter(FailingEmitter);
 
-        let (sender, runner) = hub.build();
+        let (_, sender, runner) = hub.build();
 
         let handle = tokio::spawn(async move { runner.run().await });
 
@@ -830,7 +1012,7 @@ mod tests {
             .flush_interval_ms(1000) // 1 second - way too slow if we wait for timer
             .emitter_arc(emitter.clone());
 
-        let (sender, runner) = hub.build();
+        let (_, sender, runner) = hub.build();
         let start = Instant::now();
 
         // Spawn runner
@@ -878,7 +1060,7 @@ mod tests {
     fn test_buffer_strategy_standard() {
         let hub = Hub::new().buffer_strategy(BufferStrategy::standard(5000));
 
-        let (_sender, runner) = hub.build();
+        let (_, _sender, runner) = hub.build();
 
         // Should have standard strategy
         assert_eq!(runner.buffer.strategy_name(), "standard");
@@ -889,7 +1071,7 @@ mod tests {
     fn test_buffer_strategy_tiered() {
         let hub = Hub::new().buffer_strategy(BufferStrategy::tiered(3000, 2000));
 
-        let (_sender, runner) = hub.build();
+        let (_, _sender, runner) = hub.build();
 
         // Should have tiered strategy
         assert_eq!(runner.buffer.strategy_name(), "tiered");
@@ -939,7 +1121,7 @@ mod tests {
             .flush_interval_ms(1)
             .emitter_arc(emitter.clone());
 
-        let (sender, runner) = hub.build();
+        let (_, sender, runner) = hub.build();
         let runner_handle = tokio::spawn(async move { runner.run().await });
 
         // Send 12 messages - 5 go to primary, 7 overflow to secondary (compressed)
@@ -969,9 +1151,138 @@ mod tests {
         // buffer_capacity() should set a standard strategy
         let hub = Hub::new().buffer_capacity(7500);
 
-        let (_sender, runner) = hub.build();
+        let (_, _sender, runner) = hub.build();
 
         assert_eq!(runner.buffer.strategy_name(), "standard");
         assert_eq!(runner.buffer.capacity(), 7500);
+    }
+
+    // ========================================================================
+    // Ingestor integration tests
+    // ========================================================================
+
+    #[test]
+    fn test_hub_ingestor_builder() {
+        use crate::ingest::{JsonIngestor, PassthroughIngestor};
+
+        let hub = Hub::new()
+            .ingestor(JsonIngestor::new())
+            .ingestor(PassthroughIngestor::new())
+            .emitter(StdoutEmitter::new());
+
+        // Build and verify we get a RawSender
+        let (raw_sender, _, _) = hub.build();
+
+        // RawSender should have the ingestors registered
+        assert!(raw_sender.has_ingestor("json"));
+        assert!(raw_sender.has_ingestor("json-lines"));
+        assert!(raw_sender.has_ingestor("ndjson"));
+        assert!(raw_sender.has_ingestor("passthrough"));
+        assert!(raw_sender.has_ingestor("polku"));
+        assert!(!raw_sender.has_ingestor("unknown"));
+    }
+
+    #[tokio::test]
+    async fn test_raw_sender_json_ingestion() {
+        use crate::ingest::JsonIngestor;
+        use std::sync::atomic::AtomicU64;
+
+        // Emitter that captures events
+        struct CaptureEmitter {
+            count: AtomicU64,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::emit::Emitter for CaptureEmitter {
+            fn name(&self) -> &'static str {
+                "capture"
+            }
+            async fn emit(&self, events: &[Event]) -> Result<(), crate::error::PluginError> {
+                self.count.fetch_add(events.len() as u64, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn health(&self) -> bool {
+                true
+            }
+        }
+
+        let emitter = Arc::new(CaptureEmitter {
+            count: AtomicU64::new(0),
+        });
+
+        let hub = Hub::new()
+            .ingestor(JsonIngestor::new())
+            .batch_size(10)
+            .flush_interval_ms(1)
+            .emitter_arc(emitter.clone());
+
+        let (raw_sender, _, runner) = hub.build();
+
+        // Spawn runner
+        let handle = tokio::spawn(async move { runner.run().await });
+
+        // Send raw JSON via RawSender
+        let json = r#"{"id": "evt-1", "source": "test-svc", "event_type": "user.created"}"#;
+        let count = raw_sender
+            .send("json", "prod", "json", json.as_bytes())
+            .await
+            .expect("send should work");
+
+        assert_eq!(count, 1, "Should ingest 1 event from JSON");
+
+        // Send JSON array (multiple events)
+        let json_array = r#"[
+            {"id": "evt-2", "source": "svc", "event_type": "a"},
+            {"id": "evt-3", "source": "svc", "event_type": "b"}
+        ]"#;
+        let count = raw_sender
+            .send("json", "prod", "json", json_array.as_bytes())
+            .await
+            .expect("send should work");
+
+        assert_eq!(count, 2, "Should ingest 2 events from JSON array");
+
+        // Wait for flush
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Shutdown
+        drop(raw_sender);
+        let _ = handle.await;
+
+        // All 3 events should have been emitted
+        assert_eq!(emitter.count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_raw_sender_unknown_source_error() {
+        // Hub without any ingestors
+        let hub = Hub::new().emitter(StdoutEmitter::new());
+
+        let (raw_sender, _, _runner) = hub.build();
+
+        // Sending to unknown source should fail
+        let result = raw_sender.send("unknown", "prod", "json", b"data").await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_raw_sender_with_default_ingestor() {
+        use crate::ingest::JsonIngestor;
+
+        let hub = Hub::new()
+            .default_ingestor(JsonIngestor::new())
+            .emitter(StdoutEmitter::new());
+
+        let (raw_sender, _, _runner) = hub.build();
+
+        // Unknown source should use default ingestor
+        let json = r#"{"id": "evt-1", "source": "svc", "event_type": "test"}"#;
+        let result = raw_sender
+            .send("any-source", "prod", "json", json.as_bytes())
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 1);
     }
 }
