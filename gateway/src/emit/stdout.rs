@@ -5,8 +5,8 @@
 
 use crate::emit::Emitter;
 use crate::error::PluginError;
-use polku_core::Event;
 use async_trait::async_trait;
+use polku_core::Event;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Stdout emitter - prints events for debugging
@@ -156,5 +156,4 @@ mod tests {
         let emitter = StdoutEmitter::new();
         assert!(emitter.health().await);
     }
-
 }

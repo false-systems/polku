@@ -4,8 +4,8 @@
 
 use crate::emit::Emitter;
 use crate::error::PluginError;
-use polku_core::Event;
 use async_trait::async_trait;
+use polku_core::Event;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

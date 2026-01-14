@@ -19,13 +19,13 @@
 //!
 //! External ingestors communicate via gRPC using the IngestorPlugin service.
 
-mod passthrough;
-mod json;
 mod external;
+mod json;
+mod passthrough;
 
-pub use passthrough::PassthroughIngestor;
-pub use json::JsonIngestor;
 pub use external::ExternalIngestor;
+pub use json::JsonIngestor;
+pub use passthrough::PassthroughIngestor;
 
 use crate::emit::Event;
 use crate::error::PluginError;

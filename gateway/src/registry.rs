@@ -53,7 +53,8 @@ impl PluginRegistry {
             "Auto-registering ingestor for sources"
         );
         for source in sources {
-            self.ingestors.insert((*source).to_string(), Arc::clone(&ingestor));
+            self.ingestors
+                .insert((*source).to_string(), Arc::clone(&ingestor));
         }
     }
 
@@ -496,6 +497,6 @@ mod tests {
 
         let events = registry.ingest(&ctx, b"data").unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].id, "my-source:4");  // Uses ctx.source in MockIngestor
+        assert_eq!(events[0].id, "my-source:4"); // Uses ctx.source in MockIngestor
     }
 }

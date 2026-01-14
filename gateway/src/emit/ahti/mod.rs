@@ -24,9 +24,9 @@ mod ahti_proto;
 
 use super::{Emitter, Event, PluginError};
 use ahti_proto::ahti::v1::{
-    self as ahti_types, ahti_service_client::AhtiServiceClient, AhtiEvent, AhtiEventBatch,
-    AhtiHealthRequest, Entity, EntityReference, EntityType, EventType, Relationship,
-    RelationshipState, RelationshipType,
+    self as ahti_types, AhtiEvent, AhtiEventBatch, AhtiHealthRequest, Entity, EntityReference,
+    EntityType, EventType, Relationship, RelationshipState, RelationshipType,
+    ahti_service_client::AhtiServiceClient,
 };
 // Import polku_core types for the Event.data oneof
 use polku_core::proto::event::Data as PolkuEventData;
@@ -67,7 +67,8 @@ impl EndpointState {
     fn record_success(&self, latency_us: u64) {
         self.consecutive_failures.store(0, Ordering::SeqCst);
         self.unhealthy_until.store(0, Ordering::SeqCst);
-        self.total_latency_us.fetch_add(latency_us, Ordering::Relaxed);
+        self.total_latency_us
+            .fetch_add(latency_us, Ordering::Relaxed);
         self.emit_count.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -260,7 +261,10 @@ impl AhtiEmitter {
                         } else {
                             warn!(endpoint = %endpoint, error = %ack.error, "AHTI rejected batch");
                             state.record_failure();
-                            Err(PluginError::Send(format!("AHTI rejected batch: {}", ack.error)))
+                            Err(PluginError::Send(format!(
+                                "AHTI rejected batch: {}",
+                                ack.error
+                            )))
                         }
                     }
                     Ok(None) => {
@@ -272,14 +276,20 @@ impl AhtiEmitter {
                     Err(e) => {
                         error!(endpoint = %endpoint, error = %e, "Stream error from AHTI");
                         state.record_failure();
-                        Err(PluginError::Send(format!("Stream error from {}: {}", endpoint, e)))
+                        Err(PluginError::Send(format!(
+                            "Stream error from {}: {}",
+                            endpoint, e
+                        )))
                     }
                 }
             }
             Err(e) => {
                 error!(endpoint = %endpoint, error = %e, "Failed to open stream to AHTI");
                 state.record_failure();
-                Err(PluginError::Send(format!("Failed to send to {}: {}", endpoint, e)))
+                Err(PluginError::Send(format!(
+                    "Failed to send to {}: {}",
+                    endpoint, e
+                )))
             }
         }
     }
@@ -325,7 +335,11 @@ impl AhtiEmitter {
             source: event.source.clone(),
             trace_id: event.metadata.get("trace_id").cloned().unwrap_or_default(),
             span_id: event.metadata.get("span_id").cloned().unwrap_or_default(),
-            parent_span_id: event.metadata.get("parent_span_id").cloned().unwrap_or_default(),
+            parent_span_id: event
+                .metadata
+                .get("parent_span_id")
+                .cloned()
+                .unwrap_or_default(),
             duration_us,
             entities,
             relationships,
@@ -375,7 +389,10 @@ impl AhtiEmitter {
 
         // Pod -> Node relationship (ScheduledOn)
         if let (Some(_pod_name), Some(node_name)) = (
-            event.metadata.get("pod_name").or_else(|| event.metadata.get("name")),
+            event
+                .metadata
+                .get("pod_name")
+                .or_else(|| event.metadata.get("name")),
             event.metadata.get("node_name"),
         ) {
             if event.metadata.get("resource").map(|s| s.as_str()) == Some("pod") {
@@ -590,7 +607,9 @@ impl AhtiEmitter {
         match parts.as_slice() {
             ["k8s", resource, action] => {
                 let ahti_type = match *resource {
-                    "deployment" | "replicaset" | "statefulset" | "daemonset" => EventType::Deployment,
+                    "deployment" | "replicaset" | "statefulset" | "daemonset" => {
+                        EventType::Deployment
+                    }
                     "pod" => EventType::Pod,
                     "service" | "endpoint" => EventType::Service,
                     "configmap" | "secret" => EventType::Config,
@@ -629,7 +648,11 @@ impl AhtiEmitter {
         let mut entities = Vec::new();
 
         if let Some(name) = event.metadata.get("name") {
-            let resource = event.metadata.get("resource").map(|s| s.as_str()).unwrap_or("");
+            let resource = event
+                .metadata
+                .get("resource")
+                .map(|s| s.as_str())
+                .unwrap_or("");
             let entity_type = match resource {
                 "deployment" => EntityType::Deployment,
                 "pod" => EntityType::Pod,
@@ -647,7 +670,11 @@ impl AhtiEmitter {
                 r#type: entity_type as i32,
                 id: event.metadata.get("uid").cloned().unwrap_or_default(),
                 name: name.clone(),
-                cluster_id: event.metadata.get("cluster_id").cloned().unwrap_or_default(),
+                cluster_id: event
+                    .metadata
+                    .get("cluster_id")
+                    .cloned()
+                    .unwrap_or_default(),
                 namespace: event.metadata.get("namespace").cloned().unwrap_or_default(),
                 labels: Default::default(),
                 attributes: Default::default(),
@@ -706,7 +733,8 @@ impl Emitter for AhtiEmitter {
 
         error!(event_count = events.len(), "All AHTI endpoints failed");
 
-        Err(last_error.unwrap_or_else(|| PluginError::Send("No AHTI endpoints available".to_string())))
+        Err(last_error
+            .unwrap_or_else(|| PluginError::Send("No AHTI endpoints available".to_string())))
     }
 
     async fn health(&self) -> bool {
@@ -1001,7 +1029,9 @@ mod tests {
     #[test]
     fn test_extract_duration_from_metadata_us() {
         let mut event = make_event();
-        event.metadata.insert("duration_us".to_string(), "5000".to_string());
+        event
+            .metadata
+            .insert("duration_us".to_string(), "5000".to_string());
 
         let duration = AhtiEmitter::extract_duration_us(&event);
         assert_eq!(duration, 5000);
@@ -1010,7 +1040,9 @@ mod tests {
     #[test]
     fn test_extract_duration_from_metadata_ms() {
         let mut event = make_event();
-        event.metadata.insert("duration_ms".to_string(), "5".to_string());
+        event
+            .metadata
+            .insert("duration_ms".to_string(), "5".to_string());
 
         let duration = AhtiEmitter::extract_duration_us(&event);
         assert_eq!(duration, 5000); // 5ms = 5000us
@@ -1032,7 +1064,9 @@ mod tests {
     fn test_extract_duration_us_precedence() {
         // duration_us in metadata takes precedence over network latency
         let mut event = make_event();
-        event.metadata.insert("duration_us".to_string(), "1234".to_string());
+        event
+            .metadata
+            .insert("duration_us".to_string(), "1234".to_string());
         event.data = Some(PolkuEventData::Network(PolkuNetworkEventData {
             latency_ms: 99.0,
             ..Default::default()
@@ -1139,7 +1173,10 @@ mod tests {
         let relationships = AhtiEmitter::extract_relationships(&event);
 
         assert_eq!(relationships.len(), 1);
-        assert_eq!(relationships[0].r#type, RelationshipType::ScheduledOn as i32);
+        assert_eq!(
+            relationships[0].r#type,
+            RelationshipType::ScheduledOn as i32
+        );
 
         let source = relationships[0].source.as_ref().unwrap();
         assert_eq!(source.r#type, EntityType::Pod as i32);
@@ -1148,7 +1185,10 @@ mod tests {
         let target = relationships[0].target.as_ref().unwrap();
         assert_eq!(target.r#type, EntityType::Node as i32);
 
-        assert_eq!(relationships[0].labels.get("target_name"), Some(&"worker-1".to_string()));
+        assert_eq!(
+            relationships[0].labels.get("target_name"),
+            Some(&"worker-1".to_string())
+        );
     }
 
     #[test]
@@ -1632,7 +1672,10 @@ mod tests {
 
         // event_to_ahti_event correctly falls back to "cluster" key
         let ahti_event = AhtiEmitter::event_to_ahti_event(&event);
-        assert_eq!(ahti_event.cluster, "prod-cluster", "event_to_ahti_event uses fallback");
+        assert_eq!(
+            ahti_event.cluster, "prod-cluster",
+            "event_to_ahti_event uses fallback"
+        );
 
         // EXPECTED: Entity should also have cluster_id = "prod-cluster"
         // BUG: extract_entities does NOT use the fallback
@@ -1784,7 +1827,10 @@ mod tests {
 
         // But entities don't - inconsistent!
         let entities = AhtiEmitter::extract_entities(&event);
-        assert_eq!(entities[0].cluster_id, "", "Entities do NOT use cluster fallback");
+        assert_eq!(
+            entities[0].cluster_id, "",
+            "Entities do NOT use cluster fallback"
+        );
     }
 
     // ==========================================================================
@@ -1831,7 +1877,10 @@ mod tests {
         let result = AhtiEmitter::with_endpoints_lazy(vec!["not-a-valid-url".to_string()]).await;
 
         // This SUCCEEDS because lazy mode never tries to connect!
-        assert!(result.is_ok(), "BUG: Lazy mode accepts invalid URLs without validation");
+        assert!(
+            result.is_ok(),
+            "BUG: Lazy mode accepts invalid URLs without validation"
+        );
         // The error only surfaces when emit() is called
     }
 
@@ -1839,8 +1888,12 @@ mod tests {
     #[tokio::test]
     async fn test_ahti_emitter_lazy_unreachable_succeeds_at_init() {
         // Valid URL format but nothing listening - lazy should succeed
-        let result = AhtiEmitter::with_endpoints_lazy(vec!["http://127.0.0.1:59999".to_string()]).await;
-        assert!(result.is_ok(), "Lazy init should succeed even if endpoint unreachable");
+        let result =
+            AhtiEmitter::with_endpoints_lazy(vec!["http://127.0.0.1:59999".to_string()]).await;
+        assert!(
+            result.is_ok(),
+            "Lazy init should succeed even if endpoint unreachable"
+        );
     }
 
     /// When AHTI is unreachable at init time (eager connect), it fails
@@ -1877,7 +1930,10 @@ mod tests {
     #[test]
     fn test_unhealthy_duration_is_30_seconds() {
         // Just documenting the constant value for awareness
-        assert_eq!(UNHEALTHY_DURATION_MS, 30_000, "Unhealthy endpoints cool down for 30s");
+        assert_eq!(
+            UNHEALTHY_DURATION_MS, 30_000,
+            "Unhealthy endpoints cool down for 30s"
+        );
     }
 
     /// BUG: A single success resets ALL failure state, even if transient
@@ -1896,7 +1952,10 @@ mod tests {
         // Now we need 3 more failures to become unhealthy
         state.record_failure();
         state.record_failure();
-        assert!(state.is_healthy(), "Still healthy - counter reset by success");
+        assert!(
+            state.is_healthy(),
+            "Still healthy - counter reset by success"
+        );
 
         state.record_failure();
         assert!(!state.is_healthy(), "Now unhealthy after 3 NEW failures");
@@ -2011,7 +2070,7 @@ mod tests {
         let fast = EndpointState::new();
 
         slow.record_success(10_000); // 10ms
-        fast.record_success(1_000);  // 1ms
+        fast.record_success(1_000); // 1ms
 
         assert!(fast.avg_latency_us() < slow.avg_latency_us());
     }

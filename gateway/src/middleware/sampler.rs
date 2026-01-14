@@ -276,5 +276,4 @@ mod tests {
         }
         assert_eq!(sampler.dropped_count(), 5);
     }
-
 }

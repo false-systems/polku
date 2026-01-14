@@ -145,11 +145,7 @@ async fn main() -> anyhow::Result<()> {
     let registry = Arc::new(PluginRegistry::new());
 
     // Create gRPC service with Hub sender
-    let service = GatewayService::with_hub(
-        Arc::clone(&buffer),
-        Arc::clone(&registry),
-        hub_sender,
-    );
+    let service = GatewayService::with_hub(Arc::clone(&buffer), Arc::clone(&registry), hub_sender);
 
     // Start gRPC server
     let addr = config.grpc_addr;

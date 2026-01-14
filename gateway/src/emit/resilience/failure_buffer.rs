@@ -18,9 +18,9 @@
 
 use crate::emit::Emitter;
 use crate::error::PluginError;
-use polku_core::Event;
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use polku_core::Event;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

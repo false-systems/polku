@@ -451,7 +451,11 @@ mod tests {
 
         // MiddlewareChain.flush() returns pending messages from all middleware
         let flushed = chain.flush();
-        assert_eq!(flushed.len(), 1, "Should flush 1 combined message from aggregator");
+        assert_eq!(
+            flushed.len(),
+            1,
+            "Should flush 1 combined message from aggregator"
+        );
 
         // Verify the flushed message contains all 3 original messages
         let msg = &flushed[0];

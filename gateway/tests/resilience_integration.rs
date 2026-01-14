@@ -696,8 +696,8 @@ fn make_test_event(id: &str) -> polku_gateway::Event {
 
 /// Create a test event with typed network data
 fn make_typed_network_event(id: &str) -> polku_gateway::Event {
-    use polku_core::proto::event::Data as EventData;
     use polku_core::NetworkEventData;
+    use polku_core::proto::event::Data as EventData;
 
     polku_gateway::Event {
         id: id.to_string(),

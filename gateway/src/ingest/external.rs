@@ -6,6 +6,10 @@
 use super::{IngestContext, Ingestor};
 use crate::emit::Event;
 use crate::error::PluginError;
+use crate::proto::IngestRequest;
+use crate::proto::ingestor_plugin_client::IngestorPluginClient;
+use parking_lot::Mutex;
+use tonic::transport::Channel;
 
 /// External ingestor that delegates to a gRPC plugin
 ///
@@ -37,6 +41,8 @@ pub struct ExternalIngestor {
     sources_static: &'static [&'static str],
     /// Leaked static string for name
     name_static: &'static str,
+    /// Cached gRPC client (lazy initialized)
+    client: Mutex<Option<IngestorPluginClient<Channel>>>,
 }
 
 impl ExternalIngestor {
@@ -63,12 +69,77 @@ impl ExternalIngestor {
             address,
             sources_static,
             name_static,
+            client: Mutex::new(None),
         }
     }
 
     /// Get the plugin address
     pub fn address(&self) -> &str {
         &self.address
+    }
+
+    /// Get the source identifier
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// Get or create the gRPC client (async)
+    async fn get_client(&self) -> Result<IngestorPluginClient<Channel>, PluginError> {
+        // Check if we already have a client
+        {
+            let guard = self.client.lock();
+            if let Some(client) = guard.as_ref() {
+                return Ok(client.clone());
+            }
+        }
+
+        // Create new connection
+        let channel = Channel::from_shared(self.address.clone())
+            .map_err(|e| {
+                PluginError::Connection(format!("Invalid address '{}': {}", self.address, e))
+            })?
+            .connect()
+            .await
+            .map_err(|e| {
+                PluginError::Connection(format!("Failed to connect to '{}': {}", self.address, e))
+            })?;
+
+        let client = IngestorPluginClient::new(channel);
+
+        // Cache the client
+        {
+            let mut guard = self.client.lock();
+            *guard = Some(client.clone());
+        }
+
+        Ok(client)
+    }
+
+    /// Async implementation of ingest
+    async fn ingest_async(
+        &self,
+        ctx: &IngestContext<'_>,
+        data: &[u8],
+    ) -> Result<Vec<Event>, PluginError> {
+        let mut client = self.get_client().await?;
+
+        let request = IngestRequest {
+            source: ctx.source.to_string(),
+            cluster: ctx.cluster.to_string(),
+            format: ctx.format.to_string(),
+            data: data.to_vec(),
+        };
+
+        let response = client.ingest(request).await.map_err(|status| {
+            // Clear cached client on error (it might be stale)
+            let mut guard = self.client.lock();
+            *guard = None;
+
+            // Map gRPC status to PluginError
+            PluginError::Transform(format!("Plugin error: {}", status.message()))
+        })?;
+
+        Ok(response.into_inner().events)
     }
 }
 
@@ -82,20 +153,302 @@ impl Ingestor for ExternalIngestor {
     }
 
     fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Event>, PluginError> {
-        // TODO: Implement actual gRPC call to IngestorPlugin service
+        // Bridge sync trait to async gRPC call
         //
-        // The implementation would:
-        // 1. Create/reuse a gRPC client connection to self.address
-        // 2. Call IngestorPlugin.Ingest(IngestRequest { source, cluster, format, data })
-        // 3. Return the Events from IngestResponse
-        //
-        // For now, return an error indicating the plugin isn't connected
-        Err(PluginError::Connection(format!(
-            "External ingestor '{}' not connected to plugin at {} (source: {}, {} bytes)",
-            self.source,
-            self.address,
-            ctx.source,
-            data.len()
-        )))
+        // block_in_place moves the current worker thread to blocking mode,
+        // allowing us to call block_on without blocking other async tasks.
+        // This is acceptable because:
+        // 1. Plugin calls already add latency (~100-500μs)
+        // 2. Ingestors are typically called from async gRPC handlers
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.ingest_async(ctx, data))
+        })
+    }
+}
+
+// =============================================================================
+// TESTS - TDD RED PHASE
+// =============================================================================
+// These tests define the expected behavior of ExternalIngestor.
+// They will FAIL until we implement the gRPC client.
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::proto::ingestor_plugin_server::{IngestorPlugin, IngestorPluginServer};
+    use crate::proto::{IngestRequest, IngestResponse, PluginHealthResponse, PluginInfo};
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use tokio::sync::oneshot;
+    use tonic::{Request, Response, Status};
+
+    // =========================================================================
+    // Mock Plugin Server
+    // =========================================================================
+
+    /// Mock plugin that returns predictable events
+    struct MockPlugin {
+        /// Number of events to return per ingest call
+        events_per_call: u32,
+        /// Counter for generating unique event IDs
+        call_count: AtomicU32,
+        /// If set, return this error instead of events
+        error_message: Option<String>,
+    }
+
+    impl MockPlugin {
+        fn new(events_per_call: u32) -> Self {
+            Self {
+                events_per_call,
+                call_count: AtomicU32::new(0),
+                error_message: None,
+            }
+        }
+
+        fn with_error(message: impl Into<String>) -> Self {
+            Self {
+                events_per_call: 0,
+                call_count: AtomicU32::new(0),
+                error_message: Some(message.into()),
+            }
+        }
+    }
+
+    #[tonic::async_trait]
+    impl IngestorPlugin for MockPlugin {
+        async fn info(&self, _: Request<()>) -> Result<Response<PluginInfo>, Status> {
+            Ok(Response::new(PluginInfo {
+                name: "mock-plugin".to_string(),
+                version: "1.0.0".to_string(),
+                r#type: 1, // INGESTOR
+                description: "Test plugin".to_string(),
+                sources: vec!["mock-source".to_string()],
+                emitter_name: String::new(),
+                capabilities: vec![],
+            }))
+        }
+
+        async fn health(&self, _: Request<()>) -> Result<Response<PluginHealthResponse>, Status> {
+            Ok(Response::new(PluginHealthResponse {
+                healthy: true,
+                message: "OK".to_string(),
+                components: Default::default(),
+            }))
+        }
+
+        async fn ingest(
+            &self,
+            request: Request<IngestRequest>,
+        ) -> Result<Response<IngestResponse>, Status> {
+            // Check if we should return an error
+            if let Some(ref msg) = self.error_message {
+                return Err(Status::internal(msg.clone()));
+            }
+
+            let req = request.into_inner();
+            let call_num = self.call_count.fetch_add(1, Ordering::SeqCst);
+
+            // Generate events based on input
+            let events: Vec<Event> = (0..self.events_per_call)
+                .map(|i| Event {
+                    id: format!("mock-{}-{}", call_num, i),
+                    timestamp_unix_ns: 1234567890,
+                    source: req.source.clone(),
+                    event_type: "mock.event".to_string(),
+                    metadata: Default::default(),
+                    payload: req.data.clone(),
+                    route_to: vec![],
+                    severity: 0,
+                    outcome: 0,
+                    data: None,
+                })
+                .collect();
+
+            Ok(Response::new(IngestResponse {
+                events,
+                errors: vec![],
+            }))
+        }
+    }
+
+    /// Start a mock plugin server and return its address
+    async fn start_mock_server(plugin: MockPlugin) -> (SocketAddr, oneshot::Sender<()>) {
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        // Find an available port
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(IngestorPluginServer::new(plugin))
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async {
+                        shutdown_rx.await.ok();
+                    },
+                )
+                .await
+                .unwrap();
+        });
+
+        // Give server time to start
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        (addr, shutdown_tx)
+    }
+
+    // =========================================================================
+    // Unit Tests (no network)
+    // =========================================================================
+
+    #[test]
+    fn test_external_ingestor_name_format() {
+        let ingestor = ExternalIngestor::new("my-source", "localhost:9001");
+        assert_eq!(ingestor.name(), "external:my-source");
+    }
+
+    #[test]
+    fn test_external_ingestor_sources() {
+        let ingestor = ExternalIngestor::new("legacy-system", "localhost:9001");
+        let sources = ingestor.sources();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0], "legacy-system");
+    }
+
+    #[test]
+    fn test_external_ingestor_address() {
+        let ingestor = ExternalIngestor::new("src", "plugin.internal:9002");
+        assert_eq!(ingestor.address(), "plugin.internal:9002");
+    }
+
+    // =========================================================================
+    // Integration Tests (with mock server)
+    // =========================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_successful_ingest_returns_events() {
+        // Start mock server that returns 2 events per call
+        let (addr, _shutdown) = start_mock_server(MockPlugin::new(2)).await;
+
+        let ingestor = ExternalIngestor::new("test-source", format!("http://{}", addr));
+        let ctx = IngestContext {
+            source: "test-source",
+            cluster: "test-cluster",
+            format: "json",
+        };
+
+        let result = ingestor.ingest(&ctx, b"test payload");
+
+        // This will FAIL until we implement the gRPC client
+        assert!(result.is_ok(), "Expected Ok, got: {:?}", result);
+        let events = result.unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].source, "test-source");
+        assert!(events[0].id.starts_with("mock-"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_ingest_preserves_payload_data() {
+        let (addr, _shutdown) = start_mock_server(MockPlugin::new(1)).await;
+
+        let ingestor = ExternalIngestor::new("test-source", format!("http://{}", addr));
+        let ctx = IngestContext {
+            source: "test-source",
+            cluster: "prod",
+            format: "binary",
+        };
+
+        let payload = b"important binary data";
+        let result = ingestor.ingest(&ctx, payload);
+
+        assert!(result.is_ok());
+        let events = result.unwrap();
+        assert_eq!(events[0].payload, payload.to_vec());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_failure_returns_error() {
+        // No server running at this address
+        let ingestor = ExternalIngestor::new("test-source", "http://127.0.0.1:59999");
+        let ctx = IngestContext {
+            source: "test-source",
+            cluster: "test",
+            format: "json",
+        };
+
+        let result = ingestor.ingest(&ctx, b"data");
+
+        assert!(result.is_err());
+        match result {
+            Err(PluginError::Connection(msg)) => {
+                assert!(msg.contains("127.0.0.1:59999") || msg.contains("connection"));
+            }
+            Err(e) => panic!("Expected Connection error, got: {:?}", e),
+            Ok(_) => panic!("Expected error"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_plugin_error_propagates() {
+        // Start mock server that returns errors
+        let (addr, _shutdown) =
+            start_mock_server(MockPlugin::with_error("Parse failed: invalid format")).await;
+
+        let ingestor = ExternalIngestor::new("test-source", format!("http://{}", addr));
+        let ctx = IngestContext {
+            source: "test-source",
+            cluster: "test",
+            format: "json",
+        };
+
+        let result = ingestor.ingest(&ctx, b"bad data");
+
+        assert!(result.is_err());
+        // Plugin errors should be returned as Transform errors
+        match result {
+            Err(PluginError::Transform(msg)) => {
+                assert!(msg.contains("Parse failed") || msg.contains("invalid"));
+            }
+            Err(e) => panic!("Expected Transform error, got: {:?}", e),
+            Ok(_) => panic!("Expected error"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_multiple_calls_reuse_connection() {
+        let (addr, _shutdown) = start_mock_server(MockPlugin::new(1)).await;
+
+        let ingestor = ExternalIngestor::new("test-source", format!("http://{}", addr));
+        let ctx = IngestContext {
+            source: "test-source",
+            cluster: "test",
+            format: "json",
+        };
+
+        // Multiple calls should succeed (connection reused)
+        for i in 0..3 {
+            let result = ingestor.ingest(&ctx, format!("payload-{}", i).as_bytes());
+            assert!(result.is_ok(), "Call {} failed: {:?}", i, result);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_empty_response_returns_empty_vec() {
+        // Plugin that returns 0 events
+        let (addr, _shutdown) = start_mock_server(MockPlugin::new(0)).await;
+
+        let ingestor = ExternalIngestor::new("test-source", format!("http://{}", addr));
+        let ctx = IngestContext {
+            source: "test-source",
+            cluster: "test",
+            format: "json",
+        };
+
+        let result = ingestor.ingest(&ctx, b"data");
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 0);
     }
 }

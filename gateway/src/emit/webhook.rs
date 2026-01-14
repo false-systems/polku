@@ -12,8 +12,8 @@
 
 use crate::emit::Emitter;
 use crate::error::PluginError;
-use polku_core::Event;
 use async_trait::async_trait;
+use polku_core::Event;
 use reqwest::Client;
 use serde::Serialize;
 use std::collections::HashMap;

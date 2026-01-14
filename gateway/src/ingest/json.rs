@@ -93,11 +93,9 @@ impl JsonEvent {
     fn into_event(self, ctx: &IngestContext) -> Event {
         let id = self.id.unwrap_or_else(|| ulid::Ulid::new().to_string());
 
-        let timestamp = self.timestamp_unix_ns.unwrap_or_else(|| {
-            chrono::Utc::now()
-                .timestamp_nanos_opt()
-                .unwrap_or(0)
-        });
+        let timestamp = self
+            .timestamp_unix_ns
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
 
         // Use source from JSON or fall back to context
         let source = self.source.unwrap_or_else(|| ctx.source.to_string());

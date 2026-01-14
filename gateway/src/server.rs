@@ -7,10 +7,10 @@
 //! - Transform: Clients send raw bytes, InputPlugins transform them to Events
 
 use crate::buffer::RingBuffer;
+use crate::emit::Event;
 use crate::hub::MessageSender;
 use crate::ingest::IngestContext;
 use crate::message::Message;
-use crate::emit::Event;
 use crate::proto::{
     Ack, ComponentHealth, HealthRequest, HealthResponse, IngestBatch, IngestEvent,
     gateway_server::{Gateway, GatewayServer},
@@ -228,7 +228,9 @@ impl Gateway for GatewayService {
         // Send to Hub if configured, otherwise buffer
         if let Some(ref sender) = self.hub_sender {
             if sender.try_send(message).is_err() {
-                return Err(Status::resource_exhausted("Hub channel full, event dropped"));
+                return Err(Status::resource_exhausted(
+                    "Hub channel full, event dropped",
+                ));
             }
         } else {
             let dropped = self.buffer.push(vec![message]);

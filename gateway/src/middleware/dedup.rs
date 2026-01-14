@@ -346,5 +346,4 @@ mod tests {
         assert!(dedup.process(msg3).await.is_none());
         assert_eq!(dedup.dropped_count(), 2);
     }
-
 }
