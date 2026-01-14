@@ -22,6 +22,7 @@ pub mod buffer_lockfree;
 pub mod buffer_tiered;
 pub mod checkpoint;
 pub mod config;
+pub mod discovery;
 pub mod emit;
 pub mod error;
 pub mod hub;
@@ -55,7 +56,7 @@ pub use emit::resilience::{
     BackoffConfig, CircuitBreakerConfig, CircuitBreakerEmitter, CircuitState, FailedEvent,
     FailureBuffer, FailureCaptureConfig, FailureCaptureEmitter, ResilientEmitter, RetryEmitter,
 };
-pub use emit::{Emitter, GrpcEmitter, StdoutEmitter, WebhookEmitter};
+pub use emit::{Emitter, ExternalEmitter, GrpcEmitter, StdoutEmitter, WebhookEmitter};
 pub use error::{PluginError, PolkuError, Result};
 pub use hub::{BufferStrategy, Hub, HubBuffer, HubRunner, MessageSender, RawSender};
 pub use ingest::{ExternalIngestor, IngestContext, Ingestor, JsonIngestor, PassthroughIngestor};
@@ -68,3 +69,4 @@ pub use middleware::{
     ValidationResult, Validator,
 };
 pub use registry::PluginRegistry;
+pub use discovery::DiscoveryServer;

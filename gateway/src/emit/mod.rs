@@ -5,6 +5,7 @@
 
 #[cfg(feature = "ahti")]
 pub mod ahti;
+pub mod external;
 pub mod grpc;
 pub mod resilience;
 pub mod stdout;
@@ -18,6 +19,7 @@ pub use polku_core::PluginError;
 
 #[cfg(feature = "ahti")]
 pub use ahti::AhtiEmitter;
+pub use external::ExternalEmitter;
 pub use grpc::GrpcEmitter;
 pub use stdout::StdoutEmitter;
 pub use webhook::WebhookEmitter;
