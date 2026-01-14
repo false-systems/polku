@@ -1,298 +1,242 @@
 # POLKU
 
-**Programmatic Protocol Hub**
+**The path your events take.**
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 
-Event routing as code. No YAML. No config files. Just Rust.
+```
+Events in  ───►  POLKU  ───►  Events out
+              (transform)
+              (filter)
+              (route)
+```
 
 ---
 
 ## What is POLKU?
 
-POLKU is an **event gateway library**. It receives events from multiple sources, transforms them, and routes them to multiple destinations.
+POLKU is an **event gateway**. Events come in, get transformed, and go out to multiple destinations.
 
 ```
-                            ┌─────────────────────────────────────────────────────────────┐
-                            │                         POLKU                                │
-                            │                                                              │
-   ┌─────────┐              │   ┌───────────┐    ┌────────────┐    ┌───────────┐          │              ┌─────────┐
-   │ Agent 1 │──────────────┼──►│           │    │            │    │           │──────────┼─────────────►│  AHTI   │
-   └─────────┘   gRPC       │   │           │    │            │    │           │          │   gRPC       └─────────┘
-                            │   │ Ingestors │───►│ Middleware │───►│  Emitters │          │
-   ┌─────────┐              │   │           │    │            │    │           │          │              ┌─────────┐
-   │ Agent 2 │──────────────┼──►│           │    │            │    │           │──────────┼─────────────►│  Kafka  │
-   └─────────┘   gRPC       │   └───────────┘    └────────────┘    └───────────┘          │              └─────────┘
-                            │        │                │                  │                 │
-   ┌─────────┐              │        │           ┌────▼────┐             │                 │              ┌─────────┐
-   │ Plugin  │◄─────────────┼────────┘           │ Buffer  │             └─────────────────┼─────────────►│   S3    │
-   │ (Go/Py) │  gRPC        │                    │ (Ring)  │                               │              └─────────┘
-   └─────────┘              │                    └─────────┘                               │
-                            │                                                              │
-                            └─────────────────────────────────────────────────────────────┘
+                     ┌────────────────────────────────────────────────────┐
+                     │                      POLKU                          │
+                     │                                                     │
+   Your App ────────►│   Ingestors ──► Middleware ──► Buffer ──► Emitters │────────► Slack
+                     │       │              │                        │     │
+   Agents ──────────►│       │         [transform]                   │     │────────► S3
+                     │       │         [filter]                      │     │
+   Webhooks ────────►│       │         [route]                       │     │────────► Kafka
+                     │       │                                       │     │
+                     │       ▼                                       ▼     │
+                     │   ┌────────┐                            ┌────────┐  │
+                     │   │ Plugin │  ◄── gRPC ──►              │ Plugin │  │
+                     │   │ (any   │                            │ (any   │  │
+                     │   │  lang) │                            │  lang) │  │
+                     │   └────────┘                            └────────┘  │
+                     └────────────────────────────────────────────────────┘
 ```
 
-**Key features:**
-- **Programmable** - Routing logic is Rust code, not config files
-- **Pluggable** - Write plugins in any language (Go, Python, Rust) via gRPC
-- **Lightweight** - 10-20MB footprint, no external dependencies
-- **Fire-and-forget** - Buffered delivery, not request/response
+**Why POLKU?**
+
+- **No YAML** - Routing logic is code, not config files
+- **Any language** - Write plugins in Python, Go, Rust, whatever
+- **Tiny** - 10-20MB memory, no dependencies
+- **Fast** - 100k+ events/sec
 
 ---
 
 ## Quick Start
 
-### Installation
-
 ```bash
+# Clone and build
 git clone https://github.com/yairfalse/polku
-cd polku
-cargo build --release
-```
+cd polku && cargo build --release
 
-### Run the Gateway
-
-```bash
-# With environment config
-POLKU_GRPC_ADDR=0.0.0.0:50051 \
-POLKU_BUFFER_CAPACITY=100000 \
-POLKU_LOG_LEVEL=info \
+# Run the gateway
 ./target/release/polku-gateway
-```
 
-### Send Events
-
-```bash
-# Using grpcurl
+# Send an event
 grpcurl -plaintext -d '{
-  "source": "my-agent",
-  "cluster": "prod",
-  "events": {
-    "events": [{
-      "id": "evt-001",
-      "source": "my-agent",
-      "event_type": "user.login"
-    }]
-  }
+  "source": "my-app",
+  "events": {"events": [{"id": "1", "event_type": "user.signup"}]}
 }' localhost:50051 polku.v1.Gateway/SendEvent
 ```
 
----
-
-## How It Works
-
-### The Pipeline
-
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                              EVENT FLOW                                       │
-│                                                                              │
-│  1. INGEST          2. TRANSFORM         3. BUFFER         4. EMIT          │
-│  ┌─────────┐        ┌─────────────┐      ┌─────────┐      ┌─────────┐       │
-│  │ Raw     │        │ Filter      │      │ Ring    │      │ Fan-out │       │
-│  │ Bytes   │───────►│ Transform   │─────►│ Buffer  │─────►│ to all  │       │
-│  │ → Event │        │ Enrich      │      │ (async) │      │ emitters│       │
-│  └─────────┘        └─────────────┘      └─────────┘      └─────────┘       │
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
-
-1. **Ingestors** parse raw bytes into typed `Event` structs
-2. **Middleware** transforms, filters, and routes events
-3. **Buffer** decouples ingestion from emission (backpressure handling)
-4. **Emitters** send events to destinations in parallel
-
-### The Event
-
-```rust
-pub struct Event {
-    pub id: String,                        // Unique ID (ULID)
-    pub timestamp_unix_ns: i64,            // When it happened
-    pub source: String,                    // Origin ("tapio", "my-agent")
-    pub event_type: String,                // Type ("network.connection", "k8s.pod.created")
-    pub metadata: HashMap<String, String>, // Key-value context
-    pub severity: Severity,                // Debug, Info, Warning, Error, Critical
-    pub outcome: Outcome,                  // Success, Failure, Timeout
-
-    // Typed data (preferred over raw payload)
-    pub data: Option<EventData>,           // Network, Kernel, Container, K8s, Process, Resource
-}
-```
+That's it. Events flow through POLKU.
 
 ---
 
-## Writing Plugins
+## Write a Plugin in 5 Minutes
 
-POLKU supports **external plugins** written in any language with gRPC support. Plugins communicate via the `IngestorPlugin` service.
+Want to send events to Slack? Parse a custom format? Write a plugin.
 
-### Plugin Protocol
-
-```protobuf
-// proto/polku/v1/plugin.proto
-
-service IngestorPlugin {
-    rpc Info(Empty) returns (PluginInfo);           // Plugin metadata
-    rpc Health(Empty) returns (PluginHealthResponse); // Health check
-    rpc Ingest(IngestRequest) returns (IngestResponse); // Transform bytes → Events
-}
-
-message IngestRequest {
-    string source = 1;   // Source identifier
-    string cluster = 2;  // Cluster/environment
-    string format = 3;   // Format hint ("json", "protobuf", "msgpack")
-    bytes data = 4;      // Raw bytes to transform
-}
-
-message IngestResponse {
-    repeated Event events = 1;  // Transformed events
-    repeated IngestError errors = 2;  // Any errors
-}
-```
-
-### Python Plugin Example
+### Python: Slack Emitter
 
 ```python
-# my_plugin.py
-import grpc
-from concurrent import futures
-from polku.v1 import plugin_pb2, plugin_pb2_grpc
-from polku.event.v1 import event_pb2
+# slack_emitter.py
+# Sends events to Slack as pretty messages
 
-class MyPlugin(plugin_pb2_grpc.IngestorPluginServicer):
+class SlackEmitter:
 
     def Info(self, request, context):
-        return plugin_pb2.PluginInfo(
-            name="my-python-plugin",
-            version="1.0.0",
-            type=plugin_pb2.PLUGIN_TYPE_INGESTOR,
-            sources=["my-custom-source"],  # POLKU routes this source here
+        return PluginInfo(
+            name="slack-emitter",
+            type=EMITTER,
+            emitter_name="slack",  # ← POLKU knows us as "slack"
         )
 
-    def Health(self, request, context):
-        return plugin_pb2.PluginHealthResponse(healthy=True)
+    def Emit(self, request, context):
+        for event in request.events:
+            # Format the event nicely
+            message = f"*{event.event_type}* from `{event.source}`"
 
-    def Ingest(self, request, context):
-        # request.data contains raw bytes
-        # Parse your custom format and return Events
-        events = []
-        for record in parse_my_format(request.data):
-            events.append(event_pb2.Event(
-                id=generate_id(),
-                source=request.source,
-                event_type="my.event.type",
-                payload=record.to_bytes(),
-            ))
-        return plugin_pb2.IngestResponse(events=events)
+            # Send to Slack
+            requests.post(SLACK_WEBHOOK, json={"text": message})
 
-def serve():
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
-    plugin_pb2_grpc.add_IngestorPluginServicer_to_server(MyPlugin(), server)
-    server.add_insecure_port('[::]:9001')
-    server.start()
-    server.wait_for_termination()
+        return EmitResponse(success_count=len(request.events))
 
-if __name__ == '__main__':
-    serve()
+# Start the plugin
+server = grpc.server(ThreadPoolExecutor())
+server.add_insecure_port('[::]:9001')
+server.start()
 ```
 
-### Go Plugin Example
+```bash
+# Run it
+python slack_emitter.py
+
+# Tell POLKU about it (or use auto-discovery)
+# → Events now flow to Slack!
+```
+
+### Go: CSV Ingestor
 
 ```go
-// main.go
-package main
+// csv_ingestor.go
+// Turns CSV data into events
 
-import (
-    "context"
-    "net"
-
-    "google.golang.org/grpc"
-    pb "github.com/yairfalse/proto/gen/go/polku/v1"
-)
-
-type myPlugin struct {
-    pb.UnimplementedIngestorPluginServer
-}
-
-func (p *myPlugin) Info(ctx context.Context, _ *emptypb.Empty) (*pb.PluginInfo, error) {
-    return &pb.PluginInfo{
-        Name:    "my-go-plugin",
-        Version: "1.0.0",
-        Type:    pb.PluginType_PLUGIN_TYPE_INGESTOR,
-        Sources: []string{"my-custom-source"},
+func (p *CSVIngestor) Info(ctx context.Context, _ *empty.Empty) (*PluginInfo, error) {
+    return &PluginInfo{
+        Name:    "csv-ingestor",
+        Type:    INGESTOR,
+        Sources: []string{"csv"},  // ← Handle source: "csv"
     }, nil
 }
 
-func (p *myPlugin) Health(ctx context.Context, _ *emptypb.Empty) (*pb.PluginHealthResponse, error) {
-    return &pb.PluginHealthResponse{Healthy: true}, nil
-}
+func (p *CSVIngestor) Ingest(ctx context.Context, req *IngestRequest) (*IngestResponse, error) {
+    reader := csv.NewReader(bytes.NewReader(req.Data))
+    headers, _ := reader.Read()
 
-func (p *myPlugin) Ingest(ctx context.Context, req *pb.IngestRequest) (*pb.IngestResponse, error) {
-    // Parse req.Data and return events
-    events := parseMyFormat(req.Data)
-    return &pb.IngestResponse{Events: events}, nil
-}
+    var events []*Event
+    for {
+        row, err := reader.Read()
+        if err != nil { break }
 
-func main() {
-    lis, _ := net.Listen("tcp", ":9001")
-    s := grpc.NewServer()
-    pb.RegisterIngestorPluginServer(s, &myPlugin{})
-    s.Serve(lis)
+        // Each CSV row becomes an event
+        metadata := make(map[string]string)
+        for i, h := range headers {
+            metadata[h] = row[i]
+        }
+
+        events = append(events, &Event{
+            Id:        uuid.New().String(),
+            EventType: "csv.row",
+            Metadata:  metadata,
+        })
+    }
+
+    return &IngestResponse{Events: events}, nil
 }
 ```
 
-### Register Plugin in POLKU
+```bash
+# Run it
+go run csv_ingestor.go
+
+# Send CSV data to POLKU with source: "csv"
+# → Each row becomes an event!
+```
+
+---
+
+## Plugin Discovery (Auto-Registration)
+
+Plugins can register themselves. No config needed.
+
+```python
+# In your plugin, call POLKU's registry:
+stub = PluginRegistryStub(channel)
+stub.Register(RegisterRequest(
+    info=PluginInfo(name="my-plugin", type=EMITTER, emitter_name="slack"),
+    address="localhost:9001",
+))
+
+# POLKU now routes events to your plugin
+# Send heartbeats to stay registered
+stub.Heartbeat(HeartbeatRequest(plugin_id=response.plugin_id))
+```
+
+Or configure statically in Rust:
 
 ```rust
-use polku_gateway::{Hub, ExternalIngestor, StdoutEmitter};
-
-fn main() {
-    let (raw_sender, msg_sender, runner) = Hub::new()
-        // Register external plugin
-        .ingestor(ExternalIngestor::new("my-custom-source", "http://localhost:9001"))
-        // Built-in emitter
-        .emitter(StdoutEmitter::new())
-        .build();
-
-    // Start the hub
-    tokio::runtime::Runtime::new().unwrap().block_on(runner.run());
-}
+Hub::new()
+    .ingestor(ExternalIngestor::new("csv", "http://localhost:9002"))
+    .emitter(ExternalEmitter::new("slack", "http://localhost:9001"))
+    .build();
 ```
 
-Now when POLKU receives events with `source: "my-custom-source"`, it routes them to your plugin for parsing.
+---
+
+## The Pipeline
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                           EVENT FLOW                                 │
+│                                                                     │
+│   INGEST           TRANSFORM            BUFFER           EMIT       │
+│  ┌───────┐        ┌───────────┐        ┌───────┐       ┌───────┐   │
+│  │ bytes │───────►│  Filter   │───────►│ Ring  │──────►│ Fan   │   │
+│  │   ↓   │        │  Enrich   │        │Buffer │       │ Out   │   │
+│  │ Event │        │  Route    │        │(async)│       │       │   │
+│  └───────┘        └───────────┘        └───────┘       └───────┘   │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+1. **Ingestors** - Parse bytes into Events (JSON, protobuf, CSV, custom)
+2. **Middleware** - Transform, filter, enrich, route
+3. **Buffer** - Decouple ingestion from emission (backpressure)
+4. **Emitters** - Send to destinations (Slack, S3, Kafka, custom)
 
 ---
 
 ## Built-in Components
 
 ### Ingestors
-
-| Ingestor | Description |
-|----------|-------------|
-| `PassthroughIngestor` | Events already in protobuf `Event` format |
-| `JsonIngestor` | JSON matching the Event schema |
-| `ExternalIngestor` | Delegates to external gRPC plugin |
+| Name | Description |
+|------|-------------|
+| `PassthroughIngestor` | Events already in protobuf format |
+| `JsonIngestor` | JSON → Event |
+| `ExternalIngestor` | Delegate to any gRPC plugin |
 
 ### Middleware
-
-| Middleware | Description |
-|------------|-------------|
-| `Filter` | Drop events based on predicate |
-| `Transform` | Modify events (add metadata, change fields) |
-| `Router` | Route to specific emitters based on event type |
-| `RateLimiter` | Limit events per second |
-| `Sampler` | Sample a percentage of events |
-| `Deduplicator` | Drop duplicate event IDs |
-| `Aggregator` | Batch events before emitting |
+| Name | What it does |
+|------|--------------|
+| `Filter` | Drop events that don't match |
+| `Transform` | Modify events |
+| `Router` | Route to specific emitters |
+| `RateLimiter` | Limit events/sec |
+| `Sampler` | Sample N% of events |
+| `Deduplicator` | Drop duplicates |
 
 ### Emitters
-
-| Emitter | Description |
-|---------|-------------|
-| `StdoutEmitter` | Print events to stdout (debugging) |
-| `GrpcEmitter` | Send to any gRPC endpoint |
-| `WebhookEmitter` | POST events to HTTP endpoint |
-| `AhtiEmitter` | Send to AHTI knowledge graph (feature-gated) |
+| Name | Description |
+|------|-------------|
+| `StdoutEmitter` | Print to console (debugging) |
+| `GrpcEmitter` | Send via gRPC |
+| `WebhookEmitter` | HTTP POST |
+| `ExternalEmitter` | Delegate to any gRPC plugin |
 
 ---
 
@@ -302,81 +246,37 @@ Now when POLKU receives events with `source: "my-custom-source"`, it routes them
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `POLKU_GRPC_ADDR` | `0.0.0.0:50051` | gRPC listen address |
-| `POLKU_BUFFER_CAPACITY` | `10000` | Ring buffer size |
-| `POLKU_LOG_LEVEL` | `info` | Log level (debug, info, warn, error) |
-| `POLKU_EMIT_AHTI_ENDPOINT` | - | AHTI emitter endpoint (if enabled) |
+| `POLKU_GRPC_ADDR` | `0.0.0.0:50051` | Listen address |
+| `POLKU_BUFFER_CAPACITY` | `10000` | Buffer size |
+| `POLKU_LOG_LEVEL` | `info` | Log level |
 
-### Programmatic Configuration
+### Programmatic (Rust)
 
 ```rust
-use polku_gateway::{Hub, BufferStrategy, Filter, Transform, StdoutEmitter};
+use polku_gateway::*;
 
 let hub = Hub::new()
-    // Buffer strategy
-    .buffer_strategy(BufferStrategy::tiered(10_000, 5_000))
+    // Parse JSON events
+    .ingestor(JsonIngestor::new())
 
-    // Middleware chain
-    .middleware(Filter::new(|msg| msg.event_type.starts_with("user.")))
-    .middleware(Transform::new(|mut msg| {
-        msg.metadata.insert("processed".into(), "true".into());
-        msg
+    // External plugin for CSV
+    .ingestor(ExternalIngestor::new("csv", "http://localhost:9002"))
+
+    // Filter to only user events
+    .middleware(Filter::new(|e| e.event_type.starts_with("user.")))
+
+    // Add metadata
+    .middleware(Transform::new(|mut e| {
+        e.metadata.insert("env".into(), "prod".into());
+        e
     }))
 
-    // Emitters (fan-out to all)
+    // Send to stdout and Slack
     .emitter(StdoutEmitter::new())
-    .emitter(GrpcEmitter::new("http://downstream:50051"))
+    .emitter(ExternalEmitter::new("slack", "http://localhost:9001"))
 
     .build();
 ```
-
----
-
-## Architecture
-
-```
-polku/
-├── proto/                    # Protocol definitions
-│   └── polku/v1/
-│       ├── gateway.proto     # Gateway service (client → POLKU)
-│       ├── plugin.proto      # Plugin service (POLKU → plugins)
-│       └── event.proto       # Event envelope + typed data
-│
-├── core/                     # polku-core crate
-│   └── src/
-│       ├── emit.rs           # Emitter trait
-│       ├── error.rs          # PluginError
-│       └── proto/            # Generated Event types
-│
-└── gateway/                  # polku-gateway crate
-    └── src/
-        ├── main.rs           # Entry point
-        ├── hub/              # Hub builder + runner
-        ├── ingest/           # Ingestors (Passthrough, Json, External)
-        ├── middleware/       # Filter, Transform, Router, etc.
-        ├── emit/             # Emitters (Stdout, gRPC, Webhook, AHTI)
-        └── buffer.rs         # Ring buffer
-```
-
-### Crate Dependencies
-
-```
-polku-core ◄── polku-gateway
-    ▲
-    └────────── external plugins (ahti-emitter, etc.)
-```
-
-`polku-core` contains shared types (`Emitter`, `Event`, `PluginError`) to avoid dependency cycles.
-
----
-
-## Deployment Modes
-
-| Mode | Description | Use Case |
-|------|-------------|----------|
-| **Library** | Import as Rust crate | Embedded in your service |
-| **Standalone** | Central gateway | Cluster-wide event routing |
-| **Sidecar** | Per-service proxy | Legacy protocol translation |
 
 ---
 
@@ -384,12 +284,33 @@ polku-core ◄── polku-gateway
 
 | Metric | Value |
 |--------|-------|
-| Memory footprint | 10-20MB |
+| Memory | 10-20 MB |
 | Throughput | 100k+ events/sec |
-| Plugin latency | ~100-500μs per call |
-| Buffer overflow | Configurable (drop or compress) |
+| Plugin latency | ~100-500μs |
 
-For high-volume sources (>10k events/sec), implement a native Rust ingestor instead of using external plugins.
+For high-volume sources (>10k/sec), write a native Rust ingestor instead of using external plugins.
+
+---
+
+## Project Structure
+
+```
+polku/
+├── proto/polku/v1/
+│   ├── gateway.proto      # Client → POLKU
+│   ├── plugin.proto       # POLKU ↔ Plugins
+│   └── event.proto        # Event schema
+│
+├── core/                  # Shared types (Emitter, Event, Error)
+│
+├── gateway/               # The gateway itself
+│   ├── ingest/            # Ingestors
+│   ├── middleware/        # Middleware
+│   ├── emit/              # Emitters
+│   └── discovery/         # Plugin auto-registration
+│
+└── examples/plugins/      # Example plugins (Python, Go)
+```
 
 ---
 
@@ -397,7 +318,7 @@ For high-volume sources (>10k events/sec), implement a native Rust ingestor inst
 
 **Polku** (Finnish) = "path"
 
-The path events take through your system.
+The path your events take through the system.
 
 ---
 
