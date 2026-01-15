@@ -504,12 +504,17 @@ async fn test_health_reflects_plugin_state() {
 /// Rapid plugin restart - verify no resource leaks
 #[tokio::test]
 async fn test_rapid_plugin_restarts() {
-    let emitter = ExternalEmitter::new("chaos", "http://127.0.0.1:19999");
+    // Bind to port 0 to get a random available port
+    let initial_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = initial_listener.local_addr().unwrap();
+    drop(initial_listener); // Release it so we can rebind in the loop
+
+    let emitter = ExternalEmitter::new("chaos", format!("http://{}", addr));
 
     for i in 0..5 {
-        // Start plugin
+        // Start plugin on same port
         let plugin = ChaoticPluginInner::new();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:19999").await.unwrap();
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
         let service = ChaoticEmitter(plugin);
 
         let handle = tokio::spawn(async move {
