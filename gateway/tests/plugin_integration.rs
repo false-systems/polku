@@ -3,14 +3,14 @@
 //! Black-box tests for the plugin system using real infrastructure.
 //! These tests verify failure modes, not happy paths.
 //!
-//! Test scenarios:
-//! 1. Plugin crashes mid-request → POLKU recovers
-//! 2. Plugin slow/hangs → timeout triggers, doesn't block pipeline
-//! 3. Plugin returns garbage → graceful error, no panic
-//! 4. Network partition → reconnects automatically
-//! 5. Plugin restarts with new address → discovery handles it
-//! 6. Concurrent requests during plugin restart → no data loss
-//! 7. Plugin OOMs → circuit breaker opens
+//! Test scenarios covered:
+//! 1. Plugin crashes mid-request → POLKU returns error gracefully
+//! 2. Plugin slow/hangs → timeout prevents blocking
+//! 3. Plugin returns gRPC error → error propagates correctly
+//! 4. Network partition → client reconnects when server is back
+//! 5. Rapid plugin restarts → client handles reconnection
+//! 6. Concurrent requests during crash → some succeed, some fail, no panic
+//! 7. Discovery edge cases → registration, heartbeat, unregister flows
 
 use polku_gateway::emit::{Emitter, ExternalEmitter};
 use polku_gateway::error::PluginError;
@@ -19,11 +19,11 @@ use polku_gateway::proto::emitter_plugin_server::{EmitterPlugin, EmitterPluginSe
 use polku_gateway::proto::ingestor_plugin_server::{IngestorPlugin, IngestorPluginServer};
 use polku_gateway::proto::{
     EmitRequest, EmitResponse, IngestRequest, IngestResponse, PluginHealthResponse, PluginInfo,
-    ShutdownResponse,
+    PluginType, ShutdownResponse,
 };
 use polku_core::Event;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{oneshot, Notify};
@@ -40,8 +40,8 @@ struct ChaoticPluginInner {
     kill_after: AtomicU32,
     /// Current request count
     request_count: AtomicU32,
-    /// Delay each request by this duration
-    delay: Duration,
+    /// Delay each request by this duration (in milliseconds)
+    delay_ms: AtomicU64,
     /// Return error on next request
     fail_next: AtomicBool,
     /// Hang forever (simulate OOM/deadlock)
@@ -61,7 +61,7 @@ impl ChaoticPluginInner {
         Arc::new(Self {
             kill_after: AtomicU32::new(u32::MAX),
             request_count: AtomicU32::new(0),
-            delay: Duration::ZERO,
+            delay_ms: AtomicU64::new(0),
             fail_next: AtomicBool::new(false),
             hang: AtomicBool::new(false),
             request_started: Notify::new(),
@@ -75,16 +75,8 @@ impl ChaoticPluginInner {
     }
 
     fn with_delay(self: Arc<Self>, d: Duration) -> Arc<Self> {
-        // Create new instance with delay
-        Arc::new(Self {
-            kill_after: AtomicU32::new(self.kill_after.load(Ordering::SeqCst)),
-            request_count: AtomicU32::new(0),
-            delay: d,
-            fail_next: AtomicBool::new(false),
-            hang: AtomicBool::new(false),
-            request_started: Notify::new(),
-            kill_signal: Notify::new(),
-        })
+        self.delay_ms.store(d.as_millis() as u64, Ordering::SeqCst);
+        self
     }
 
     fn fail_next(&self) {
@@ -109,8 +101,9 @@ impl ChaoticPluginInner {
         }
 
         // Apply delay
-        if !self.delay.is_zero() {
-            tokio::time::sleep(self.delay).await;
+        let delay_ms = self.delay_ms.load(Ordering::SeqCst);
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
 
         // Check if we should kill
@@ -130,7 +123,7 @@ impl EmitterPlugin for ChaoticEmitter {
         Ok(Response::new(PluginInfo {
             name: "chaotic-emitter".to_string(),
             version: "1.0.0".to_string(),
-            r#type: 2,
+            r#type: PluginType::Emitter as i32,
             description: "Chaos testing".to_string(),
             sources: vec![],
             emitter_name: "chaos".to_string(),
@@ -171,7 +164,7 @@ impl IngestorPlugin for ChaoticIngestor {
         Ok(Response::new(PluginInfo {
             name: "chaotic-ingestor".to_string(),
             version: "1.0.0".to_string(),
-            r#type: 1,
+            r#type: PluginType::Ingestor as i32,
             description: "Chaos testing".to_string(),
             sources: vec!["chaos".to_string()],
             emitter_name: String::new(),
@@ -374,7 +367,7 @@ async fn test_emitter_plugin_slow_response() {
     assert!(elapsed < Duration::from_secs(2), "Shouldn't take too long");
 }
 
-/// Multiple concurrent requests during plugin instability
+/// Concurrent requests during plugin crash - verify no panics and graceful degradation
 #[tokio::test]
 async fn test_emitter_concurrent_requests_during_chaos() {
     let plugin = ChaoticPluginInner::new().with_kill_after(5);
@@ -501,7 +494,7 @@ async fn test_health_reflects_plugin_state() {
     assert!(!emitter.health().await);
 }
 
-/// Rapid plugin restart - verify no resource leaks
+/// Rapid plugin restart - verify client handles reconnection to same address
 #[tokio::test]
 async fn test_rapid_plugin_restarts() {
     // Bind to port 0 to get a random available port
@@ -593,9 +586,7 @@ async fn test_nonexistent_plugin() {
 
 use polku_gateway::discovery::DiscoveryServer;
 use polku_gateway::proto::plugin_registry_server::PluginRegistryServer;
-use polku_gateway::proto::{
-    HeartbeatRequest, PluginType, RegisterRequest, UnregisterRequest,
-};
+use polku_gateway::proto::{HeartbeatRequest, RegisterRequest, UnregisterRequest};
 use polku_gateway::registry::PluginRegistry as StaticRegistry;
 
 /// Handle to a running discovery server for testing
