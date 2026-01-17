@@ -1,0 +1,18 @@
+[package]
+name = "polku-test-receiver"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+polku-core = { path = "../../core" }
+tokio = { version = "1", features = ["full"] }
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+parking_lot = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+
+[build-dependencies]
+tonic-build = "0.12"
