@@ -87,57 +87,11 @@ async fn test_event_flows_through_pipeline(ctx: Context) {
 #[seppo::test]
 #[ignore] // Requires Kind cluster with POLKU images
 async fn test_receiver_down_graceful_degradation(ctx: Context) {
-    use k8s_openapi::api::apps::v1::Deployment;
-    use k8s_openapi::api::core::v1::Service;
+    use polku_e2e::setup::{polku_deployment_no_receiver, polku_service};
 
-    // POLKU deployment with no receiver (pointing to nonexistent endpoint)
-    // Uses imagePullPolicy: Never for Kind
-    const POLKU_NO_RECEIVER: &str = r#"
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: polku
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: polku
-  template:
-    metadata:
-      labels:
-        app: polku
-    spec:
-      containers:
-      - name: polku
-        image: polku-gateway:latest
-        imagePullPolicy: Never
-        ports:
-        - containerPort: 50051
-        env:
-        - name: POLKU_GRPC_ADDR
-          value: "0.0.0.0:50051"
-        - name: POLKU_EMIT_GRPC_ENDPOINTS
-          value: "http://nonexistent:9001"
-        - name: POLKU_EMIT_GRPC_LAZY
-          value: "true"
-"#;
-
-    const POLKU_SERVICE: &str = r#"
-apiVersion: v1
-kind: Service
-metadata:
-  name: polku
-spec:
-  selector:
-    app: polku
-  ports:
-  - port: 50051
-    targetPort: 50051
-"#;
-
-    // Deploy POLKU only (no receiver)
-    let polku: Deployment = serde_yaml::from_str(POLKU_NO_RECEIVER).expect("Parse deployment");
-    let polku_svc: Service = serde_yaml::from_str(POLKU_SERVICE).expect("Parse service");
+    // Deploy POLKU only (no receiver) - uses shared helpers with imagePullPolicy: Never
+    let polku = polku_deployment_no_receiver();
+    let polku_svc = polku_service();
 
     ctx.apply(&polku).await.expect("Deploy POLKU");
     ctx.apply(&polku_svc).await.expect("Deploy POLKU service");
