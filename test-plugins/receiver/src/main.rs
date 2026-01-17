@@ -1,7 +1,9 @@
 //! Test Receiver Plugin
 //!
-//! A simple emitter plugin that stores all received events for verification.
+//! A simple gateway receiver that stores all received events for verification.
 //! Used for black-box testing of POLKU.
+//!
+//! Implements the Gateway service to receive events from POLKU's gRPC emitter.
 //!
 //! Features:
 //! - Stores all received events in memory
@@ -11,18 +13,22 @@
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::oneshot;
-use tonic::{Request, Response, Status};
+use tokio_stream::{Stream, StreamExt};
+use tonic::{Request, Response, Status, Streaming};
 use tracing::info;
 
 pub mod proto {
     include!("proto/polku.v1.rs");
 }
 
-use proto::emitter_plugin_server::{EmitterPlugin, EmitterPluginServer};
-use proto::{EmitError, EmitRequest, EmitResponse, PluginHealthResponse, PluginInfo, PluginType, ShutdownResponse};
+use proto::gateway_server::{Gateway, GatewayServer};
+use proto::{
+    Ack, AckError, ComponentHealth, HealthRequest, HealthResponse,
+    IngestBatch, IngestEvent, ingest_batch, ingest_event,
+};
 
 /// Storage for received events - uses polku_core::Event directly
 #[derive(Default)]
@@ -47,26 +53,31 @@ impl ReceivedEvents {
     }
 
     /// Get count of successfully received events
+    #[allow(dead_code)]
     pub fn success_count(&self) -> u64 {
         self.success_count.load(Ordering::SeqCst)
     }
 
     /// Get count of rejected events
+    #[allow(dead_code)]
     pub fn failure_count(&self) -> u64 {
         self.failure_count.load(Ordering::SeqCst)
     }
 
     /// Get all received events
+    #[allow(dead_code)]
     pub fn get_all(&self) -> Vec<polku_core::Event> {
         self.events.read().values().cloned().collect()
     }
 
     /// Get a specific event by ID
+    #[allow(dead_code)]
     pub fn get(&self, id: &str) -> Option<polku_core::Event> {
         self.events.read().get(id).cloned()
     }
 
     /// Clear all received events
+    #[allow(dead_code)]
     pub fn clear(&self) {
         self.events.write().clear();
         self.success_count.store(0, Ordering::SeqCst);
@@ -74,16 +85,19 @@ impl ReceivedEvents {
     }
 
     /// Configure to reject specific event IDs
+    #[allow(dead_code)]
     pub fn reject_ids(&self, ids: Vec<String>) {
         *self.reject_ids.write() = ids;
     }
 
     /// Configure to reject events with empty ID
+    #[allow(dead_code)]
     pub fn set_reject_empty_id(&self, reject: bool) {
         *self.reject_empty_id.write() = reject;
     }
 
     /// Configure to reject events with empty event_type
+    #[allow(dead_code)]
     pub fn set_reject_empty_type(&self, reject: bool) {
         *self.reject_empty_type.write() = reject;
     }
@@ -122,111 +136,156 @@ impl ReceivedEvents {
     }
 }
 
-/// The receiver plugin service
-pub struct ReceiverPlugin {
+/// The receiver gateway service - implements Gateway to receive from POLKU's gRPC emitter
+pub struct ReceiverGateway {
     storage: Arc<ReceivedEvents>,
-    #[allow(dead_code)]
-    shutdown_tx: Option<oneshot::Sender<()>>,
 }
 
-impl ReceiverPlugin {
+impl ReceiverGateway {
     pub fn new(storage: Arc<ReceivedEvents>) -> Self {
-        Self {
-            storage,
-            shutdown_tx: None,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn with_shutdown(mut self, tx: oneshot::Sender<()>) -> Self {
-        self.shutdown_tx = Some(tx);
-        self
+        Self { storage }
     }
 }
 
 #[tonic::async_trait]
-impl EmitterPlugin for ReceiverPlugin {
-    async fn info(&self, _: Request<()>) -> Result<Response<PluginInfo>, Status> {
-        Ok(Response::new(PluginInfo {
-            name: "test-receiver".to_string(),
-            version: "1.0.0".to_string(),
-            r#type: PluginType::Emitter as i32,
-            description: "Test receiver that stores events for verification".to_string(),
-            sources: vec![],
-            emitter_name: "test-receiver".to_string(),
-            capabilities: vec!["store".to_string(), "query".to_string()],
-        }))
+impl Gateway for ReceiverGateway {
+    type StreamEventsStream = Pin<Box<dyn Stream<Item = Result<Ack, Status>> + Send>>;
+
+    async fn stream_events(
+        &self,
+        request: Request<Streaming<IngestBatch>>,
+    ) -> Result<Response<Self::StreamEventsStream>, Status> {
+        let mut stream = request.into_inner();
+        let storage = self.storage.clone();
+
+        let output = async_stream::try_stream! {
+            while let Some(batch_result) = stream.next().await {
+                let batch = batch_result?;
+
+                let mut event_ids = Vec::new();
+                let mut errors = Vec::new();
+
+                // Extract events from the batch payload
+                if let Some(payload) = batch.payload {
+                    match payload {
+                        ingest_batch::Payload::Events(event_payload) => {
+                            for event in event_payload.events {
+                                let event_id = event.id.clone();
+                                match storage.store(event) {
+                                    Ok(()) => event_ids.push(event_id),
+                                    Err((id, reason)) => {
+                                        errors.push(AckError {
+                                            event_id: id,
+                                            code: "REJECTED".to_string(),
+                                            message: reason,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        ingest_batch::Payload::Raw(_) => {
+                            // We don't support raw payloads in the test receiver
+                            errors.push(AckError {
+                                event_id: String::new(),
+                                code: "UNSUPPORTED".to_string(),
+                                message: "Raw payloads not supported".to_string(),
+                            });
+                        }
+                    }
+                }
+
+                info!(
+                    success = event_ids.len(),
+                    failed = errors.len(),
+                    "Processed batch"
+                );
+
+                yield Ack {
+                    event_ids,
+                    errors,
+                    buffer_size: 0,
+                    buffer_capacity: 100000,
+                    middleware_stats: None,
+                };
+            }
+        };
+
+        Ok(Response::new(Box::pin(output)))
     }
 
-    async fn health(&self, _: Request<()>) -> Result<Response<PluginHealthResponse>, Status> {
-        Ok(Response::new(PluginHealthResponse {
-            healthy: true,
-            message: format!(
-                "Received {} events ({} rejected)",
-                self.storage.success_count(),
-                self.storage.failure_count()
-            ),
-            components: Default::default(),
-        }))
-    }
-
-    async fn emit(&self, request: Request<EmitRequest>) -> Result<Response<EmitResponse>, Status> {
-        let req = request.into_inner();
-        let mut failed_ids = Vec::new();
+    async fn send_event(&self, request: Request<IngestEvent>) -> Result<Response<Ack>, Status> {
+        let ingest = request.into_inner();
+        let mut event_ids = Vec::new();
         let mut errors = Vec::new();
-        let mut success_count = 0i64;
 
-        for proto_event in req.events {
-            // polku_core::Event IS the proto event (same type via extern_path)
-            // Just store it directly
-            let event = proto_event;
-
-            match self.storage.store(event) {
-                Ok(()) => success_count += 1,
-                Err((event_id, reason)) => {
-                    failed_ids.push(event_id.clone());
-                    errors.push(EmitError {
-                        event_id,
-                        message: reason,
-                        retryable: false,
+        if let Some(payload) = ingest.payload {
+            match payload {
+                ingest_event::Payload::Event(event) => {
+                    let event_id = event.id.clone();
+                    match self.storage.store(event) {
+                        Ok(()) => event_ids.push(event_id),
+                        Err((id, reason)) => {
+                            errors.push(AckError {
+                                event_id: id,
+                                code: "REJECTED".to_string(),
+                                message: reason,
+                            });
+                        }
+                    }
+                }
+                ingest_event::Payload::Raw(_) => {
+                    errors.push(AckError {
+                        event_id: String::new(),
+                        code: "UNSUPPORTED".to_string(),
+                        message: "Raw payloads not supported".to_string(),
                     });
                 }
             }
         }
 
-        info!(
-            success = success_count,
-            failed = failed_ids.len(),
-            "Processed batch"
-        );
-
-        Ok(Response::new(EmitResponse {
-            success_count,
-            failed_event_ids: failed_ids,
+        Ok(Response::new(Ack {
+            event_ids,
             errors,
+            buffer_size: 0,
+            buffer_capacity: 100000,
+            middleware_stats: None,
         }))
     }
 
-    async fn shutdown(&self, _: Request<()>) -> Result<Response<ShutdownResponse>, Status> {
-        info!("Shutdown requested");
-        Ok(Response::new(ShutdownResponse {
-            success: true,
-            message: "Shutting down".to_string(),
+    async fn health(&self, _: Request<HealthRequest>) -> Result<Response<HealthResponse>, Status> {
+        let mut components = HashMap::new();
+        components.insert(
+            "storage".to_string(),
+            ComponentHealth {
+                healthy: true,
+                message: format!(
+                    "Received {} events ({} rejected)",
+                    self.storage.success_count.load(Ordering::SeqCst),
+                    self.storage.failure_count.load(Ordering::SeqCst)
+                ),
+            },
+        );
+
+        Ok(Response::new(HealthResponse {
+            healthy: true,
+            components,
+            uptime_seconds: 0,
+            events_processed: self.storage.success_count.load(Ordering::SeqCst),
         }))
     }
 }
 
-/// Start the receiver plugin server
+/// Start the receiver gateway server
 pub async fn start_server(
     addr: SocketAddr,
     storage: Arc<ReceivedEvents>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let plugin = ReceiverPlugin::new(storage);
+    let gateway = ReceiverGateway::new(storage);
 
     info!(%addr, "Starting test receiver plugin");
 
     tonic::transport::Server::builder()
-        .add_service(EmitterPluginServer::new(plugin))
+        .add_service(GatewayServer::new(gateway))
         .serve(addr)
         .await?;
 

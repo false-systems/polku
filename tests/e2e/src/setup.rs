@@ -1,49 +1,35 @@
 //! Test environment setup using Seppo
 
-use seppo::{Context, DeploymentFixture, ServiceFixture, eventually};
+use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::core::v1::Service;
+use seppo::{Context, PortForward, eventually};
 use std::time::Duration;
 
 /// POLKU test environment in Kubernetes
 pub struct PolkuTestEnv {
     pub polku_addr: String,
+    /// Keep the port forward alive for the duration of the test
+    #[allow(dead_code)]
+    _port_forward: PortForward,
 }
 
 impl PolkuTestEnv {
     /// Deploy POLKU and test-receiver to a new namespace
     pub async fn setup(ctx: &Context) -> anyhow::Result<Self> {
         // Deploy test-receiver first (POLKU needs it as downstream)
-        let receiver = DeploymentFixture::new("test-receiver")
-            .image("polku-test-receiver:latest")
-            .replicas(1)
-            .port(9001)
-            .build();
+        // Parse YAML to get imagePullPolicy: Never for Kind
+        let receiver_deploy: Deployment = serde_yaml::from_str(manifests::RECEIVER_DEPLOYMENT)?;
+        let receiver_svc: Service = serde_yaml::from_str(manifests::RECEIVER_SERVICE)?;
 
-        let receiver_svc = ServiceFixture::new("test-receiver")
-            .selector("app", "test-receiver")
-            .port(9001, 9001)
-            .build();
-
-        ctx.apply(&receiver).await?;
+        ctx.apply(&receiver_deploy).await?;
         ctx.apply(&receiver_svc).await?;
         ctx.wait_ready("deployment/test-receiver").await?;
 
         // Deploy POLKU configured to emit to test-receiver
-        let polku = DeploymentFixture::new("polku")
-            .image("polku-gateway:latest")
-            .replicas(1)
-            .port(50051)
-            .env("POLKU_GRPC_ADDR", "0.0.0.0:50051")
-            .env("POLKU_EMIT_GRPC_ENDPOINTS", "http://test-receiver:9001")
-            .env("POLKU_EMIT_GRPC_LAZY", "true")
-            .env("POLKU_LOG_LEVEL", "debug")
-            .build();
+        let polku_deploy: Deployment = serde_yaml::from_str(manifests::POLKU_DEPLOYMENT)?;
+        let polku_svc: Service = serde_yaml::from_str(manifests::POLKU_SERVICE)?;
 
-        let polku_svc = ServiceFixture::new("polku")
-            .selector("app", "polku")
-            .port(50051, 50051)
-            .build();
-
-        ctx.apply(&polku).await?;
+        ctx.apply(&polku_deploy).await?;
         ctx.apply(&polku_svc).await?;
         ctx.wait_ready("deployment/polku").await?;
 
@@ -69,13 +55,16 @@ impl PolkuTestEnv {
         .await_condition()
         .await?;
 
-        Ok(Self { polku_addr })
+        Ok(Self {
+            polku_addr,
+            _port_forward: pf,
+        })
     }
 }
 
 /// K8s manifests for POLKU deployment
 pub mod manifests {
-    /// POLKU gateway deployment YAML (alternative to fixtures)
+    /// POLKU gateway deployment YAML with imagePullPolicy: Never for Kind
     pub const POLKU_DEPLOYMENT: &str = r#"
 apiVersion: apps/v1
 kind: Deployment
@@ -104,9 +93,25 @@ spec:
           value: "http://test-receiver:9001"
         - name: POLKU_EMIT_GRPC_LAZY
           value: "true"
+        - name: POLKU_LOG_LEVEL
+          value: "debug"
 "#;
 
-    /// Test receiver deployment YAML
+    /// POLKU service YAML
+    pub const POLKU_SERVICE: &str = r#"
+apiVersion: v1
+kind: Service
+metadata:
+  name: polku
+spec:
+  selector:
+    app: polku
+  ports:
+  - port: 50051
+    targetPort: 50051
+"#;
+
+    /// Test receiver deployment YAML with imagePullPolicy: Never for Kind
     pub const RECEIVER_DEPLOYMENT: &str = r#"
 apiVersion: apps/v1
 kind: Deployment
@@ -131,5 +136,19 @@ spec:
         env:
         - name: RECEIVER_ADDR
           value: "0.0.0.0:9001"
+"#;
+
+    /// Test receiver service YAML
+    pub const RECEIVER_SERVICE: &str = r#"
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-receiver
+spec:
+  selector:
+    app: test-receiver
+  ports:
+  - port: 9001
+    targetPort: 9001
 "#;
 }

@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 polku-core = { path = "../../core" }
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+async-stream = "0.3"
 tonic = "0.12"
 prost = "0.13"
 prost-types = "0.13"

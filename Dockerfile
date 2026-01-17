@@ -6,11 +6,39 @@ WORKDIR /app
 # Install build dependencies
 RUN apt-get update && apt-get install -y protobuf-compiler pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 
-# Copy workspace files
-COPY Cargo.toml Cargo.lock ./
+# Copy workspace files (only production crates, not test infrastructure)
+COPY Cargo.lock ./
 COPY core/ core/
 COPY gateway/ gateway/
 COPY ci/ ci/
+
+# Create minimal workspace Cargo.toml for build (excludes test crates with external deps)
+RUN printf '%s\n' \
+    '[workspace]' \
+    'resolver = "2"' \
+    'members = ["core", "gateway", "ci"]' \
+    '' \
+    '[workspace.package]' \
+    'version = "0.1.0"' \
+    'edition = "2024"' \
+    'authors = ["POLKU Team"]' \
+    'license = "Apache-2.0"' \
+    'repository = "https://github.com/falsesystems/polku"' \
+    '' \
+    '[workspace.lints.rust]' \
+    'unsafe_code = "deny"' \
+    '' \
+    '[workspace.lints.clippy]' \
+    'unwrap_used = "warn"' \
+    'expect_used = "warn"' \
+    'panic = "warn"' \
+    'todo = "warn"' \
+    '' \
+    '[profile.release]' \
+    'lto = "fat"' \
+    'codegen-units = 1' \
+    'opt-level = 3' \
+    'strip = true' > Cargo.toml
 
 # Build release binary with AHTI emitter support
 RUN cargo build --release --package polku-gateway --features ahti
