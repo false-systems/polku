@@ -428,7 +428,7 @@ async fn test_hub_with_resilient_emitter() {
 
     let hub = Hub::new().buffer_capacity(100).emitter_arc(resilient);
 
-    let (sender, runner) = hub.build();
+    let (_, sender, runner) = hub.build();
 
     // Run hub in background
     let runner_handle = tokio::spawn(async move {
@@ -476,7 +476,7 @@ async fn test_hub_with_failing_resilient_emitter() {
 
     let hub = Hub::new().buffer_capacity(100).emitter_arc(resilient);
 
-    let (sender, runner) = hub.build();
+    let (_, sender, runner) = hub.build();
 
     let runner_handle = tokio::spawn(async move {
         tokio::time::timeout(Duration::from_millis(200), runner.run())
@@ -523,7 +523,7 @@ async fn test_hub_graceful_degradation() {
         .emitter_arc(resilient_failing)
         .emitter_arc(tracking.clone());
 
-    let (sender, runner) = hub.build();
+    let (_, sender, runner) = hub.build();
 
     let runner_handle = tokio::spawn(async move {
         tokio::time::timeout(Duration::from_millis(200), runner.run())
