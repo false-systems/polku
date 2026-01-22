@@ -86,7 +86,7 @@ fn bench_sustained_throughput(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let emitter = Arc::new(NullEmitter(AtomicU64::new(0)));
-                let (sender, runner) = Hub::new()
+                let (_, sender, runner) = Hub::new()
                     .buffer_capacity(50_000)
                     .emitter_arc(emitter.clone())
                     .build();
@@ -134,7 +134,7 @@ fn bench_backpressure(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let emitter = Arc::new(SlowEmitter::new(10));
-                let (sender, runner) = Hub::new()
+                let (_, sender, runner) = Hub::new()
                     .buffer_capacity(1000) // Small buffer
                     .emitter_arc(emitter.clone())
                     .build();
@@ -202,7 +202,7 @@ fn bench_buffer_overflow(c: &mut Criterion) {
                         }
                     }
 
-                    let (sender, runner) = Hub::new()
+                    let (_, sender, runner) = Hub::new()
                         .buffer_capacity(buffer_size)
                         .emitter(BlockingEmitter)
                         .build();
@@ -248,7 +248,7 @@ fn bench_large_payloads(c: &mut Criterion) {
             b.iter(|| {
                 rt.block_on(async {
                     let emitter = Arc::new(NullEmitter(AtomicU64::new(0)));
-                    let (sender, runner) = Hub::new()
+                    let (_, sender, runner) = Hub::new()
                         .buffer_capacity(2000)
                         .emitter_arc(emitter.clone())
                         .build();
