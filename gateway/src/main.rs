@@ -68,9 +68,9 @@ async fn main() -> anyhow::Result<()> {
     // Build Hub with appropriate emitter
     #[cfg(feature = "ahti")]
     let hub = if let Some(ref ahti_endpoint) = config.emit_ahti_endpoint {
-        // AHTI mode: forward to AHTI for analysis
-        let ahti_emitter = AhtiEmitter::new(ahti_endpoint).await?;
-        info!(endpoint = %ahti_endpoint, "AHTI mode: forwarding to AHTI");
+        // AHTI mode: forward to AHTI for analysis (using lazy connections for resilience)
+        let ahti_emitter = AhtiEmitter::with_endpoints_lazy(vec![ahti_endpoint.clone()]).await?;
+        info!(endpoint = %ahti_endpoint, "AHTI mode: forwarding to AHTI (lazy)");
         Hub::new()
             .buffer_capacity(config.buffer_capacity)
             .batch_size(config.batch_size)

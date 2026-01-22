@@ -62,7 +62,7 @@ fn bench_hub_throughput(c: &mut Criterion) {
             b.iter(|| {
                 rt.block_on(async {
                     let emitter = Arc::new(NullEmitter::new());
-                    let (sender, runner) = Hub::new()
+                    let (_, sender, runner) = Hub::new()
                         .buffer_capacity(batch_size * 2)
                         .emitter_arc(emitter.clone())
                         .build();
@@ -103,7 +103,7 @@ fn bench_hub_with_middleware(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let emitter = Arc::new(NullEmitter::new());
-                let (sender, runner) = Hub::new()
+                let (_, sender, runner) = Hub::new()
                     .buffer_capacity(2000)
                     .emitter_arc(emitter.clone())
                     .build();
@@ -124,7 +124,7 @@ fn bench_hub_with_middleware(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let emitter = Arc::new(NullEmitter::new());
-                let (sender, runner) = Hub::new()
+                let (_, sender, runner) = Hub::new()
                     .buffer_capacity(2000)
                     .middleware(Filter::new(|_| true)) // pass all
                     .emitter_arc(emitter.clone())
@@ -146,7 +146,7 @@ fn bench_hub_with_middleware(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let emitter = Arc::new(NullEmitter::new());
-                let (sender, runner) = Hub::new()
+                let (_, sender, runner) = Hub::new()
                     .buffer_capacity(2000)
                     .middleware(Transform::new(|mut msg| {
                         msg.metadata_mut().insert("processed".into(), "true".into());
@@ -171,7 +171,7 @@ fn bench_hub_with_middleware(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let emitter = Arc::new(NullEmitter::new());
-                let (sender, runner) = Hub::new()
+                let (_, sender, runner) = Hub::new()
                     .buffer_capacity(2000)
                     .middleware(Filter::new(|_| true))
                     .middleware(Transform::new(|msg| msg))
@@ -209,7 +209,7 @@ fn bench_hot_path(c: &mut Criterion) {
     group.bench_function("prewarmed_10k", |b| {
         // Setup once outside iterations
         let emitter = Arc::new(NullEmitter::new());
-        let (sender, runner) = Hub::new()
+        let (_, sender, runner) = Hub::new()
             .buffer_capacity(50_000)
             .batch_size(1000) // Larger batches
             .flush_interval_ms(1) // Fast flush - 1ms instead of 10ms
@@ -245,7 +245,7 @@ fn bench_hot_path(c: &mut Criterion) {
     // Compare with try_send (non-blocking)
     group.bench_function("try_send_10k", |b| {
         let emitter = Arc::new(NullEmitter::new());
-        let (sender, runner) = Hub::new()
+        let (_, sender, runner) = Hub::new()
             .buffer_capacity(100_000) // Larger buffer for try_send
             .batch_size(1000)
             .flush_interval_ms(1)

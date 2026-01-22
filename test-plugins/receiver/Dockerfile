@@ -1,22 +1,20 @@
-# Build stage - using nightly for edition2024
+# Build stage
 FROM rustlang/rust:nightly-bookworm-slim AS builder
 
 WORKDIR /app
 
-# Install build dependencies
 RUN apt-get update && apt-get install -y protobuf-compiler pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 
-# Copy workspace files (only production crates, not test infrastructure)
+# Copy workspace files needed for build
 COPY Cargo.lock ./
 COPY core/ core/
-COPY gateway/ gateway/
-COPY ci/ ci/
+COPY test-plugins/receiver/ test-plugins/receiver/
 
-# Create minimal workspace Cargo.toml for build (excludes test crates with external deps)
+# Create minimal workspace Cargo.toml for build
 RUN printf '%s\n' \
     '[workspace]' \
     'resolver = "2"' \
-    'members = ["core", "gateway", "ci"]' \
+    'members = ["core", "test-plugins/receiver"]' \
     '' \
     '[workspace.package]' \
     'version = "0.1.0"' \
@@ -40,17 +38,17 @@ RUN printf '%s\n' \
     'opt-level = 3' \
     'strip = true' > Cargo.toml
 
-# Build release binary with AHTI emitter support
-RUN cargo build --release --package polku-gateway --features ahti
+# Build release binary
+RUN cargo build --release --package polku-test-receiver
 
 # Runtime stage
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/polku-gateway /usr/local/bin/polku-gateway
+COPY --from=builder /app/target/release/polku-test-receiver /usr/local/bin/polku-test-receiver
 
 USER nobody:nogroup
-EXPOSE 50051
+EXPOSE 9001
 
-ENTRYPOINT ["polku-gateway"]
+ENTRYPOINT ["polku-test-receiver"]

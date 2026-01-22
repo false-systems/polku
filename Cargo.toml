@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "gateway", "ci"]
+members = ["core", "gateway", "ci", "test-plugins/receiver", "tests/e2e"]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,0 +1,22 @@
+[package]
+name = "polku-e2e"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+seppo = { path = "../../../seppo" }
+polku-core = { path = "../../core" }
+tokio = { version = "1", features = ["full"] }
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+futures = "0.3"
+k8s-openapi = { version = "0.26", features = ["v1_30"] }
+
+[build-dependencies]
+tonic-build = "0.12"
