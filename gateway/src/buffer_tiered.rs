@@ -27,7 +27,7 @@ use crate::message::Message;
 use crate::metrics::Metrics;
 use bytes::Bytes;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Compressed batch of messages stored in secondary buffer
@@ -61,8 +61,8 @@ pub struct BatchAccumulator {
     /// Maximum time to hold messages before forcing flush
     max_age: Duration,
     /// Timestamp when first message was added to current batch (nanos since start)
-    /// 0 means no messages pending
-    first_message_time: AtomicI64,
+    /// 0 means no messages pending. Uses u64 to avoid overflow for long uptimes.
+    first_message_time: AtomicU64,
     /// Reference instant for time calculations
     start: Instant,
 }
@@ -78,7 +78,7 @@ impl BatchAccumulator {
             messages: Mutex::new(Vec::with_capacity(batch_size)),
             batch_size: batch_size.max(1), // At least 1
             max_age,
-            first_message_time: AtomicI64::new(0),
+            first_message_time: AtomicU64::new(0),
             start: Instant::now(),
         }
     }
@@ -92,7 +92,7 @@ impl BatchAccumulator {
 
         // Track first message time
         if messages.is_empty() {
-            let now_nanos = self.start.elapsed().as_nanos() as i64;
+            let now_nanos = self.start.elapsed().as_nanos() as u64;
             self.first_message_time.store(now_nanos, Ordering::Release);
         }
 
@@ -137,9 +137,11 @@ impl BatchAccumulator {
             return false; // No messages pending
         }
 
-        let now_nanos = self.start.elapsed().as_nanos() as i64;
+        // Use u64 throughout to avoid overflow issues with long uptimes
+        let now_nanos = self.start.elapsed().as_nanos() as u64;
         let age_nanos = now_nanos.saturating_sub(first_time);
-        let max_age_nanos = self.max_age.as_nanos() as i64;
+        // Clamp max_age to u64::MAX to handle extreme Duration values safely
+        let max_age_nanos = self.max_age.as_nanos().min(u64::MAX as u128) as u64;
 
         age_nanos >= max_age_nanos
     }
@@ -179,6 +181,10 @@ pub struct TieredMetrics {
     pub bytes_saved: AtomicU64,
     /// Messages dropped (both tiers full)
     pub dropped: AtomicU64,
+    /// Messages lost due to decode failures during drain
+    pub decode_failed: AtomicU64,
+    /// Logical message count in secondary (not batch count)
+    pub secondary_messages: AtomicU64,
 }
 
 impl Default for TieredMetrics {
@@ -188,6 +194,8 @@ impl Default for TieredMetrics {
             overflowed: AtomicU64::new(0),
             bytes_saved: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
+            decode_failed: AtomicU64::new(0),
+            secondary_messages: AtomicU64::new(0),
         }
     }
 }
@@ -260,6 +268,9 @@ impl TieredBuffer {
     ///
     /// Drains primary (oldest) first, then secondary (overflow/newer).
     /// Flushes any pending accumulator messages before draining secondary.
+    ///
+    /// Note: May return slightly more than `n` messages when a compressed batch
+    /// is decompressed, as we don't split batches mid-decompression.
     pub fn drain(&self, n: usize) -> Vec<Message> {
         let mut result = Vec::with_capacity(n);
 
@@ -269,28 +280,83 @@ impl TieredBuffer {
             return result;
         }
 
-        // Flush accumulator to secondary before draining
-        // This ensures we don't skip pending messages
+        // Flush accumulator - if store fails, return messages directly to avoid loss
         if let Some(batch) = self.accumulator.flush() {
-            self.store_compressed_batch(batch);
+            if !self.store_compressed_batch_internal(&batch) {
+                // Store failed - return batch messages directly to avoid data loss
+                result.extend(batch);
+                if result.len() >= n {
+                    return result;
+                }
+            }
         }
 
         // Then drain from secondary (newer overflow, compressed)
-        let remaining = n - result.len();
+        let remaining = n.saturating_sub(result.len());
+        if remaining == 0 {
+            return result;
+        }
+
         let secondary_msgs = self.secondary.drain(remaining);
         let drained_from_secondary = !secondary_msgs.is_empty();
 
         for wrapper in secondary_msgs {
+            // Parse batch count from message_type for tracking
+            let expected_count = wrapper
+                .message_type
+                .strip_prefix("batch.")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(1);
+
             if wrapper.source == "compressed_batch" {
                 // New batch format - decompress entire batch
-                if let Ok(decompressed) = zstd::decode_all(wrapper.payload.as_ref()) {
-                    let batch_messages = self.deserialize_batch(&decompressed);
-                    result.extend(batch_messages);
+                match zstd::decode_all(wrapper.payload.as_ref()) {
+                    Ok(decompressed) => {
+                        let batch_messages = self.deserialize_batch(&decompressed);
+                        let recovered = batch_messages.len();
+                        // Track any messages lost during deserialization
+                        if recovered < expected_count {
+                            let lost = (expected_count - recovered) as u64;
+                            self.metrics.decode_failed.fetch_add(lost, Ordering::Relaxed);
+                            tracing::warn!(
+                                expected = expected_count,
+                                recovered = recovered,
+                                "Partial batch recovery during drain"
+                            );
+                        }
+                        // Update secondary_messages counter
+                        self.metrics
+                            .secondary_messages
+                            .fetch_sub(recovered as u64, Ordering::Relaxed);
+                        result.extend(batch_messages);
+                    }
+                    Err(e) => {
+                        // Decode failed - track and log
+                        self.metrics
+                            .decode_failed
+                            .fetch_add(expected_count as u64, Ordering::Relaxed);
+                        self.metrics
+                            .secondary_messages
+                            .fetch_sub(expected_count as u64, Ordering::Relaxed);
+                        tracing::error!(
+                            count = expected_count,
+                            error = %e,
+                            "Failed to decompress batch during drain"
+                        );
+                    }
                 }
             } else if wrapper.source == "compressed" {
                 // Legacy single-message format
-                if let Some(msg) = self.decompress_message(&wrapper) {
-                    result.push(msg);
+                match self.decompress_message(&wrapper) {
+                    Some(msg) => {
+                        self.metrics.secondary_messages.fetch_sub(1, Ordering::Relaxed);
+                        result.push(msg);
+                    }
+                    None => {
+                        self.metrics.decode_failed.fetch_add(1, Ordering::Relaxed);
+                        self.metrics.secondary_messages.fetch_sub(1, Ordering::Relaxed);
+                        tracing::error!("Failed to decompress legacy message during drain");
+                    }
                 }
             } else {
                 result.push(wrapper);
@@ -309,6 +375,54 @@ impl TieredBuffer {
         result
     }
 
+    /// Internal version that takes a reference to avoid moving the batch
+    fn store_compressed_batch_internal(&self, messages: &[Message]) -> bool {
+        if messages.is_empty() {
+            return true;
+        }
+
+        let count = messages.len();
+        let first_id = messages[0].id;
+        let first_timestamp = messages[0].timestamp;
+        let serialized = self.serialize_batch(messages);
+        let original_size = serialized.len();
+
+        match zstd::encode_all(serialized.as_slice(), self.compression_level) {
+            Ok(compressed) => {
+                let compressed_len = compressed.len();
+                let wrapper = Message::with_id(
+                    first_id,
+                    first_timestamp,
+                    "compressed_batch",
+                    format!("batch.{count}"),
+                    Bytes::from(compressed),
+                );
+
+                if self.secondary.push(wrapper) {
+                    self.metrics
+                        .overflowed
+                        .fetch_add(count as u64, Ordering::Relaxed);
+                    self.metrics
+                        .secondary_messages
+                        .fetch_add(count as u64, Ordering::Relaxed);
+                    let saved = original_size.saturating_sub(compressed_len);
+                    self.metrics
+                        .bytes_saved
+                        .fetch_add(saved as u64, Ordering::Relaxed);
+
+                    if let Some(m) = Metrics::get() {
+                        m.record_compression_savings(saved as u64);
+                        m.set_tiered_secondary_size(self.secondary.len());
+                    }
+                    true
+                } else {
+                    false // Let caller handle the messages
+                }
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Decompress a legacy single-message format
     fn decompress_message(&self, wrapper: &Message) -> Option<Message> {
         match zstd::decode_all(wrapper.payload.as_ref()) {
@@ -318,9 +432,19 @@ impl TieredBuffer {
     }
 
     /// Message serialization preserving all fields
+    ///
+    /// Format (all strings are length-prefixed with u32):
+    /// ```text
+    /// [id_len: u32][id: bytes]
+    /// [source_len: u32][source: bytes]
+    /// [type_len: u32][type: bytes]
+    /// [timestamp: i64]
+    /// [meta_count: u32][[key_len: u32][key][val_len: u32][val]]...
+    /// [route_count: u32][[route_len: u32][route]]...
+    /// [payload_len: u32][payload: bytes]
+    /// ```
     fn serialize_message(&self, msg: &Message) -> Vec<u8> {
         let mut buf = Vec::new();
-        // Format: id | source | type | timestamp | metadata_count | metadata[] | route_count | routes[] | payload
 
         // String helper: len(4) + bytes
         let write_str = |buf: &mut Vec<u8>, s: &str| {
@@ -383,6 +507,9 @@ impl TieredBuffer {
     /// Returns as many messages as could be successfully deserialized.
     /// Truncated or corrupted data returns partial results without panic.
     fn deserialize_batch(&self, data: &[u8]) -> Vec<Message> {
+        /// Hard limit on messages per batch to prevent CPU exhaustion on corrupted data
+        const MAX_BATCH_COUNT: usize = 10_000;
+
         let mut messages = Vec::new();
         let mut cursor = 0;
 
@@ -393,9 +520,9 @@ impl TieredBuffer {
         let count = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap_or([0; 4])) as usize;
         cursor += 4;
 
-        // Sanity check: don't try to allocate for impossibly large count
+        // Sanity check: apply hard cap and data-based limit
         let max_reasonable_count = data.len() / 10; // Each message is at least ~10 bytes
-        let count = count.min(max_reasonable_count.max(1000));
+        let count = count.min(max_reasonable_count).min(MAX_BATCH_COUNT);
 
         // Read each message
         for _ in 0..count {
@@ -593,9 +720,16 @@ impl TieredBuffer {
     /// Flush any pending messages in accumulator to secondary.
     ///
     /// Call this before shutdown to avoid losing messages.
-    pub fn flush_pending(&self) {
+    ///
+    /// Returns `true` if all pending messages were successfully stored in
+    /// the secondary buffer, or `false` if they were dropped due to
+    /// compression failure or a full secondary buffer.
+    pub fn flush_pending(&self) -> bool {
         if let Some(batch) = self.accumulator.flush() {
-            self.store_compressed_batch(batch);
+            self.store_compressed_batch(batch)
+        } else {
+            // Nothing to flush, so no messages are lost.
+            true
         }
     }
 
@@ -615,20 +749,26 @@ impl TieredBuffer {
 
         match zstd::encode_all(serialized.as_slice(), self.compression_level) {
             Ok(compressed) => {
+                // Capture length before moving compressed into Bytes
+                let compressed_len = compressed.len();
+
                 // Store as wrapper message with "compressed_batch" marker
                 let wrapper = Message::with_id(
                     first_id,
                     first_timestamp,
                     "compressed_batch", // New marker for batches
                     format!("batch.{count}"),
-                    Bytes::from(compressed.clone()),
+                    Bytes::from(compressed), // Move, don't clone
                 );
 
                 if self.secondary.push(wrapper) {
                     self.metrics
                         .overflowed
                         .fetch_add(count as u64, Ordering::Relaxed);
-                    let saved = original_size.saturating_sub(compressed.len());
+                    self.metrics
+                        .secondary_messages
+                        .fetch_add(count as u64, Ordering::Relaxed);
+                    let saved = original_size.saturating_sub(compressed_len);
                     self.metrics
                         .bytes_saved
                         .fetch_add(saved as u64, Ordering::Relaxed);
@@ -663,9 +803,14 @@ impl TieredBuffer {
         }
     }
 
-    /// Get total logical length (primary + secondary + accumulator)
+    /// Get total logical length (primary + secondary messages + accumulator)
+    ///
+    /// Note: Uses tracked message count for secondary tier (not batch count)
+    /// to provide accurate logical message count for flush logic.
     pub fn len(&self) -> usize {
-        self.primary.len() + self.secondary.len() + self.accumulator.len()
+        self.primary.len()
+            + self.metrics.secondary_messages.load(Ordering::Relaxed) as usize
+            + self.accumulator.len()
     }
 
     /// Check if all buffers are empty
@@ -686,6 +831,11 @@ impl TieredBuffer {
     /// Get total dropped messages
     pub fn total_dropped(&self) -> u64 {
         self.metrics.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Get total messages lost due to decode failures
+    pub fn total_decode_failed(&self) -> u64 {
+        self.metrics.decode_failed.load(Ordering::Relaxed)
     }
 
     /// Get primary buffer capacity
@@ -786,20 +936,14 @@ mod tests {
         fn test_accumulator_preserves_message_order() {
             let acc = BatchAccumulator::new(5, Duration::from_millis(100));
 
-            for i in 0..5 {
-                acc.push(make_message(&format!("msg-{i}"), 100));
-            }
-
-            // Won't return until we push the 5th, so push triggered batch
-            // Actually need to capture the return from last push
-            let acc = BatchAccumulator::new(5, Duration::from_millis(100));
+            // Push 4 messages, 5th triggers batch return
             acc.push(make_message("msg-0", 100));
             acc.push(make_message("msg-1", 100));
             acc.push(make_message("msg-2", 100));
             acc.push(make_message("msg-3", 100));
             let batch = acc.push(make_message("msg-4", 100)).unwrap();
 
-            // Verify order
+            // Verify order preserved
             assert_eq!(batch[0].id, "msg-0");
             assert_eq!(batch[1].id, "msg-1");
             assert_eq!(batch[2].id, "msg-2");
