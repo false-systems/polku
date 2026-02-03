@@ -7,6 +7,7 @@
 pub mod ahti;
 pub mod external;
 pub mod grpc;
+pub mod registry;
 pub mod resilience;
 pub mod stdout;
 pub mod webhook;
@@ -16,6 +17,7 @@ pub mod webhook;
 pub use polku_core::Emitter;
 pub use polku_core::Event;
 pub use polku_core::PluginError;
+pub use registry::EmitterRegistry;
 
 #[cfg(feature = "ahti")]
 pub use ahti::AhtiEmitter;
