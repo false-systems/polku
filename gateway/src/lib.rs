@@ -51,15 +51,20 @@ pub mod proto {
 
 pub use checkpoint::{CheckpointStore, MemoryCheckpointStore};
 pub use config::Config;
+pub use discovery::DiscoveryServer;
 pub use emit::Event;
 pub use emit::resilience::{
     BackoffConfig, CircuitBreakerConfig, CircuitBreakerEmitter, CircuitState, FailedEvent,
     FailureBuffer, FailureCaptureConfig, FailureCaptureEmitter, ResilientEmitter, RetryEmitter,
 };
-pub use emit::{Emitter, EmitterRegistry, ExternalEmitter, GrpcEmitter, StdoutEmitter, WebhookEmitter};
+pub use emit::{
+    Emitter, EmitterRegistry, ExternalEmitter, GrpcEmitter, StdoutEmitter, WebhookEmitter,
+};
 pub use error::{PluginError, PolkuError, Result};
 pub use hub::{BufferStrategy, Hub, HubBuffer, HubRunner, MessageSender, RawSender};
-pub use ingest::{ExternalIngestor, IngestContext, Ingestor, IngestorRegistry, JsonIngestor, PassthroughIngestor};
+pub use ingest::{
+    ExternalIngestor, IngestContext, Ingestor, IngestorRegistry, JsonIngestor, PassthroughIngestor,
+};
 pub use intern::InternedStr;
 pub use message::{Message, MessageId};
 pub use metrics_server::MetricsServer;
@@ -69,4 +74,3 @@ pub use middleware::{
     ValidationResult, Validator,
 };
 pub use registry::PluginRegistry;
-pub use discovery::DiscoveryServer;

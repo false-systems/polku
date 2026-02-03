@@ -317,7 +317,9 @@ impl TieredBuffer {
                         // Track any messages lost during deserialization
                         if recovered < expected_count {
                             let lost = (expected_count - recovered) as u64;
-                            self.metrics.decode_failed.fetch_add(lost, Ordering::Relaxed);
+                            self.metrics
+                                .decode_failed
+                                .fetch_add(lost, Ordering::Relaxed);
                             tracing::warn!(
                                 expected = expected_count,
                                 recovered = recovered,
@@ -349,12 +351,16 @@ impl TieredBuffer {
                 // Legacy single-message format
                 match self.decompress_message(&wrapper) {
                     Some(msg) => {
-                        self.metrics.secondary_messages.fetch_sub(1, Ordering::Relaxed);
+                        self.metrics
+                            .secondary_messages
+                            .fetch_sub(1, Ordering::Relaxed);
                         result.push(msg);
                     }
                     None => {
                         self.metrics.decode_failed.fetch_add(1, Ordering::Relaxed);
-                        self.metrics.secondary_messages.fetch_sub(1, Ordering::Relaxed);
+                        self.metrics
+                            .secondary_messages
+                            .fetch_sub(1, Ordering::Relaxed);
                         tracing::error!("Failed to decompress legacy message during drain");
                     }
                 }
@@ -517,7 +523,8 @@ impl TieredBuffer {
         if cursor + 4 > data.len() {
             return messages;
         }
-        let count = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap_or([0; 4])) as usize;
+        let count =
+            u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap_or([0; 4])) as usize;
         cursor += 4;
 
         // Sanity check: apply hard cap and data-based limit
@@ -871,7 +878,13 @@ mod tests {
         timestamp: i64,
         payload: &[u8],
     ) -> Message {
-        Message::with_id(id, timestamp, source, msg_type, Bytes::from(payload.to_vec()))
+        Message::with_id(
+            id,
+            timestamp,
+            source,
+            msg_type,
+            Bytes::from(payload.to_vec()),
+        )
     }
 
     // ==========================================================================
@@ -1166,7 +1179,9 @@ mod tests {
         #[test]
         fn test_deserialize_truncated_data_returns_partial() {
             let buffer = TieredBuffer::new(10, 10, 5);
-            let messages: Vec<Message> = (0..3).map(|i| make_message(&format!("m{i}"), 100)).collect();
+            let messages: Vec<Message> = (0..3)
+                .map(|i| make_message(&format!("m{i}"), 100))
+                .collect();
 
             let serialized = buffer.serialize_batch(&messages);
 
@@ -1424,8 +1439,8 @@ mod tests {
 
         #[test]
         fn test_with_max_batch_age_builder() {
-            let buffer = TieredBuffer::new(10, 10, 100)
-                .with_max_batch_age(Duration::from_millis(50));
+            let buffer =
+                TieredBuffer::new(10, 10, 100).with_max_batch_age(Duration::from_millis(50));
 
             // Fill primary
             for i in 0..10 {

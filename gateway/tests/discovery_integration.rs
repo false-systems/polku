@@ -6,7 +6,9 @@
 use polku_gateway::discovery::DiscoveryServer;
 use polku_gateway::proto::plugin_registry_client::PluginRegistryClient;
 use polku_gateway::proto::plugin_registry_server::PluginRegistryServer;
-use polku_gateway::proto::{HeartbeatRequest, PluginInfo, PluginType, RegisterRequest, UnregisterRequest};
+use polku_gateway::proto::{
+    HeartbeatRequest, PluginInfo, PluginType, RegisterRequest, UnregisterRequest,
+};
 use polku_gateway::registry::PluginRegistry as StaticRegistry;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -35,7 +37,9 @@ async fn start_discovery_server() -> DiscoveryTestHandle {
             .add_service(PluginRegistryServer::new(discovery))
             .serve_with_incoming_shutdown(
                 tokio_stream::wrappers::TcpListenerStream::new(listener),
-                async move { shutdown_rx.await.ok(); },
+                async move {
+                    shutdown_rx.await.ok();
+                },
             )
             .await
             .ok();
@@ -247,7 +251,10 @@ async fn test_discovery_heartbeat_stale_id() {
         .unwrap()
         .into_inner();
 
-    assert!(!heartbeat_resp.acknowledged, "Stale ID should not be acknowledged");
+    assert!(
+        !heartbeat_resp.acknowledged,
+        "Stale ID should not be acknowledged"
+    );
 
     // Plugin should re-register to recover
     let rereg_resp = client
@@ -365,9 +372,7 @@ async fn test_discovery_double_unregister() {
         .unwrap();
 
     // Second unregister - should be idempotent
-    let result = client
-        .unregister(UnregisterRequest { plugin_id })
-        .await;
+    let result = client.unregister(UnregisterRequest { plugin_id }).await;
 
     assert!(result.is_ok(), "Double unregister should be idempotent");
 

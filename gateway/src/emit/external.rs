@@ -291,7 +291,10 @@ mod tests {
             }))
         }
 
-        async fn emit(&self, request: Request<EmitRequest>) -> Result<Response<EmitResponse>, Status> {
+        async fn emit(
+            &self,
+            request: Request<EmitRequest>,
+        ) -> Result<Response<EmitResponse>, Status> {
             // Check if we should return an error
             if let Some(ref msg) = self.error_message {
                 return Err(Status::internal(msg.clone()));
@@ -445,9 +448,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_partial_failure() {
-        let (addr, _shutdown) =
-            start_mock_server(MockEmitterPlugin::with_failing_events(vec!["evt-2".to_string()]))
-                .await;
+        let (addr, _shutdown) = start_mock_server(MockEmitterPlugin::with_failing_events(vec![
+            "evt-2".to_string(),
+        ]))
+        .await;
 
         let emitter = ExternalEmitter::new("test", format!("http://{}", addr));
 

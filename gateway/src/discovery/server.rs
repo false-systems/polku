@@ -7,8 +7,8 @@ use crate::emit::ExternalEmitter;
 use crate::ingest::ExternalIngestor;
 use crate::proto::plugin_registry_server::PluginRegistry;
 use crate::proto::{
-    HeartbeatRequest, HeartbeatResponse, PluginInfo, PluginType, RegisterRequest,
-    RegisterResponse, UnregisterRequest,
+    HeartbeatRequest, HeartbeatResponse, PluginInfo, PluginType, RegisterRequest, RegisterResponse,
+    UnregisterRequest,
 };
 use crate::registry::PluginRegistry as StaticRegistry;
 use parking_lot::RwLock;
@@ -86,7 +86,9 @@ impl PluginRegistry for DiscoveryServer {
         request: Request<RegisterRequest>,
     ) -> Result<Response<RegisterResponse>, Status> {
         let req = request.into_inner();
-        let info = req.info.ok_or_else(|| Status::invalid_argument("Missing plugin info"))?;
+        let info = req
+            .info
+            .ok_or_else(|| Status::invalid_argument("Missing plugin info"))?;
         let address = req.address;
 
         // Validate plugin info
@@ -97,8 +99,7 @@ impl PluginRegistry for DiscoveryServer {
             return Err(Status::invalid_argument("Plugin address is required"));
         }
 
-        let plugin_type = PluginType::try_from(info.r#type)
-            .unwrap_or(PluginType::Unspecified);
+        let plugin_type = PluginType::try_from(info.r#type).unwrap_or(PluginType::Unspecified);
 
         // Generate unique ID
         let plugin_id = Self::generate_plugin_id();
@@ -191,7 +192,9 @@ impl PluginRegistry for DiscoveryServer {
             Ok(Response::new(HeartbeatResponse { acknowledged: true }))
         } else {
             warn!(plugin_id = %plugin_id, "Heartbeat for unknown plugin");
-            Ok(Response::new(HeartbeatResponse { acknowledged: false }))
+            Ok(Response::new(HeartbeatResponse {
+                acknowledged: false,
+            }))
         }
     }
 
@@ -272,7 +275,10 @@ mod tests {
         let server = create_test_server();
 
         let request = Request::new(RegisterRequest {
-            info: Some(make_ingestor_info("my-ingestor", vec!["source-a", "source-b"])),
+            info: Some(make_ingestor_info(
+                "my-ingestor",
+                vec!["source-a", "source-b"],
+            )),
             address: "http://localhost:9001".to_string(),
         });
 

@@ -164,10 +164,7 @@ mod tests {
 
     impl MockIngestor {
         fn named(name: &'static str) -> Self {
-            Self {
-                name,
-                sources: &[],
-            }
+            Self { name, sources: &[] }
         }
 
         fn with_sources(sources: &'static [&'static str]) -> Self {

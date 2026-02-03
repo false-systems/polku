@@ -14,8 +14,8 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::info;
@@ -26,8 +26,8 @@ pub mod proto {
 
 use proto::gateway_server::{Gateway, GatewayServer};
 use proto::{
-    Ack, AckError, ComponentHealth, HealthRequest, HealthResponse,
-    IngestBatch, IngestEvent, ingest_batch, ingest_event,
+    Ack, AckError, ComponentHealth, HealthRequest, HealthResponse, IngestBatch, IngestEvent,
+    ingest_batch, ingest_event,
 };
 
 /// Storage for received events - uses polku_core::Event directly
@@ -296,8 +296,7 @@ pub async fn start_server(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
