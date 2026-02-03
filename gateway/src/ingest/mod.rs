@@ -22,10 +22,12 @@
 mod external;
 mod json;
 mod passthrough;
+mod registry;
 
 pub use external::ExternalIngestor;
 pub use json::JsonIngestor;
 pub use passthrough::PassthroughIngestor;
+pub use registry::IngestorRegistry;
 
 use crate::emit::Event;
 use crate::error::PluginError;
