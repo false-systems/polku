@@ -91,6 +91,7 @@ impl LockFreeBuffer {
     ///
     /// Returns Ok(()) if pushed successfully, Err(msg) if buffer is full.
     /// This allows callers to handle overflow without cloning upfront.
+    #[allow(clippy::result_large_err)]
     pub fn try_push(&self, msg: Message) -> Result<(), Message> {
         match self.queue.push(msg) {
             Ok(()) => {

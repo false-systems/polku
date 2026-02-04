@@ -414,6 +414,7 @@ impl Emitter for GrpcEmitter {
                     last_error = Some(e);
 
                     // Record failover (not first attempt)
+                    #[allow(clippy::collapsible_if)]
                     if attempts > 1 {
                         if let Some(m) = Metrics::get() {
                             m.record_grpc_failover();

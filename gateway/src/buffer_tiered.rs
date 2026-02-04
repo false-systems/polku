@@ -248,6 +248,7 @@ impl TieredBuffer {
 
         // Primary full - add to accumulator for batch compression
         // Check if we should flush due to age first
+        #[allow(clippy::collapsible_if)]
         if self.accumulator.should_flush_by_age() {
             if let Some(batch) = self.accumulator.flush() {
                 self.store_compressed_batch(batch);
@@ -281,6 +282,7 @@ impl TieredBuffer {
         }
 
         // Flush accumulator - if store fails, return messages directly to avoid loss
+        #[allow(clippy::collapsible_if)]
         if let Some(batch) = self.accumulator.flush() {
             if !self.store_compressed_batch_internal(&batch) {
                 // Store failed - return batch messages directly to avoid data loss
@@ -862,6 +864,7 @@ impl TieredBuffer {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -1069,7 +1072,7 @@ mod tests {
             let buffer = TieredBuffer::new(10, 10, 5);
             let msg = make_message_with_fields("id-1", "svc-a", "evt.created", 12345, b"payload");
 
-            let serialized = buffer.serialize_batch(&[msg.clone()]);
+            let serialized = buffer.serialize_batch(std::slice::from_ref(&msg));
             let deserialized = buffer.deserialize_batch(&serialized);
 
             assert_eq!(deserialized.len(), 1);
