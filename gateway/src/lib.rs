@@ -42,6 +42,7 @@ pub mod proto {
     #![allow(clippy::expect_used)]
     #![allow(clippy::panic)]
     #![allow(clippy::derive_partial_eq_without_eq)]
+    #![allow(clippy::large_enum_variant)]
 
     include!("proto/polku.v1.rs");
 

@@ -248,10 +248,10 @@ impl TieredBuffer {
 
         // Primary full - add to accumulator for batch compression
         // Check if we should flush due to age first
-        if self.accumulator.should_flush_by_age() {
-            if let Some(batch) = self.accumulator.flush() {
-                self.store_compressed_batch(batch);
-            }
+        if self.accumulator.should_flush_by_age()
+            && let Some(batch) = self.accumulator.flush()
+        {
+            self.store_compressed_batch(batch);
         }
 
         // Now add the message to accumulator
@@ -281,13 +281,13 @@ impl TieredBuffer {
         }
 
         // Flush accumulator - if store fails, return messages directly to avoid loss
-        if let Some(batch) = self.accumulator.flush() {
-            if !self.store_compressed_batch_internal(&batch) {
-                // Store failed - return batch messages directly to avoid data loss
-                result.extend(batch);
-                if result.len() >= n {
-                    return result;
-                }
+        if let Some(batch) = self.accumulator.flush()
+            && !self.store_compressed_batch_internal(&batch)
+        {
+            // Store failed - return batch messages directly to avoid data loss
+            result.extend(batch);
+            if result.len() >= n {
+                return result;
             }
         }
 
@@ -862,6 +862,11 @@ impl TieredBuffer {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::cloned_ref_to_slice_refs
+)]
 mod tests {
     use super::*;
     use std::time::Duration;

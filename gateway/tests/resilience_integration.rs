@@ -3,7 +3,12 @@
 //! These tests verify that resilience wrappers work correctly together
 //! and integrate properly with the Hub.
 
-#![allow(clippy::unwrap_used, clippy::len_zero)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::len_zero,
+    clippy::inconsistent_digit_grouping
+)]
 
 use async_trait::async_trait;
 use bytes::Bytes;

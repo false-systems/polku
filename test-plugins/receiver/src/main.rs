@@ -20,6 +20,7 @@ use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::info;
 
+#[allow(clippy::large_enum_variant)]
 pub mod proto {
     include!("proto/polku.v1.rs");
 }

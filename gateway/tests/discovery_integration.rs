@@ -3,6 +3,13 @@
 //! Tests for the plugin discovery/registration protocol.
 //! These test the actual DiscoveryServer implementation.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::redundant_locals
+)]
+
 use polku_gateway::discovery::DiscoveryServer;
 use polku_gateway::proto::plugin_registry_client::PluginRegistryClient;
 use polku_gateway::proto::plugin_registry_server::PluginRegistryServer;

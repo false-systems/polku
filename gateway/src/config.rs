@@ -130,10 +130,10 @@ impl Config {
             config.emit_grpc_lazy = lazy.to_lowercase() == "true" || lazy == "1";
         }
 
-        if let Ok(endpoint) = env::var("POLKU_EMIT_AHTI_ENDPOINT") {
-            if !endpoint.is_empty() {
-                config.emit_ahti_endpoint = Some(endpoint);
-            }
+        if let Ok(endpoint) = env::var("POLKU_EMIT_AHTI_ENDPOINT")
+            && !endpoint.is_empty()
+        {
+            config.emit_ahti_endpoint = Some(endpoint);
         }
 
         Ok(config)
