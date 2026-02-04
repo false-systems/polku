@@ -864,11 +864,7 @@ impl TieredBuffer {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::cloned_ref_to_slice_refs
-)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -1076,7 +1072,7 @@ mod tests {
             let buffer = TieredBuffer::new(10, 10, 5);
             let msg = make_message_with_fields("id-1", "svc-a", "evt.created", 12345, b"payload");
 
-            let serialized = buffer.serialize_batch(&[msg.clone()]);
+            let serialized = buffer.serialize_batch(std::slice::from_ref(&msg));
             let deserialized = buffer.deserialize_batch(&serialized);
 
             assert_eq!(deserialized.len(), 1);
