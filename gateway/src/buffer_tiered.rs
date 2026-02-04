@@ -248,10 +248,11 @@ impl TieredBuffer {
 
         // Primary full - add to accumulator for batch compression
         // Check if we should flush due to age first
-        if self.accumulator.should_flush_by_age()
-            && let Some(batch) = self.accumulator.flush()
-        {
-            self.store_compressed_batch(batch);
+        #[allow(clippy::collapsible_if)]
+        if self.accumulator.should_flush_by_age() {
+            if let Some(batch) = self.accumulator.flush() {
+                self.store_compressed_batch(batch);
+            }
         }
 
         // Now add the message to accumulator
@@ -281,13 +282,14 @@ impl TieredBuffer {
         }
 
         // Flush accumulator - if store fails, return messages directly to avoid loss
-        if let Some(batch) = self.accumulator.flush()
-            && !self.store_compressed_batch_internal(&batch)
-        {
-            // Store failed - return batch messages directly to avoid data loss
-            result.extend(batch);
-            if result.len() >= n {
-                return result;
+        #[allow(clippy::collapsible_if)]
+        if let Some(batch) = self.accumulator.flush() {
+            if !self.store_compressed_batch_internal(&batch) {
+                // Store failed - return batch messages directly to avoid data loss
+                result.extend(batch);
+                if result.len() >= n {
+                    return result;
+                }
             }
         }
 
