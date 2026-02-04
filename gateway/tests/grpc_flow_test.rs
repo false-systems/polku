@@ -5,17 +5,17 @@
 
 use async_trait::async_trait;
 use polku_gateway::{
-    proto::{gateway_client::GatewayClient, IngestEvent, ingest_event},
-    buffer::RingBuffer,
-    server::GatewayService,
-    hub::Hub,
     Emitter, Event, PluginError,
+    buffer::RingBuffer,
+    hub::Hub,
+    proto::{IngestEvent, gateway_client::GatewayClient, ingest_event},
     registry::PluginRegistry,
+    server::GatewayService,
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tonic::transport::Server;
@@ -71,7 +71,8 @@ impl Emitter for CollectingEmitter {
 // Test Helpers
 // ============================================================================
 
-async fn start_server_with_collector() -> (SocketAddr, CollectingEmitter, tokio::task::JoinHandle<()>) {
+async fn start_server_with_collector()
+-> (SocketAddr, CollectingEmitter, tokio::task::JoinHandle<()>) {
     let collector = CollectingEmitter::new();
 
     // Create Hub with collector
@@ -130,7 +131,9 @@ fn make_event(id: &str, source: &str, event_type: &str, payload: &str) -> Event 
 fn make_ebpf_event(id: usize, syscall: &str) -> Event {
     let payload = format!(
         r#"{{"syscall":"{}","pid":{},"tid":{},"retval":0}}"#,
-        syscall, id % 10000, id % 10000 + 1
+        syscall,
+        id % 10000,
+        id % 10000 + 1
     );
     make_event(
         &format!("ebpf-{}", id),
@@ -203,12 +206,21 @@ async fn test_grpc_100_events_flow_through() {
     let collected = collector.collected();
     eprintln!("Sent 100, received {}", collected.len());
 
-    assert_eq!(collected.len(), 100, "Expected 100 events, got {}", collected.len());
+    assert_eq!(
+        collected.len(),
+        100,
+        "Expected 100 events, got {}",
+        collected.len()
+    );
 
     // Verify content
     for (i, event) in collected.iter().enumerate() {
         assert_eq!(event.source, "ebpf.raw", "Event {} wrong source", i);
-        assert!(event.event_type.starts_with("syscall."), "Event {} wrong type", i);
+        assert!(
+            event.event_type.starts_with("syscall."),
+            "Event {} wrong type",
+            i
+        );
     }
 }
 
@@ -225,7 +237,12 @@ async fn test_grpc_20k_events_with_broken() {
     let broken_count = 1_000usize;
     let syscalls = ["read", "write", "open", "close", "stat", "mmap", "execve"];
 
-    eprintln!("Sending {} events ({} valid, {} broken)...", total, total - broken_count, broken_count);
+    eprintln!(
+        "Sending {} events ({} valid, {} broken)...",
+        total,
+        total - broken_count,
+        broken_count
+    );
 
     let mut sent = 0;
     let mut errors = 0;
@@ -271,7 +288,13 @@ async fn test_grpc_20k_events_with_broken() {
     eprintln!("Valid: {}, Broken: {}", valid_count, broken_count);
 
     // All sent events should arrive (gateway accepts all valid protobuf)
-    assert_eq!(collected.len(), sent, "Lost events! sent={} collected={}", sent, collected.len());
+    assert_eq!(
+        collected.len(),
+        sent,
+        "Lost events! sent={} collected={}",
+        sent,
+        collected.len()
+    );
 }
 
 /// High throughput: 50k events as fast as possible
@@ -302,7 +325,10 @@ async fn test_grpc_50k_throughput() {
 
     let send_time = start.elapsed();
     let send_rate = total as f64 / send_time.as_secs_f64();
-    eprintln!("Sent {} in {:?} ({:.0} events/sec)", total, send_time, send_rate);
+    eprintln!(
+        "Sent {} in {:?} ({:.0} events/sec)",
+        total, send_time, send_rate
+    );
 
     // Wait for processing
     tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -316,7 +342,11 @@ async fn test_grpc_50k_throughput() {
     // Verify we got most events
     let received_pct = (collected as f64 / total as f64) * 100.0;
     eprintln!("Received {:.1}% of events", received_pct);
-    assert!(received_pct > 95.0, "Lost too many events: only {:.1}% received", received_pct);
+    assert!(
+        received_pct > 95.0,
+        "Lost too many events: only {:.1}% received",
+        received_pct
+    );
 }
 
 /// Concurrent clients sending events
@@ -327,7 +357,10 @@ async fn test_grpc_concurrent_clients() {
     let num_clients = 4;
     let events_per_client = 1000;
 
-    eprintln!("Starting {} concurrent clients, {} events each", num_clients, events_per_client);
+    eprintln!(
+        "Starting {} concurrent clients, {} events each",
+        num_clients, events_per_client
+    );
 
     let mut handles = vec![];
 
@@ -377,7 +410,8 @@ async fn test_grpc_concurrent_clients() {
 
     // Count by client
     for client_id in 0..num_clients {
-        let count = collected.iter()
+        let count = collected
+            .iter()
             .filter(|e| e.source == format!("client-{}", client_id))
             .count();
         eprintln!("  Client {}: {} events", client_id, count);
@@ -422,7 +456,10 @@ async fn test_grpc_content_integrity() {
     // Debug: print what we actually received
     eprintln!("Collected {} events:", collected.len());
     for (i, e) in collected.iter().enumerate() {
-        eprintln!("  [{}] id='{}' source='{}' type='{}'", i, e.id, e.source, e.event_type);
+        eprintln!(
+            "  [{}] id='{}' source='{}' type='{}'",
+            i, e.id, e.source, e.event_type
+        );
     }
 
     assert_eq!(collected.len(), 4, "Expected 4 events");
@@ -443,7 +480,8 @@ async fn test_grpc_content_integrity() {
         assert_eq!(
             String::from_utf8_lossy(&event.payload),
             *payload,
-            "Wrong payload for id={}", id
+            "Wrong payload for id={}",
+            id
         );
     }
 

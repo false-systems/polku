@@ -1775,7 +1775,12 @@ mod tests {
             }
 
             let drained = buffer.drain(1000);
-            assert_eq!(drained.len(), 50, "Expected 50 messages, got {}", drained.len());
+            assert_eq!(
+                drained.len(),
+                50,
+                "Expected 50 messages, got {}",
+                drained.len()
+            );
         }
 
         /// Push N, drain partial, push more, drain all - nothing lost
@@ -1799,7 +1804,12 @@ mod tests {
 
             // Drain all remaining
             let batch2 = buffer.drain(1000);
-            assert_eq!(batch2.len(), 40, "Expected 40 remaining (30-10+20), got {}", batch2.len());
+            assert_eq!(
+                batch2.len(),
+                40,
+                "Expected 40 remaining (30-10+20), got {}",
+                batch2.len()
+            );
         }
 
         /// Messages come out in FIFO order
@@ -1842,9 +1852,11 @@ mod tests {
 
             // Conservation law: everything we put in either comes out or was dropped
             assert_eq!(
-                drained.len() + dropped as usize, 10,
+                drained.len() + dropped as usize,
+                10,
                 "Conservation violated! drained={} dropped={} != 10",
-                drained.len(), dropped
+                drained.len(),
+                dropped
             );
 
             // Verify some were actually dropped (buffer is small)
@@ -1857,10 +1869,14 @@ mod tests {
             // Small primary forces overflow to secondary (compression path)
             let buffer = TieredBuffer::new(1, 100, 1);
 
-            let original = Message::new("test-source", "test.event.type", Bytes::from("test payload data"))
-                .with_metadata("key1", "value1")
-                .with_metadata("key2", "value2")
-                .with_routes(vec!["route1".into(), "route2".into()]);
+            let original = Message::new(
+                "test-source",
+                "test.event.type",
+                Bytes::from("test payload data"),
+            )
+            .with_metadata("key1", "value1")
+            .with_metadata("key2", "value2")
+            .with_routes(vec!["route1".into(), "route2".into()]);
 
             buffer.push(original.clone());
             buffer.push(original.clone()); // This one goes through compression
@@ -1873,8 +1889,14 @@ mod tests {
             assert_eq!(recovered.source, "test-source");
             assert_eq!(recovered.message_type, "test.event.type");
             assert_eq!(recovered.payload.as_ref(), b"test payload data");
-            assert_eq!(recovered.metadata().get("key1"), Some(&"value1".to_string()));
-            assert_eq!(recovered.metadata().get("key2"), Some(&"value2".to_string()));
+            assert_eq!(
+                recovered.metadata().get("key1"),
+                Some(&"value1".to_string())
+            );
+            assert_eq!(
+                recovered.metadata().get("key2"),
+                Some(&"value2".to_string())
+            );
             assert_eq!(recovered.route_to.len(), 2);
             assert_eq!(recovered.route_to[0], "route1");
             assert_eq!(recovered.route_to[1], "route2");
@@ -1899,8 +1921,16 @@ mod tests {
 
             let drained = buffer.drain(10);
             // Should get approximately 10, maybe more due to batch decompression
-            assert!(drained.len() >= 10, "Should drain at least 10, got {}", drained.len());
-            assert!(drained.len() <= 20, "Should not drain way more than limit, got {}", drained.len());
+            assert!(
+                drained.len() >= 10,
+                "Should drain at least 10, got {}",
+                drained.len()
+            );
+            assert!(
+                drained.len() <= 20,
+                "Should not drain way more than limit, got {}",
+                drained.len()
+            );
         }
 
         /// After drain, buffer length reflects remaining messages
@@ -2086,9 +2116,14 @@ mod tests {
                 // (unless batches caused slight overage)
                 let expected_after = before_len.saturating_sub(drained.len());
                 assert_eq!(
-                    after_len, expected_after,
+                    after_len,
+                    expected_after,
                     "Cycle {}: len was {}, drained {}, expected len {} but got {}",
-                    cycle, before_len, drained.len(), expected_after, after_len
+                    cycle,
+                    before_len,
+                    drained.len(),
+                    expected_after,
+                    after_len
                 );
             }
         }
@@ -2202,8 +2237,7 @@ mod tests {
             let buffer = TieredBuffer::new(1, 10, 1);
 
             let routes: Vec<String> = (0..50).map(|i| format!("route{i}")).collect();
-            let msg = Message::new("src", "type", Bytes::new())
-                .with_routes(routes.clone());
+            let msg = Message::new("src", "type", Bytes::new()).with_routes(routes.clone());
 
             buffer.push(msg.clone());
             buffer.push(msg); // Compression path
@@ -2242,10 +2276,18 @@ mod tests {
                         for i in 0..iterations {
                             // Mix of operations
                             match i % 4 {
-                                0 => { buf.push(make_message(&format!("t{t}-{i}"), 50)); }
-                                1 => { buf.drain(5); }
-                                2 => { buf.len(); }
-                                3 => { buf.flush_pending(); }
+                                0 => {
+                                    buf.push(make_message(&format!("t{t}-{i}"), 50));
+                                }
+                                1 => {
+                                    buf.drain(5);
+                                }
+                                2 => {
+                                    buf.len();
+                                }
+                                3 => {
+                                    buf.flush_pending();
+                                }
                                 _ => unreachable!(),
                             }
                         }
@@ -2316,7 +2358,9 @@ mod tests {
                 // Drain remaining
                 loop {
                     let batch = buffer.drain(1000);
-                    if batch.is_empty() { break; }
+                    if batch.is_empty() {
+                        break;
+                    }
                     drained.fetch_add(batch.len(), std::sync::atomic::Ordering::Relaxed);
                 }
 
@@ -2327,7 +2371,10 @@ mod tests {
                 if total_pushed != total_drained + dropped {
                     failures.push(format!(
                         "iter {}: pushed={} drained={} dropped={} (diff={})",
-                        iteration, total_pushed, total_drained, dropped,
+                        iteration,
+                        total_pushed,
+                        total_drained,
+                        dropped,
                         (total_pushed as i64) - ((total_drained + dropped) as i64)
                     ));
                 }
@@ -2356,17 +2403,27 @@ mod tests {
                 let mut total = 0;
                 loop {
                     let batch = buffer.drain(1000);
-                    if batch.is_empty() { break; }
+                    if batch.is_empty() {
+                        break;
+                    }
                     total += batch.len();
                 }
 
                 // Verify empty
-                assert!(buffer.is_empty(), "Cycle {}: Buffer not empty after drain", cycle);
+                assert!(
+                    buffer.is_empty(),
+                    "Cycle {}: Buffer not empty after drain",
+                    cycle
+                );
                 assert_eq!(buffer.len(), 0, "Cycle {}: len() not 0 after drain", cycle);
 
                 // Verify we got something (not all dropped)
                 let dropped = buffer.total_dropped();
-                assert!(total > 0 || dropped > 0, "Cycle {}: Got nothing and dropped nothing?", cycle);
+                assert!(
+                    total > 0 || dropped > 0,
+                    "Cycle {}: Got nothing and dropped nothing?",
+                    cycle
+                );
             }
         }
 
@@ -2383,9 +2440,11 @@ mod tests {
             let dropped = buffer.total_dropped();
 
             assert_eq!(
-                drained.len() + dropped as usize, 20,
+                drained.len() + dropped as usize,
+                20,
                 "batch_size=1: drained={} dropped={} != 20",
-                drained.len(), dropped
+                drained.len(),
+                dropped
             );
         }
 
@@ -2405,9 +2464,11 @@ mod tests {
             let dropped = buffer.total_dropped();
 
             assert_eq!(
-                drained.len() + dropped as usize, 50,
+                drained.len() + dropped as usize,
+                50,
                 "huge batch_size: drained={} dropped={} != 50",
-                drained.len(), dropped
+                drained.len(),
+                dropped
             );
         }
 
@@ -2447,7 +2508,11 @@ mod tests {
 
             // Fill primary exactly
             for i in 0..10 {
-                assert!(buffer.push(make_message(&format!("p{i}"), 50)), "Primary push {} failed", i);
+                assert!(
+                    buffer.push(make_message(&format!("p{i}"), 50)),
+                    "Primary push {} failed",
+                    i
+                );
             }
 
             // Next 10 should go to accumulator/secondary
@@ -2459,9 +2524,11 @@ mod tests {
             let dropped = buffer.total_dropped();
 
             assert_eq!(
-                drained.len() + dropped as usize, 20,
+                drained.len() + dropped as usize,
+                20,
                 "boundary: drained={} dropped={} != 20",
-                drained.len(), dropped
+                drained.len(),
+                dropped
             );
         }
 
@@ -2514,15 +2581,20 @@ mod tests {
             // Final drain
             loop {
                 let batch = buffer.drain(1000);
-                if batch.is_empty() { break; }
+                if batch.is_empty() {
+                    break;
+                }
                 total_drained += batch.len();
             }
 
             let dropped = buffer.total_dropped() as usize;
             assert_eq!(
-                total_pushed, total_drained + dropped,
+                total_pushed,
+                total_drained + dropped,
                 "burst: pushed={} drained={} dropped={}",
-                total_pushed, total_drained, dropped
+                total_pushed,
+                total_drained,
+                dropped
             );
         }
 
@@ -2577,7 +2649,9 @@ mod tests {
             let mut total_drained = 0;
             loop {
                 let batch = buffer.drain(1000);
-                if batch.is_empty() { break; }
+                if batch.is_empty() {
+                    break;
+                }
                 total_drained += batch.len();
             }
 
@@ -2600,16 +2674,19 @@ mod tests {
             let payload = if valid {
                 format!(
                     r#"{{"syscall":"{}","pid":{},"tid":{},"timestamp_ns":{},"retval":0}}"#,
-                    syscall, pid, pid + 1, id * 1000
+                    syscall,
+                    pid,
+                    pid + 1,
+                    id * 1000
                 )
             } else {
                 // Broken: missing fields, bad JSON, empty, etc.
                 match id % 5 {
-                    0 => String::new(),                          // empty payload
-                    1 => "{".to_string(),                        // truncated JSON
-                    2 => format!(r#"{{"broken":}}"#),            // invalid JSON
+                    0 => String::new(),                                            // empty payload
+                    1 => "{".to_string(),                                          // truncated JSON
+                    2 => format!(r#"{{"broken":}}"#),                              // invalid JSON
                     3 => String::from_utf8_lossy(&[0x00, 0xFF, 0xFE]).to_string(), // binary garbage
-                    _ => format!(r#"{{"pid":{}}}"#, pid),        // missing required fields
+                    _ => format!(r#"{{"pid":{}}}"#, pid), // missing required fields
                 }
             };
 
@@ -2664,7 +2741,10 @@ mod tests {
             let syscalls = ["read", "write", "open", "close", "stat", "mmap", "execve"];
             let mut expected_ids: Vec<usize> = Vec::with_capacity(total_events);
 
-            eprintln!("Pushing {} events ({} valid, {} broken)...", total_events, valid_count, broken_count);
+            eprintln!(
+                "Pushing {} events ({} valid, {} broken)...",
+                total_events, valid_count, broken_count
+            );
 
             // Push events - every 20th is broken
             for i in 0..total_events {
@@ -2685,21 +2765,29 @@ mod tests {
             let mut drained: Vec<Message> = Vec::new();
             loop {
                 let batch = buffer.drain(1000);
-                if batch.is_empty() { break; }
+                if batch.is_empty() {
+                    break;
+                }
                 drained.extend(batch);
             }
 
             let dropped = buffer.total_dropped() as usize;
             eprintln!(
                 "Results: drained={}, dropped={}, total={}",
-                drained.len(), dropped, drained.len() + dropped
+                drained.len(),
+                dropped,
+                drained.len() + dropped
             );
 
             // Verify count
             assert_eq!(
-                drained.len() + dropped, total_events,
+                drained.len() + dropped,
+                total_events,
                 "Event count mismatch: got {} + {} = {}, expected {}",
-                drained.len(), dropped, drained.len() + dropped, total_events
+                drained.len(),
+                dropped,
+                drained.len() + dropped,
+                total_events
             );
 
             // Verify content integrity on a sample
@@ -2764,7 +2852,9 @@ mod tests {
 
             loop {
                 let batch = buffer.drain(500);
-                if batch.is_empty() { break; }
+                if batch.is_empty() {
+                    break;
+                }
 
                 for msg in batch {
                     if msg.source.starts_with("ebpf") {
@@ -2789,16 +2879,23 @@ mod tests {
 
             // Verify totals
             assert_eq!(
-                drained_ebpf + drained_ahti + dropped, 10_000,
+                drained_ebpf + drained_ahti + dropped,
+                10_000,
                 "Count mismatch"
             );
 
             // Verify routes preserved
             if drained_ahti > 0 {
-                assert!(route_counts.get("kafka").unwrap_or(&0) > &0, "Ahti events should have kafka route");
+                assert!(
+                    route_counts.get("kafka").unwrap_or(&0) > &0,
+                    "Ahti events should have kafka route"
+                );
             }
             if drained_ebpf > 0 {
-                assert!(route_counts.get("analytics").unwrap_or(&0) > &0, "eBPF events should have analytics route");
+                assert!(
+                    route_counts.get("analytics").unwrap_or(&0) > &0,
+                    "eBPF events should have analytics route"
+                );
             }
         }
 
@@ -2818,7 +2915,11 @@ mod tests {
             }
 
             let push_time = start.elapsed();
-            eprintln!("Push complete in {:?} ({:.0} events/sec)", push_time, total as f64 / push_time.as_secs_f64());
+            eprintln!(
+                "Push complete in {:?} ({:.0} events/sec)",
+                push_time,
+                total as f64 / push_time.as_secs_f64()
+            );
 
             buffer.flush_pending();
 
@@ -2827,7 +2928,9 @@ mod tests {
 
             loop {
                 let batch = buffer.drain(5000);
-                if batch.is_empty() { break; }
+                if batch.is_empty() {
+                    break;
+                }
                 drained_count += batch.len();
             }
 
@@ -2836,7 +2939,8 @@ mod tests {
 
             eprintln!(
                 "Drain complete in {:?} ({:.0} events/sec)",
-                drain_time, drained_count as f64 / drain_time.as_secs_f64()
+                drain_time,
+                drained_count as f64 / drain_time.as_secs_f64()
             );
             eprintln!("Total: drained={}, dropped={}", drained_count, dropped);
 
@@ -2844,15 +2948,19 @@ mod tests {
 
             // Performance sanity check - should handle at least 100k events/sec
             let push_rate = total as f64 / push_time.as_secs_f64();
-            assert!(push_rate > 100_000.0, "Push too slow: {:.0} events/sec", push_rate);
+            assert!(
+                push_rate > 100_000.0,
+                "Push too slow: {:.0} events/sec",
+                push_rate
+            );
         }
 
         /// Simulate pipeline backpressure: producer faster than consumer
         #[test]
         fn test_real_flow_backpressure_simulation() {
             use std::sync::Arc;
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
             use std::thread;
-            use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 
             // Small buffer to trigger backpressure
             let buffer = Arc::new(TieredBuffer::new(20, 10, 5));
@@ -2898,7 +3006,9 @@ mod tests {
             // Final drain
             loop {
                 let batch = buffer.drain(1000);
-                if batch.is_empty() { break; }
+                if batch.is_empty() {
+                    break;
+                }
                 drained.fetch_add(batch.len(), Ordering::Relaxed);
             }
 
@@ -2918,10 +3028,16 @@ mod tests {
             // If drops occurred, verify conservation (accounting for known bug #28)
             if dropped > 0 {
                 // Due to metrics bug, dropped may over-count, so just sanity check
-                assert!(total_drained + dropped >= total_pushed, "Lost more than pushed?");
+                assert!(
+                    total_drained + dropped >= total_pushed,
+                    "Lost more than pushed?"
+                );
             } else {
                 // No drops - buffer kept up, verify exact match
-                assert_eq!(total_drained, total_pushed, "No drops but counts don't match");
+                assert_eq!(
+                    total_drained, total_pushed,
+                    "No drops but counts don't match"
+                );
             }
         }
     }
