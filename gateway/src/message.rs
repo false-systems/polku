@@ -57,6 +57,11 @@ fn metadata_ref(m: &Metadata) -> &HashMap<String, String> {
 /// Stores ULID internally for efficient comparison and hashing, but preserves
 /// the original string for non-ULID IDs (UUIDs, custom IDs) so they can be
 /// returned unchanged when converting back to proto Events.
+///
+/// Note: Using non-ULID IDs incurs an additional heap allocation to store the
+/// original string (`Box<str>`), and because of this extra field `MessageId`
+/// is no longer `Copy` (it is `Clone` only). This is a trade-off to preserve
+/// original identifiers exactly while keeping ULID-based IDs compact and fast.
 #[derive(Clone)]
 pub struct MessageId {
     ulid: ulid::Ulid,
@@ -165,10 +170,16 @@ impl Eq for MessageId {}
 
 impl PartialEq<str> for MessageId {
     fn eq(&self, other: &str) -> bool {
-        // Compare by original string if present, otherwise ULID
+        // Compare by original string if present, otherwise by ULID without allocating
         match &self.original {
             Some(orig) => orig.as_ref() == other,
-            None => self.ulid.to_string() == other,
+            None => {
+                if let Ok(other_ulid) = other.parse() {
+                    self.ulid == other_ulid
+                } else {
+                    false
+                }
+            }
         }
     }
 }
@@ -544,6 +555,11 @@ mod tests {
         eprintln!("UUID out: '{}'", id.to_string());
         assert_eq!(id.to_string(), uuid, "UUID should be preserved");
         assert!(id.is_synthetic());
+
+        // Verify deterministic ULID generation - same string = same MessageId
+        let id_copy = MessageId::from_string(uuid);
+        assert_eq!(id, id_copy);
+        assert_eq!(id.as_ulid(), id_copy.as_ulid());
 
         // Custom IDs should be preserved
         let custom = "my-custom-event-id-12345";
