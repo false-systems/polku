@@ -3,6 +3,8 @@
 //! These tests start an actual gRPC server, send events through it,
 //! and verify they come out the other end correctly.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use async_trait::async_trait;
 use polku_gateway::{
     Emitter, Event, PluginError,

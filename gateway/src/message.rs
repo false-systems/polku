@@ -420,6 +420,13 @@ impl From<Message> for Event {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::field_reassign_with_default,
+    clippy::inconsistent_digit_grouping,
+    clippy::to_string_in_format_args
+)]
 mod tests {
     use super::*;
 
