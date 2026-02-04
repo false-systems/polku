@@ -367,7 +367,7 @@ async fn test_grpc_concurrent_clients() {
     let mut handles = vec![];
 
     for client_id in 0..num_clients {
-        let addr = addr.clone();
+        let addr = addr;
         handles.push(tokio::spawn(async move {
             let mut client = GatewayClient::connect(format!("http://{}", addr))
                 .await

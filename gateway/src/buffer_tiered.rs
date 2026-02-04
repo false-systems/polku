@@ -1827,11 +1827,11 @@ mod tests {
             assert_eq!(drained.len(), 20);
 
             // Check FIFO order via timestamps
-            for i in 0..20 {
+            for (i, msg) in drained.iter().enumerate().take(20) {
                 assert_eq!(
-                    drained[i].timestamp, i as i64,
+                    msg.timestamp, i as i64,
                     "Message {} has wrong timestamp: expected {}, got {}",
-                    i, i, drained[i].timestamp
+                    i, i, msg.timestamp
                 );
             }
         }
@@ -2684,7 +2684,7 @@ mod tests {
                 match id % 5 {
                     0 => String::new(),                                            // empty payload
                     1 => "{".to_string(),                                          // truncated JSON
-                    2 => format!(r#"{{"broken":}}"#),                              // invalid JSON
+                    2 => r#"{"broken":}"#.to_string(),                             // invalid JSON
                     3 => String::from_utf8_lossy(&[0x00, 0xFF, 0xFE]).to_string(), // binary garbage
                     _ => format!(r#"{{"pid":{}}}"#, pid), // missing required fields
                 }
