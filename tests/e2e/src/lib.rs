@@ -19,4 +19,4 @@ pub mod client;
 pub mod setup;
 
 pub use client::PolkuClient;
-pub use setup::PolkuTestEnv;
+pub use setup::{PolkuTestEnv, PolkuWithReceiverEnv};

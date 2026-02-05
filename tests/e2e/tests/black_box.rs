@@ -255,74 +255,20 @@ async fn test_performance_latency(ctx: Context) {
 #[seppo::test]
 #[ignore] // Requires Kind cluster with POLKU images
 async fn test_real_ebpf_200k_events(ctx: Context) {
-    use seppo::{deployment, service};
+    use polku_e2e::PolkuWithReceiverEnv;
 
-    // Deploy test-receiver first
-    let receiver_deploy = deployment("test-receiver")
-        .image("polku-test-receiver:latest")
-        .image_pull_policy("Never")
-        .port(9001)
-        .env("RECEIVER_ADDR", "0.0.0.0:9001")
-        .build();
-
-    let receiver_svc = service("test-receiver")
-        .selector("app", "test-receiver")
-        .port(9001, 9001)
-        .build();
-
-    ctx.apply(&receiver_deploy).await.expect("Deploy receiver");
-    ctx.apply(&receiver_svc)
+    // Deploy POLKU + receiver using shared helper
+    let env = PolkuWithReceiverEnv::setup(&ctx, "debug")
         .await
-        .expect("Deploy receiver service");
-    ctx.wait_ready("deployment/test-receiver")
-        .await
-        .expect("Wait for receiver");
-
-    // Deploy POLKU configured to emit to test-receiver
-    let polku_deploy = deployment("polku")
-        .image("polku-gateway:latest")
-        .image_pull_policy("Never")
-        .port(50051)
-        .env("POLKU_GRPC_ADDR", "0.0.0.0:50051")
-        .env("POLKU_EMIT_GRPC_ENDPOINTS", "http://test-receiver:9001")
-        .env("POLKU_EMIT_GRPC_LAZY", "true")
-        .env("POLKU_LOG_LEVEL", "debug")
-        .build();
-
-    let polku_svc = service("polku")
-        .selector("app", "polku")
-        .port(50051, 50051)
-        .build();
-
-    ctx.apply(&polku_deploy).await.expect("Deploy POLKU");
-    ctx.apply(&polku_svc).await.expect("Deploy POLKU service");
-    ctx.wait_ready("deployment/polku")
-        .await
-        .expect("Wait for POLKU");
-
-    // Port forward to both POLKU (to send) and receiver (to verify)
-    let polku_pf = ctx
-        .port_forward("svc/polku", 50051)
-        .await
-        .expect("Port forward POLKU");
-    let receiver_pf = ctx
-        .port_forward("svc/test-receiver", 9001)
-        .await
-        .expect("Port forward receiver");
-
-    let polku_addr = format!("http://{}", polku_pf.local_addr());
-    let receiver_addr = format!("http://{}", receiver_pf.local_addr());
-
-    // Wait for services to be ready
-    tokio::time::sleep(Duration::from_secs(2)).await;
+        .expect("Setup should succeed");
 
     // Connect to POLKU
-    let mut client = PolkuClient::connect(&polku_addr)
+    let mut client = PolkuClient::connect(&env.polku_addr)
         .await
         .expect("Connect to POLKU");
 
     // Get initial receiver event count
-    let mut receiver_client = GatewayClient::connect(receiver_addr.clone())
+    let mut receiver_client = GatewayClient::connect(env.receiver_addr.clone())
         .await
         .expect("Connect to receiver");
     let initial_health = receiver_client
@@ -472,74 +418,20 @@ async fn test_network_events(ctx: Context) {
 #[seppo::test]
 #[ignore] // Requires Kind cluster with POLKU images
 async fn test_streaming_500k_events(ctx: Context) {
-    use seppo::{deployment, service};
+    use polku_e2e::PolkuWithReceiverEnv;
 
-    // Deploy test-receiver first
-    let receiver_deploy = deployment("test-receiver")
-        .image("polku-test-receiver:latest")
-        .image_pull_policy("Never")
-        .port(9001)
-        .env("RECEIVER_ADDR", "0.0.0.0:9001")
-        .build();
-
-    let receiver_svc = service("test-receiver")
-        .selector("app", "test-receiver")
-        .port(9001, 9001)
-        .build();
-
-    ctx.apply(&receiver_deploy).await.expect("Deploy receiver");
-    ctx.apply(&receiver_svc)
+    // Deploy POLKU + receiver using shared helper (info log level for reduced overhead)
+    let env = PolkuWithReceiverEnv::setup(&ctx, "info")
         .await
-        .expect("Deploy receiver service");
-    ctx.wait_ready("deployment/test-receiver")
-        .await
-        .expect("Wait for receiver");
-
-    // Deploy POLKU configured to emit to test-receiver
-    let polku_deploy = deployment("polku")
-        .image("polku-gateway:latest")
-        .image_pull_policy("Never")
-        .port(50051)
-        .env("POLKU_GRPC_ADDR", "0.0.0.0:50051")
-        .env("POLKU_EMIT_GRPC_ENDPOINTS", "http://test-receiver:9001")
-        .env("POLKU_EMIT_GRPC_LAZY", "true")
-        .env("POLKU_LOG_LEVEL", "info") // Reduce logging overhead
-        .build();
-
-    let polku_svc = service("polku")
-        .selector("app", "polku")
-        .port(50051, 50051)
-        .build();
-
-    ctx.apply(&polku_deploy).await.expect("Deploy POLKU");
-    ctx.apply(&polku_svc).await.expect("Deploy POLKU service");
-    ctx.wait_ready("deployment/polku")
-        .await
-        .expect("Wait for POLKU");
-
-    // Port forward to both POLKU (to send) and receiver (to verify)
-    let polku_pf = ctx
-        .port_forward("svc/polku", 50051)
-        .await
-        .expect("Port forward POLKU");
-    let receiver_pf = ctx
-        .port_forward("svc/test-receiver", 9001)
-        .await
-        .expect("Port forward receiver");
-
-    let polku_addr = format!("http://{}", polku_pf.local_addr());
-    let receiver_addr = format!("http://{}", receiver_pf.local_addr());
-
-    // Wait for services to be ready
-    tokio::time::sleep(Duration::from_secs(2)).await;
+        .expect("Setup should succeed");
 
     // Connect to POLKU
-    let mut client = PolkuClient::connect(&polku_addr)
+    let mut client = PolkuClient::connect(&env.polku_addr)
         .await
         .expect("Connect to POLKU");
 
     // Get initial receiver event count
-    let mut receiver_client = GatewayClient::connect(receiver_addr.clone())
+    let mut receiver_client = GatewayClient::connect(env.receiver_addr.clone())
         .await
         .expect("Connect to receiver");
     let initial_health = receiver_client
