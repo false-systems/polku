@@ -52,16 +52,21 @@ fn metadata_ref(m: &Metadata) -> &HashMap<String, String> {
         .unwrap_or_else(|| EMPTY.get_or_init(HashMap::new))
 }
 
-/// Compact message identifier (16 bytes instead of 26-char string)
+/// Compact message identifier that preserves original IDs
 ///
-/// Stores ULID in binary form. Implements Display for string formatting
-/// and PartialEq<str> for easy comparisons.
-#[derive(Clone, Copy)]
+/// Stores ULID internally for efficient comparison and hashing, but preserves
+/// the original string for non-ULID IDs (UUIDs, custom IDs) so they can be
+/// returned unchanged when converting back to proto Events.
+///
+/// Note: Using non-ULID IDs incurs an additional heap allocation to store the
+/// original string (`Box<str>`), and because of this extra field `MessageId`
+/// is no longer `Copy` (it is `Clone` only). This is a trade-off to preserve
+/// original identifiers exactly while keeping ULID-based IDs compact and fast.
+#[derive(Clone)]
 pub struct MessageId {
     ulid: ulid::Ulid,
-    /// Original string for non-ULID IDs (tests, legacy). Empty if generated.
-    /// We store a hash to enable PartialEq<str> without storing the string.
-    original_hash: u64,
+    /// Original string for non-ULID IDs. None if this was a valid ULID or generated.
+    original: Option<Box<str>>,
 }
 
 impl MessageId {
@@ -70,35 +75,35 @@ impl MessageId {
     pub fn new() -> Self {
         Self {
             ulid: ulid::Ulid::new(),
-            original_hash: 0,
+            original: None,
         }
     }
 
-    /// Create from a string (parses ULID or creates deterministic ID)
+    /// Create from a string (parses ULID or preserves original)
     pub fn from_string(s: &str) -> Self {
         // Try to parse as valid ULID first
         if let Ok(ulid) = ulid::Ulid::from_string(s) {
             return Self {
                 ulid,
-                original_hash: 0,
+                original: None,
             };
         }
 
-        // For arbitrary strings (tests), create deterministic ID from hash
+        // For non-ULID strings (UUIDs, custom IDs), store original and create internal ULID
         let hash = Self::hash_string(s);
         let bytes = hash.to_le_bytes();
-        // Create ULID from hash bytes (deterministic but not time-ordered)
+        // Create ULID from hash bytes (deterministic for dedup/comparison)
         let ulid_bytes: [u8; 16] = [
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ];
         Self {
             ulid: ulid::Ulid::from_bytes(ulid_bytes),
-            original_hash: hash,
+            original: Some(s.into()),
         }
     }
 
-    /// Get the ULID
+    /// Get the ULID (for internal use)
     #[inline]
     pub fn as_ulid(&self) -> ulid::Ulid {
         self.ulid
@@ -107,7 +112,17 @@ impl MessageId {
     /// Check if this was created from an arbitrary string (not a real ULID)
     #[inline]
     pub fn is_synthetic(&self) -> bool {
-        self.original_hash != 0
+        self.original.is_some()
+    }
+
+    /// Get the original string representation
+    /// Returns the original ID if non-ULID, otherwise the ULID string
+    #[inline]
+    pub fn as_str(&self) -> std::borrow::Cow<'_, str> {
+        match &self.original {
+            Some(orig) => std::borrow::Cow::Borrowed(orig.as_ref()),
+            None => std::borrow::Cow::Owned(self.ulid.to_string()),
+        }
     }
 
     /// Simple string hash (FNV-1a)
@@ -129,13 +144,19 @@ impl Default for MessageId {
 
 impl fmt::Debug for MessageId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "MessageId({})", self.ulid)
+        match &self.original {
+            Some(orig) => write!(f, "MessageId({})", orig),
+            None => write!(f, "MessageId({})", self.ulid),
+        }
     }
 }
 
 impl fmt::Display for MessageId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.ulid)
+        match &self.original {
+            Some(orig) => write!(f, "{}", orig),
+            None => write!(f, "{}", self.ulid),
+        }
     }
 }
 
@@ -149,12 +170,17 @@ impl Eq for MessageId {}
 
 impl PartialEq<str> for MessageId {
     fn eq(&self, other: &str) -> bool {
-        // For synthetic IDs, compare by hash
-        if self.original_hash != 0 {
-            return self.original_hash == Self::hash_string(other);
+        // Compare by original string if present, otherwise by ULID without allocating
+        match &self.original {
+            Some(orig) => orig.as_ref() == other,
+            None => {
+                if let Ok(other_ulid) = other.parse() {
+                    self.ulid == other_ulid
+                } else {
+                    false
+                }
+            }
         }
-        // For real ULIDs, compare string representation
-        self.ulid.to_string() == other
     }
 }
 
@@ -190,7 +216,10 @@ impl From<String> for MessageId {
 
 impl From<MessageId> for String {
     fn from(id: MessageId) -> Self {
-        id.ulid.to_string()
+        match id.original {
+            Some(orig) => orig.into(),
+            None => id.ulid.to_string(),
+        }
     }
 }
 
@@ -391,6 +420,13 @@ impl From<Message> for Event {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::field_reassign_with_default,
+    clippy::inconsistent_digit_grouping,
+    clippy::to_string_in_format_args
+)]
 mod tests {
     use super::*;
 
@@ -503,7 +539,7 @@ mod tests {
     fn test_message_id_comparison() {
         // Real ULIDs can be compared
         let id1 = MessageId::new();
-        let id2 = id1;
+        let id2 = id1.clone();
         assert_eq!(id1, id2);
 
         // Synthetic IDs from strings
@@ -515,5 +551,54 @@ mod tests {
         // Different strings = different IDs
         let id5 = MessageId::from_string("other-id");
         assert_ne!(id3, id5);
+    }
+
+    #[test]
+    fn test_message_id_preserves_original() {
+        // UUIDs should be preserved
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let id = MessageId::from_string(uuid);
+        eprintln!("UUID in:  '{}'", uuid);
+        eprintln!("UUID out: '{}'", id.to_string());
+        assert_eq!(id.to_string(), uuid, "UUID should be preserved");
+        assert!(id.is_synthetic());
+
+        // Verify deterministic ULID generation - same string = same MessageId
+        let id_copy = MessageId::from_string(uuid);
+        assert_eq!(id, id_copy);
+        assert_eq!(id.as_ulid(), id_copy.as_ulid());
+
+        // Custom IDs should be preserved
+        let custom = "my-custom-event-id-12345";
+        let id2 = MessageId::from_string(custom);
+        assert_eq!(id2.to_string(), custom);
+
+        // Valid ULIDs should work normally
+        let ulid_str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let id3 = MessageId::from_string(ulid_str);
+        assert_eq!(id3.to_string(), ulid_str);
+        assert!(!id3.is_synthetic());
+
+        // Generated IDs return ULID format
+        let id4 = MessageId::new();
+        assert!(!id4.is_synthetic());
+        assert_eq!(id4.to_string().len(), 26); // ULID is 26 chars
+    }
+
+    #[test]
+    fn test_proto_event_id_round_trip() {
+        // Create message with UUID
+        let uuid = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
+        let mut event = Event::default();
+        event.id = uuid.to_string();
+        event.source = "test".to_string();
+        event.event_type = "test.event".to_string();
+
+        // Convert to Message and back
+        let msg: Message = event.into();
+        let event_out: Event = msg.into();
+
+        // ID should be preserved!
+        assert_eq!(event_out.id, uuid, "UUID should survive Message round-trip");
     }
 }
