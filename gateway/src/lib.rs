@@ -51,6 +51,7 @@ pub mod proto {
 
 pub use checkpoint::{CheckpointStore, MemoryCheckpointStore};
 pub use config::Config;
+pub use discovery::DiscoveryServer;
 pub use emit::Event;
 pub use emit::resilience::{
     BackoffConfig, CircuitBreakerConfig, CircuitBreakerEmitter, CircuitState, FailedEvent,
@@ -69,4 +70,3 @@ pub use middleware::{
     ValidationResult, Validator,
 };
 pub use registry::PluginRegistry;
-pub use discovery::DiscoveryServer;

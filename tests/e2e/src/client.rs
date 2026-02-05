@@ -1,10 +1,10 @@
 //! POLKU gRPC Client for testing
 
 use crate::proto::gateway_client::GatewayClient;
-use crate::proto::{Ack, IngestBatch, IngestEvent, EventPayload};
 use crate::proto::ingest_batch;
-use polku_core::{Event, KernelEventData, NetworkEventData, Severity, Outcome};
+use crate::proto::{Ack, EventPayload, IngestBatch, IngestEvent};
 use polku_core::proto::event::Data;
+use polku_core::{Event, KernelEventData, NetworkEventData, Outcome, Severity};
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
 
@@ -67,11 +67,19 @@ impl PolkuClient {
 
     /// Stream events using bidirectional streaming RPC (high throughput)
     /// Sends events in batches over a single stream connection
-    pub async fn stream_events(&mut self, events: Vec<Event>, batch_size: usize) -> Result<Ack, tonic::Status> {
+    pub async fn stream_events(
+        &mut self,
+        events: Vec<Event>,
+        batch_size: usize,
+    ) -> Result<Ack, tonic::Status> {
+        assert!(batch_size > 0, "batch_size must be greater than 0");
+
         let source = self.source.clone();
         let cluster = self.cluster.clone();
 
-        // Create batches
+        // NOTE: We collect batches into a Vec here intentionally for performance measurement.
+        // This isolates the streaming RPC performance from event generation overhead.
+        // In production code, consider using an iterator-based approach for memory efficiency.
         let batches: Vec<IngestBatch> = events
             .chunks(batch_size)
             .map(|chunk| IngestBatch {
@@ -115,7 +123,9 @@ impl PolkuClient {
             timestamp_unix_ns: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_nanos() as i64,
+                .as_nanos()
+                .try_into()
+                .unwrap_or(i64::MAX),
             ..Default::default()
         }
     }
@@ -180,9 +190,15 @@ impl PolkuClient {
             timestamp_unix_ns: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_nanos() as i64,
+                .as_nanos()
+                .try_into()
+                .unwrap_or(i64::MAX),
             severity: Severity::Info as i32,
-            outcome: if retval >= 0 { Outcome::Success as i32 } else { Outcome::Failure as i32 },
+            outcome: if retval >= 0 {
+                Outcome::Success as i32
+            } else {
+                Outcome::Failure as i32
+            },
             data: Some(Data::Kernel(KernelEventData {
                 event_type: "syscall".to_string(),
                 pid,
@@ -212,7 +228,9 @@ impl PolkuClient {
             timestamp_unix_ns: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_nanos() as i64,
+                .as_nanos()
+                .try_into()
+                .unwrap_or(i64::MAX),
             severity: Severity::Info as i32,
             outcome: Outcome::Success as i32,
             data: Some(Data::Network(NetworkEventData {
@@ -234,26 +252,30 @@ impl PolkuClient {
     /// Create N real eBPF kernel events with typed data
     pub fn make_kernel_events(n: usize) -> Vec<Event> {
         let syscalls = ["read", "write", "open", "close", "execve", "mmap", "stat"];
-        (0..n).map(|i| {
-            let syscall = syscalls[i % syscalls.len()];
-            let pid = (1000 + i % 100) as u32;
-            let retval = if i % 10 == 9 { -1 } else { (i % 1000) as i64 };
-            Self::make_kernel_syscall_event(syscall, pid, retval)
-        }).collect()
+        (0..n)
+            .map(|i| {
+                let syscall = syscalls[i % syscalls.len()];
+                let pid = (1000 + i % 100) as u32;
+                let retval = if i % 10 == 9 { -1 } else { (i % 1000) as i64 };
+                Self::make_kernel_syscall_event(syscall, pid, retval)
+            })
+            .collect()
     }
 
     /// Create N network events with typed data
     pub fn make_network_events(n: usize) -> Vec<Event> {
-        (0..n).map(|i| {
-            let protocol = if i % 2 == 0 { "TCP" } else { "UDP" };
-            let dst_port = (80 + i % 10) as u32;
-            Self::make_network_event(
-                protocol,
-                &format!("10.0.0.{}", i % 256),
-                &format!("192.168.1.{}", i % 256),
-                dst_port,
-            )
-        }).collect()
+        (0..n)
+            .map(|i| {
+                let protocol = if i % 2 == 0 { "TCP" } else { "UDP" };
+                let dst_port = (80 + i % 10) as u32;
+                Self::make_network_event(
+                    protocol,
+                    &format!("10.0.0.{}", i % 256),
+                    &format!("192.168.1.{}", i % 256),
+                    dst_port,
+                )
+            })
+            .collect()
     }
 
     /// Create a mixed batch of real eBPF events (kernel + network)

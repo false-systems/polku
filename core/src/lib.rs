@@ -127,7 +127,9 @@ mod tests {
         event.timestamp_unix_ns = 1704067200_000_000_000; // 2024-01-01 00:00:00 UTC
         event.source = "test-source".to_string();
         event.event_type = "test.event".to_string();
-        event.metadata.insert("key1".to_string(), "value1".to_string());
+        event
+            .metadata
+            .insert("key1".to_string(), "value1".to_string());
         event.payload = vec![1, 2, 3, 4];
         event.route_to.push("output-a".to_string());
 
@@ -161,8 +163,8 @@ mod tests {
     // Emitter Trait Tests
     // ==========================================================================
 
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Test emitter that tracks calls for verification
     struct TestEmitter {
@@ -197,7 +199,8 @@ mod tests {
 
         async fn emit(&self, events: &[Event]) -> Result<(), PluginError> {
             self.emit_count.fetch_add(1, Ordering::Relaxed);
-            self.last_batch_size.store(events.len() as u64, Ordering::Relaxed);
+            self.last_batch_size
+                .store(events.len() as u64, Ordering::Relaxed);
             Ok(())
         }
 
@@ -230,11 +233,13 @@ mod tests {
     async fn test_emitter_emit_batch() {
         let emitter = TestEmitter::new("test");
 
-        let events: Vec<Event> = (0..5).map(|i| {
-            let mut e = Event::default();
-            e.id = format!("event-{}", i);
-            e
-        }).collect();
+        let events: Vec<Event> = (0..5)
+            .map(|i| {
+                let mut e = Event::default();
+                e.id = format!("event-{}", i);
+                e
+            })
+            .collect();
 
         let result = emitter.emit(&events).await;
         assert!(result.is_ok());
@@ -316,9 +321,15 @@ mod tests {
 
         #[async_trait::async_trait]
         impl Emitter for MinimalEmitter {
-            fn name(&self) -> &'static str { "minimal" }
-            async fn emit(&self, _events: &[Event]) -> Result<(), PluginError> { Ok(()) }
-            async fn health(&self) -> bool { true }
+            fn name(&self) -> &'static str {
+                "minimal"
+            }
+            async fn emit(&self, _events: &[Event]) -> Result<(), PluginError> {
+                Ok(())
+            }
+            async fn health(&self) -> bool {
+                true
+            }
             // Note: not overriding shutdown - uses default
         }
 
