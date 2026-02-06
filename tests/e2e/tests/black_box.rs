@@ -478,6 +478,11 @@ async fn test_streaming_500k_events(ctx: Context) {
     // This test measures streaming RPC performance, so we isolate network/server
     // processing from event generation. In production, generate events on demand.
     eprintln!(">>> [STREAMING] Generating {} events...", total);
+    // NOTE: We intentionally generate all events up front in memory here.
+    // This test is meant to measure the performance of the streaming RPC
+    // (network + server processing) and to keep the cost of event generation
+    // out of the measurement. In production code, events should typically be
+    // generated in smaller batches or on demand to reduce peak memory usage.
     let events = PolkuClient::make_real_ebpf_batch(total);
 
     eprintln!(
