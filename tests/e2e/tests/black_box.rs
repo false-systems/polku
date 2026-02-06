@@ -305,10 +305,29 @@ async fn test_real_ebpf_200k_events(ctx: Context) {
         total_sent, send_time, send_rate
     );
 
-    // Wait for events to propagate through POLKU to receiver
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Wait for events to propagate through POLKU to receiver by polling the health endpoint.
+    // This avoids relying on a fixed sleep duration and makes the test more robust on slower clusters.
+    let wait_start = std::time::Instant::now();
+    let max_wait = Duration::from_secs(30);
+    let poll_interval = Duration::from_millis(500);
 
-    // Verify events arrived at receiver via health endpoint
+    loop {
+        let health = receiver_client.health(HealthRequest {}).await.expect("Health during wait");
+        let current_count = health.into_inner().events_processed;
+        let currently_received = current_count - initial_count;
+
+        if currently_received >= (total_sent as u64 * 95 / 100) {
+            break;
+        }
+
+        if wait_start.elapsed() >= max_wait {
+            break;
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+
+    // Verify events arrived at receiver via final health snapshot
     let final_health = receiver_client
         .health(HealthRequest {})
         .await
