@@ -317,6 +317,12 @@ async fn test_real_ebpf_200k_events(ctx: Context) {
 
     assert!(
         final_count >= initial_count,
+        "Receiver event count decreased between health checks: initial={}, final={}",
+        initial_count,
+        final_count
+    );
+    assert!(
+        final_count >= initial_count,
         "Receiver event count decreased: initial={}, final={}",
         initial_count,
         final_count
