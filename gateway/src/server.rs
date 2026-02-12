@@ -7,7 +7,6 @@
 //! - Transform: Clients send raw bytes, InputPlugins transform them to Events
 
 use crate::buffer::RingBuffer;
-use crate::emit::Event;
 use crate::hub::MessageSender;
 use crate::ingest::IngestContext;
 use crate::message::Message;
@@ -83,16 +82,21 @@ impl GatewayService {
         GatewayServer::new(self)
     }
 
-    /// Process a single IngestEvent and return an Event
+    /// Process a single IngestEvent and return a (wire_id, Message) pair
+    ///
+    /// Returns the original wire-format ID (for Ack responses) alongside the
+    /// converted Message (for pipeline processing).
     #[allow(clippy::result_large_err)]
-    fn process_event(&self, ingest: &IngestEvent) -> Result<Event, Status> {
+    fn process_event(&self, ingest: &IngestEvent) -> Result<(String, Message), Status> {
         let source = &ingest.source;
         let cluster = &ingest.cluster;
 
         match &ingest.payload {
             Some(ingest_event::Payload::Event(event)) => {
                 debug!(source = %source, id = %event.id, "Pass-through event");
-                Ok(event.clone())
+                let wire_id = event.id.clone();
+                let msg: Message = event.clone().into();
+                Ok((wire_id, msg))
             }
             Some(ingest_event::Payload::Raw(data)) => {
                 let ctx = IngestContext {
@@ -102,19 +106,21 @@ impl GatewayService {
                 };
 
                 match self.registry.transform(&ctx, data) {
-                    Ok(mut events) => {
-                        if events.is_empty() {
+                    Ok(mut messages) => {
+                        if messages.is_empty() {
                             return Err(Status::invalid_argument("Transform produced no events"));
                         }
-                        // Return first event for unary RPC
-                        if events.len() > 1 {
+                        // Return first message for unary RPC
+                        if messages.len() > 1 {
                             warn!(
                                 source = %source,
-                                count = events.len(),
+                                count = messages.len(),
                                 "Transform produced multiple events, returning first only"
                             );
                         }
-                        Ok(events.remove(0))
+                        let msg = messages.remove(0);
+                        let wire_id = msg.id.to_string();
+                        Ok((wire_id, msg))
                     }
                     Err(e) => {
                         error!(source = %source, error = %e, "Transform failed");
@@ -151,15 +157,15 @@ impl Gateway for GatewayService {
                 let source = batch.source.clone();
 
                 // Process the batch
-                let events = match process_batch_with_registry(&batch, &registry) {
-                    Ok(events) => events,
+                let (event_ids, messages) = match process_batch_with_registry(&batch, &registry) {
+                    Ok(result) => result,
                     Err(status) => {
                         let _ = tx.send(Err(status)).await;
                         continue;
                     }
                 };
 
-                if events.is_empty() {
+                if messages.is_empty() {
                     let ack = Ack {
                         event_ids: vec![],
                         errors: vec![],
@@ -173,11 +179,7 @@ impl Gateway for GatewayService {
                     continue;
                 }
 
-                let event_ids: Vec<String> = events.iter().map(|e| e.id.clone()).collect();
-                let event_count = events.len();
-
-                // Convert proto Events to internal Messages
-                let messages: Vec<Message> = events.into_iter().map(Message::from).collect();
+                let event_count = messages.len();
 
                 // Send to Hub if configured (for processing and emission)
                 // Otherwise just buffer (legacy behavior)
@@ -219,11 +221,7 @@ impl Gateway for GatewayService {
 
     async fn send_event(&self, request: Request<IngestEvent>) -> Result<Response<Ack>, Status> {
         let ingest = request.into_inner();
-        let event = self.process_event(&ingest)?;
-
-        let event_id = event.id.clone();
-        // Convert proto Event to internal Message
-        let message: Message = event.into();
+        let (event_id, message) = self.process_event(&ingest)?;
 
         // Send to Hub if configured, otherwise buffer
         if let Some(ref sender) = self.hub_sender {
@@ -288,16 +286,28 @@ impl Gateway for GatewayService {
 }
 
 /// Helper to process a batch with registry (used in spawned task)
+///
+/// Returns (wire_ids, messages) - wire IDs are the original string IDs
+/// for Ack responses, messages are for pipeline processing.
 #[allow(clippy::result_large_err)]
 fn process_batch_with_registry(
     batch: &IngestBatch,
     registry: &PluginRegistry,
-) -> Result<Vec<Event>, Status> {
+) -> Result<(Vec<String>, Vec<Message>), Status> {
     let source = &batch.source;
     let cluster = &batch.cluster;
 
     match &batch.payload {
-        Some(ingest_batch::Payload::Events(payload)) => Ok(payload.events.clone()),
+        Some(ingest_batch::Payload::Events(payload)) => {
+            let wire_ids: Vec<String> = payload.events.iter().map(|e| e.id.clone()).collect();
+            let messages: Vec<Message> = payload
+                .events
+                .clone()
+                .into_iter()
+                .map(Message::from)
+                .collect();
+            Ok((wire_ids, messages))
+        }
         Some(ingest_batch::Payload::Raw(payload)) => {
             let ctx = IngestContext {
                 source,
@@ -305,11 +315,13 @@ fn process_batch_with_registry(
                 format: &payload.format,
             };
 
-            registry.transform(&ctx, &payload.data).map_err(|e| {
+            let messages = registry.transform(&ctx, &payload.data).map_err(|e| {
                 Status::unimplemented(format!("Transform failed for source '{}': {}", source, e))
-            })
+            })?;
+            let wire_ids: Vec<String> = messages.iter().map(|m| m.id.to_string()).collect();
+            Ok((wire_ids, messages))
         }
-        None => Ok(vec![]),
+        None => Ok((vec![], vec![])),
     }
 }
 
@@ -317,6 +329,7 @@ fn process_batch_with_registry(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::emit::Event;
     use crate::proto::{EventPayload, RawPayload};
 
     fn make_service() -> GatewayService {
@@ -348,9 +361,9 @@ mod tests {
             payload: Some(ingest_event::Payload::Event(event.clone())),
         };
 
-        let result = svc.process_event(&ingest);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().id, "test-id");
+        let (wire_id, msg) = svc.process_event(&ingest).unwrap();
+        assert_eq!(wire_id, "test-id");
+        assert_eq!(msg.id, "test-id");
     }
 
     #[test]
@@ -407,9 +420,9 @@ mod tests {
             })),
         };
 
-        let result = process_batch_with_registry(&batch, &registry);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().len(), 2);
+        let (wire_ids, messages) = process_batch_with_registry(&batch, &registry).unwrap();
+        assert_eq!(wire_ids.len(), 2);
+        assert_eq!(messages.len(), 2);
     }
 
     #[test]
@@ -422,9 +435,9 @@ mod tests {
             payload: None,
         };
 
-        let result = process_batch_with_registry(&batch, &registry);
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
+        let (wire_ids, messages) = process_batch_with_registry(&batch, &registry).unwrap();
+        assert!(wire_ids.is_empty());
+        assert!(messages.is_empty());
     }
 
     #[test]

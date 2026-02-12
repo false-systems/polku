@@ -6,9 +6,11 @@
 //! - Newline-delimited JSON (NDJSON/JSON Lines)
 
 use super::{IngestContext, Ingestor};
-use crate::emit::Event;
 use crate::error::PluginError;
+use crate::message::Message;
 use base64::Engine as _;
+use bytes::Bytes;
+use polku_core::message::MessageId;
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -90,8 +92,11 @@ struct JsonEvent {
 }
 
 impl JsonEvent {
-    fn into_event(self, ctx: &IngestContext) -> Event {
-        let id = self.id.unwrap_or_else(|| ulid::Ulid::new().to_string());
+    fn into_message(self, ctx: &IngestContext) -> Message {
+        let id: MessageId = self
+            .id
+            .map(|s| MessageId::from_string(&s))
+            .unwrap_or_default();
 
         let timestamp = self
             .timestamp_unix_ns
@@ -107,18 +112,35 @@ impl JsonEvent {
             .and_then(|p| base64::engine::general_purpose::STANDARD.decode(&p).ok())
             .unwrap_or_default();
 
-        Event {
+        let mut msg = Message {
             id,
-            timestamp_unix_ns: timestamp,
-            source,
-            event_type,
-            metadata: self.metadata,
-            payload,
-            route_to: self.route_to,
-            severity: self.severity,
-            outcome: self.outcome,
-            data: None,
+            timestamp,
+            source: source.into(),
+            message_type: event_type.into(),
+            metadata: if self.metadata.is_empty() {
+                None
+            } else {
+                Some(Box::new(self.metadata))
+            },
+            payload: Bytes::from(payload),
+            route_to: smallvec::SmallVec::from_vec(self.route_to),
+        };
+
+        // Preserve severity/outcome in metadata if non-default
+        if self.severity != 0 {
+            msg.metadata_mut().insert(
+                polku_core::metadata_keys::SEVERITY.to_string(),
+                self.severity.to_string(),
+            );
         }
+        if self.outcome != 0 {
+            msg.metadata_mut().insert(
+                polku_core::metadata_keys::OUTCOME.to_string(),
+                self.outcome.to_string(),
+            );
+        }
+
+        msg
     }
 }
 
@@ -131,7 +153,7 @@ impl Ingestor for JsonIngestor {
         &["json", "json-lines", "ndjson"]
     }
 
-    fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Event>, PluginError> {
+    fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Message>, PluginError> {
         let text = std::str::from_utf8(data)
             .map_err(|e| PluginError::Transform(format!("Invalid UTF-8: {}", e)))?;
 
@@ -155,22 +177,25 @@ impl Ingestor for JsonIngestor {
 }
 
 impl JsonIngestor {
-    fn parse_single(&self, text: &str, ctx: &IngestContext) -> Result<Vec<Event>, PluginError> {
+    fn parse_single(&self, text: &str, ctx: &IngestContext) -> Result<Vec<Message>, PluginError> {
         let json_event: JsonEvent = serde_json::from_str(text)
             .map_err(|e| PluginError::Transform(format!("Invalid JSON: {}", e)))?;
 
-        Ok(vec![json_event.into_event(ctx)])
+        Ok(vec![json_event.into_message(ctx)])
     }
 
-    fn parse_array(&self, text: &str, ctx: &IngestContext) -> Result<Vec<Event>, PluginError> {
+    fn parse_array(&self, text: &str, ctx: &IngestContext) -> Result<Vec<Message>, PluginError> {
         let json_events: Vec<JsonEvent> = serde_json::from_str(text)
             .map_err(|e| PluginError::Transform(format!("Invalid JSON array: {}", e)))?;
 
-        Ok(json_events.into_iter().map(|e| e.into_event(ctx)).collect())
+        Ok(json_events
+            .into_iter()
+            .map(|e| e.into_message(ctx))
+            .collect())
     }
 
-    fn parse_ndjson(&self, text: &str, ctx: &IngestContext) -> Result<Vec<Event>, PluginError> {
-        let mut events = Vec::new();
+    fn parse_ndjson(&self, text: &str, ctx: &IngestContext) -> Result<Vec<Message>, PluginError> {
+        let mut messages = Vec::new();
 
         for (line_num, line) in text.lines().enumerate() {
             let trimmed = line.trim();
@@ -182,9 +207,9 @@ impl JsonIngestor {
                 PluginError::Transform(format!("Invalid JSON on line {}: {}", line_num + 1, e))
             })?;
 
-            events.push(json_event.into_event(ctx));
+            messages.push(json_event.into_message(ctx));
         }
 
-        Ok(events)
+        Ok(messages)
     }
 }

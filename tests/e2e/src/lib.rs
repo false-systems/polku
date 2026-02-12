@@ -12,6 +12,7 @@
 //! 7. Performance test → measure throughput/latency
 
 pub mod proto {
+    #![allow(clippy::large_enum_variant)]
     include!("proto/polku.v1.rs");
 }
 

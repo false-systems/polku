@@ -27,6 +27,7 @@
 
 use crate::emit::Emitter;
 use crate::error::PluginError;
+use crate::message::Message;
 use crate::metrics::Metrics;
 use crate::proto::gateway_client::GatewayClient;
 use crate::proto::{EventPayload, HealthRequest, IngestBatch, ingest_batch};
@@ -302,7 +303,8 @@ impl GrpcEmitter {
     }
 
     /// Try to emit to a specific endpoint
-    async fn try_emit_to(&self, idx: usize, events: &[Event]) -> Result<(), PluginError> {
+    async fn try_emit_to(&self, idx: usize, messages: &[Message]) -> Result<(), PluginError> {
+        let events: Vec<Event> = messages.iter().map(|m| Event::from(m.clone())).collect();
         let mut client = self.clients[idx].clone();
         let endpoint = &self.endpoints[idx];
         let state = &self.states[idx];
@@ -366,7 +368,7 @@ impl GrpcEmitter {
 
                 // Record successful emit to metrics
                 if let Some(m) = Metrics::get() {
-                    m.record_grpc_endpoint_events(endpoint, events.len() as u64);
+                    m.record_grpc_endpoint_events(endpoint, messages.len() as u64);
                 }
 
                 Ok(())
@@ -388,8 +390,8 @@ impl Emitter for GrpcEmitter {
         "grpc"
     }
 
-    async fn emit(&self, events: &[Event]) -> Result<(), PluginError> {
-        if events.is_empty() {
+    async fn emit(&self, messages: &[Message]) -> Result<(), PluginError> {
+        if messages.is_empty() {
             return Ok(());
         }
 
@@ -403,7 +405,7 @@ impl Emitter for GrpcEmitter {
             tried[idx] = true;
             attempts += 1;
 
-            match self.try_emit_to(idx, events).await {
+            match self.try_emit_to(idx, messages).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     warn!(
@@ -414,10 +416,10 @@ impl Emitter for GrpcEmitter {
                     last_error = Some(e);
 
                     // Record failover (not first attempt)
-                    if attempts > 1 {
-                        if let Some(m) = Metrics::get() {
-                            m.record_grpc_failover();
-                        }
+                    if attempts > 1
+                        && let Some(m) = Metrics::get()
+                    {
+                        m.record_grpc_failover();
                     }
                 }
             }
@@ -434,7 +436,7 @@ impl Emitter for GrpcEmitter {
                 m.record_grpc_failover();
             }
 
-            match self.try_emit_to(idx, events).await {
+            match self.try_emit_to(idx, messages).await {
                 Ok(()) => {
                     info!(
                         endpoint = %self.endpoints[idx],
@@ -450,7 +452,7 @@ impl Emitter for GrpcEmitter {
 
         // All endpoints failed
         error!(
-            event_count = events.len(),
+            event_count = messages.len(),
             endpoints_tried = tried.iter().filter(|&&t| t).count(),
             "All endpoints failed"
         );
@@ -487,25 +489,19 @@ mod tests {
     use super::*;
     use crate::buffer::RingBuffer;
     use crate::server::GatewayService;
-    use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use tonic::transport::Server;
 
-    /// Helper to create a test event
-    fn make_event(id: &str, event_type: &str) -> Event {
-        Event {
-            id: id.to_string(),
-            timestamp_unix_ns: 1234567890,
-            source: "test-source".to_string(),
-            event_type: event_type.to_string(),
-            metadata: HashMap::new(),
-            payload: vec![1, 2, 3],
-            route_to: vec![],
-            severity: 0,
-            outcome: 0,
-            data: None,
-        }
+    /// Helper to create a test message
+    fn make_message(id: &str, event_type: &str) -> Message {
+        Message::with_id(
+            id,
+            1234567890,
+            "test-source",
+            event_type,
+            bytes::Bytes::from_static(&[1, 2, 3]),
+        )
     }
 
     /// Start a test gateway server, return its address and buffer
@@ -547,14 +543,14 @@ mod tests {
 
         let emitter = GrpcEmitter::new(&endpoint).await.unwrap();
 
-        // Send a batch of events
-        let events = vec![
-            make_event("e1", "test.created"),
-            make_event("e2", "test.updated"),
-            make_event("e3", "test.deleted"),
+        // Send a batch of messages
+        let messages = vec![
+            make_message("e1", "test.created"),
+            make_message("e2", "test.updated"),
+            make_message("e3", "test.deleted"),
         ];
 
-        let result = emitter.emit(&events).await;
+        let result = emitter.emit(&messages).await;
         assert!(result.is_ok(), "Should emit batch successfully");
 
         // Verify all events landed in the server's buffer
@@ -604,8 +600,11 @@ mod tests {
         let mut handles = vec![];
         for i in 0..5 {
             let emitter = Arc::clone(&emitter);
-            let events = vec![make_event(&format!("concurrent-{}", i), "test.concurrent")];
-            handles.push(tokio::spawn(async move { emitter.emit(&events).await }));
+            let messages = vec![make_message(
+                &format!("concurrent-{}", i),
+                "test.concurrent",
+            )];
+            handles.push(tokio::spawn(async move { emitter.emit(&messages).await }));
         }
 
         // All should complete without blocking each other
@@ -668,8 +667,8 @@ mod tests {
 
         // Send batches - should prefer server1 (less loaded)
         for i in 0..4 {
-            let events = vec![make_event(&format!("ll-{}", i), "test.leastloaded")];
-            emitter.emit(&events).await.unwrap();
+            let messages = vec![make_message(&format!("ll-{}", i), "test.leastloaded")];
+            emitter.emit(&messages).await.unwrap();
         }
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -691,12 +690,12 @@ mod tests {
 
         let emitter = GrpcEmitter::new(&endpoint).await.unwrap();
 
-        // Send a large batch of events
-        let events: Vec<Event> = (0..100)
-            .map(|i| make_event(&format!("large-{}", i), "test.large"))
+        // Send a large batch of messages
+        let messages: Vec<Message> = (0..100)
+            .map(|i| make_message(&format!("large-{}", i), "test.large"))
             .collect();
 
-        let result = emitter.emit(&events).await;
+        let result = emitter.emit(&messages).await;
         assert!(result.is_ok(), "Should emit large batch successfully");
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -753,8 +752,8 @@ mod tests {
         );
 
         // Emit should failover to second endpoint
-        let events = vec![make_event("failover-1", "test.failover")];
-        let result = emitter.emit(&events).await;
+        let messages = vec![make_message("failover-1", "test.failover")];
+        let result = emitter.emit(&messages).await;
         assert!(result.is_ok(), "Should succeed via failover");
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -787,8 +786,8 @@ mod tests {
         .unwrap();
 
         // Emit should try bad endpoint, fail, then try good endpoint and succeed
-        let events = vec![make_event("retry-1", "test.retry")];
-        let result = emitter.emit(&events).await;
+        let messages = vec![make_message("retry-1", "test.retry")];
+        let result = emitter.emit(&messages).await;
 
         assert!(
             result.is_ok(),
@@ -816,8 +815,11 @@ mod tests {
         let mut handles = vec![];
         for i in 0..20 {
             let emitter = Arc::clone(&emitter);
-            let events = vec![make_event(&format!("concurrent-{}", i), "test.concurrent")];
-            handles.push(tokio::spawn(async move { emitter.emit(&events).await }));
+            let messages = vec![make_message(
+                &format!("concurrent-{}", i),
+                "test.concurrent",
+            )];
+            handles.push(tokio::spawn(async move { emitter.emit(&messages).await }));
         }
 
         // All should complete successfully

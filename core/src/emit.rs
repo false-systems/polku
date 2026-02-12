@@ -4,13 +4,13 @@
 //! external destinations. Emitters are the output side of the POLKU pipeline.
 
 use crate::error::PluginError;
-use crate::proto::Event;
+use crate::message::Message;
 use async_trait::async_trait;
 
-/// Emitter trait - sends Events to destinations
+/// Emitter trait - sends Messages to destinations
 ///
-/// Each emitter handles forwarding events to a specific destination.
-/// Multiple emitters can be registered with POLKU and events will be
+/// Each emitter handles forwarding messages to a specific destination.
+/// Multiple emitters can be registered with POLKU and messages will be
 /// sent to all of them in a fan-out pattern.
 ///
 /// # Implementation Requirements
@@ -23,7 +23,7 @@ use async_trait::async_trait;
 /// # Example
 ///
 /// ```ignore
-/// use polku_core::{Emitter, Event, PluginError};
+/// use polku_core::{Emitter, Message, PluginError};
 /// use async_trait::async_trait;
 ///
 /// struct HttpEmitter {
@@ -37,8 +37,8 @@ use async_trait::async_trait;
 ///         "http"
 ///     }
 ///
-///     async fn emit(&self, events: &[Event]) -> Result<(), PluginError> {
-///         let body = serde_json::to_vec(events)
+///     async fn emit(&self, messages: &[Message]) -> Result<(), PluginError> {
+///         let body = serde_json::to_vec(messages)
 ///             .map_err(|e| PluginError::Transform(e.to_string()))?;
 ///
 ///         self.client.post(&self.endpoint)
@@ -67,23 +67,23 @@ pub trait Emitter: Send + Sync {
     /// the emitter type. Examples: "stdout", "kafka", "ahti", "s3".
     fn name(&self) -> &'static str;
 
-    /// Emit a batch of events to the destination
+    /// Emit a batch of messages to the destination
     ///
     /// # Arguments
     ///
-    /// * `events` - Slice of Events to emit. May be empty.
+    /// * `messages` - Slice of Messages to emit. May be empty.
     ///
     /// # Returns
     ///
-    /// * `Ok(())` - All events were successfully sent
-    /// * `Err(PluginError)` - One or more events failed to send
+    /// * `Ok(())` - All messages were successfully sent
+    /// * `Err(PluginError)` - One or more messages failed to send
     ///
     /// # Error Handling
     ///
     /// Implementations should decide whether to fail the entire batch on
-    /// any error, or to continue with remaining events. The returned error
+    /// any error, or to continue with remaining messages. The returned error
     /// should describe the failure mode clearly.
-    async fn emit(&self, events: &[Event]) -> Result<(), PluginError>;
+    async fn emit(&self, messages: &[Message]) -> Result<(), PluginError>;
 
     /// Check if the destination is healthy and accepting events
     ///

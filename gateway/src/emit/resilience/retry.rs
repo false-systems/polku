@@ -4,8 +4,8 @@
 
 use crate::emit::Emitter;
 use crate::error::PluginError;
+use crate::message::Message;
 use async_trait::async_trait;
-use polku_core::Event;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -169,7 +169,7 @@ impl Emitter for RetryEmitter {
         "retry"
     }
 
-    async fn emit(&self, events: &[Event]) -> Result<(), PluginError> {
+    async fn emit(&self, messages: &[Message]) -> Result<(), PluginError> {
         let mut last_error = None;
 
         for attempt in 0..=self.config.max_attempts {
@@ -186,7 +186,7 @@ impl Emitter for RetryEmitter {
                 tokio::time::sleep(delay).await;
             }
 
-            match self.inner.emit(events).await {
+            match self.inner.emit(messages).await {
                 Ok(()) => {
                     if attempt > 0 {
                         self.recovered_count.fetch_add(1, Ordering::Relaxed);
@@ -257,7 +257,7 @@ mod tests {
             "failing"
         }
 
-        async fn emit(&self, _: &[Event]) -> Result<(), PluginError> {
+        async fn emit(&self, _: &[Message]) -> Result<(), PluginError> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             let count = self.fail_count.fetch_add(1, Ordering::SeqCst);
             if count < self.max_failures {
@@ -272,19 +272,8 @@ mod tests {
         }
     }
 
-    fn make_test_event() -> Event {
-        Event {
-            id: "test-1".to_string(),
-            timestamp_unix_ns: 0,
-            source: "test".to_string(),
-            event_type: "test".to_string(),
-            metadata: std::collections::HashMap::new(),
-            payload: vec![],
-            route_to: vec![],
-            severity: 0,
-            outcome: 0,
-            data: None,
-        }
+    fn make_test_message() -> Message {
+        Message::new("test", "test", bytes::Bytes::new())
     }
 
     #[test]
@@ -375,7 +364,7 @@ mod tests {
             },
         );
 
-        let result = retry.emit(&[make_test_event()]).await;
+        let result = retry.emit(&[make_test_message()]).await;
 
         assert!(result.is_ok());
         assert_eq!(inner.calls(), 1);
@@ -396,7 +385,7 @@ mod tests {
             },
         );
 
-        let result = retry.emit(&[make_test_event()]).await;
+        let result = retry.emit(&[make_test_message()]).await;
 
         assert!(result.is_ok());
         assert_eq!(inner.calls(), 3); // 2 failures + 1 success
@@ -416,7 +405,7 @@ mod tests {
             },
         );
 
-        let result = retry.emit(&[make_test_event()]).await;
+        let result = retry.emit(&[make_test_message()]).await;
 
         assert!(result.is_err());
         assert_eq!(inner.calls(), 4); // 1 initial + 3 retries

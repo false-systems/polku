@@ -20,6 +20,21 @@ thiserror = "1.0"
 prost = "0.13"
 prost-types = "0.13"
 
+# Zero-copy buffers (Message payload)
+bytes = "1"
+
+# Unique message IDs
+ulid = "1"
+
+# String interning (InternedStr for source/message_type)
+lasso = { version = "0.7.3", features = ["multi-threaded"] }
+
+# Inline small collections (Routes)
+smallvec = "1.13"
+
+# Timestamps
+chrono = { version = "0.4" }
+
 [dev-dependencies]
 tokio = { version = "1.43", features = ["rt", "macros"] }
 

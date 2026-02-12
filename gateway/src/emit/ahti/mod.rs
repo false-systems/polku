@@ -22,12 +22,14 @@
 
 mod ahti_proto;
 
-use super::{Emitter, Event, PluginError};
+use super::{Emitter, PluginError};
+use crate::message::Message;
 use ahti_proto::ahti::v1::{
     self as ahti_types, AhtiEvent, AhtiEventBatch, AhtiHealthRequest, Entity, EntityReference,
     EntityType, EventType, Relationship, RelationshipState, RelationshipType,
     ahti_service_client::AhtiServiceClient,
 };
+use polku_core::Event;
 // Import polku_core types for the Event.data oneof
 use polku_core::proto::event::Data as PolkuEventData;
 use polku_core::{Outcome as PolkuOutcome, Severity as PolkuSeverity};
@@ -355,22 +357,26 @@ impl AhtiEmitter {
     /// Checks metadata["duration_us"], metadata["duration_ms"], or network latency.
     fn extract_duration_us(event: &Event) -> u64 {
         // First check explicit duration in metadata
-        if let Some(duration_us) = event.metadata.get("duration_us") {
-            if let Ok(us) = duration_us.parse::<u64>() {
-                return us;
-            }
+        if let Some(us) = event
+            .metadata
+            .get("duration_us")
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            return us;
         }
-        if let Some(duration_ms) = event.metadata.get("duration_ms") {
-            if let Ok(ms) = duration_ms.parse::<u64>() {
-                return ms * 1000;
-            }
+        if let Some(ms) = event
+            .metadata
+            .get("duration_ms")
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            return ms * 1000;
         }
 
         // Fall back to typed data latency (network events have latency_ms)
-        if let Some(PolkuEventData::Network(n)) = &event.data {
-            if n.latency_ms > 0.0 {
-                return (n.latency_ms * 1000.0) as u64;
-            }
+        if let Some(PolkuEventData::Network(n)) = &event.data
+            && n.latency_ms > 0.0
+        {
+            return (n.latency_ms * 1000.0) as u64;
         }
 
         0
@@ -394,30 +400,29 @@ impl AhtiEmitter {
                 .get("pod_name")
                 .or_else(|| event.metadata.get("name")),
             event.metadata.get("node_name"),
-        ) {
-            if event.metadata.get("resource").map(|s| s.as_str()) == Some("pod") {
-                relationships.push(Relationship {
-                    r#type: RelationshipType::ScheduledOn as i32,
-                    source: Some(EntityReference {
-                        r#type: EntityType::Pod as i32,
-                        id: event.metadata.get("uid").cloned().unwrap_or_default(),
-                        cluster_id: cluster_id.clone(),
-                    }),
-                    target: Some(EntityReference {
-                        r#type: EntityType::Node as i32,
-                        id: String::new(), // Node ID often not in metadata
-                        cluster_id: cluster_id.clone(),
-                    }),
-                    labels: [("target_name".to_string(), node_name.clone())]
-                        .into_iter()
-                        .collect(),
-                    generation: 0,
-                    state: RelationshipState::Active as i32,
-                    deleted_at: None,
-                    delete_reason: String::new(),
-                    created_at: None,
-                });
-            }
+        ) && event.metadata.get("resource").map(|s| s.as_str()) == Some("pod")
+        {
+            relationships.push(Relationship {
+                r#type: RelationshipType::ScheduledOn as i32,
+                source: Some(EntityReference {
+                    r#type: EntityType::Pod as i32,
+                    id: event.metadata.get("uid").cloned().unwrap_or_default(),
+                    cluster_id: cluster_id.clone(),
+                }),
+                target: Some(EntityReference {
+                    r#type: EntityType::Node as i32,
+                    id: String::new(), // Node ID often not in metadata
+                    cluster_id: cluster_id.clone(),
+                }),
+                labels: [("target_name".to_string(), node_name.clone())]
+                    .into_iter()
+                    .collect(),
+                generation: 0,
+                state: RelationshipState::Active as i32,
+                deleted_at: None,
+                delete_reason: String::new(),
+                created_at: None,
+            });
         }
 
         // Owner reference (e.g., Pod -> ReplicaSet -> Deployment) uses Owns relationship
@@ -548,7 +553,7 @@ impl AhtiEmitter {
                     state: c.state.clone(),
                     exit_code: c.exit_code,
                     restart_count: c.restart_count,
-                    start_time: c.start_time.clone(),
+                    start_time: c.start_time,
                     cpu_usage: c.cpu_usage,
                     memory_usage: c.memory_usage,
                     memory_limit: c.memory_limit,
@@ -580,8 +585,8 @@ impl AhtiEmitter {
                     gid: p.gid,
                     user: p.user.clone(),
                     exit_code: p.exit_code,
-                    start_time: p.start_time.clone(),
-                    end_time: p.end_time.clone(),
+                    start_time: p.start_time,
+                    end_time: p.end_time,
                 },
             )),
             PolkuEventData::Resource(r) => Some(ahti_types::ahti_event::Data::Resource(
@@ -695,10 +700,15 @@ impl Emitter for AhtiEmitter {
         "ahti"
     }
 
-    async fn emit(&self, events: &[Event]) -> Result<(), PluginError> {
-        if events.is_empty() {
+    async fn emit(&self, messages: &[Message]) -> Result<(), PluginError> {
+        if messages.is_empty() {
             return Ok(());
         }
+
+        // Convert at gRPC boundary - same pattern as GrpcEmitter/ExternalEmitter.
+        // Note: typed Event fields (severity, outcome, data) are set to defaults
+        // because they were already lost in the pipeline's Message stage.
+        let events: Vec<Event> = messages.iter().map(|m| Event::from(m.clone())).collect();
 
         let mut tried = vec![false; self.clients.len()];
         let mut last_error = None;
@@ -707,7 +717,7 @@ impl Emitter for AhtiEmitter {
         while let Some(idx) = self.select_endpoint(&tried) {
             tried[idx] = true;
 
-            match self.try_emit_to(idx, events).await {
+            match self.try_emit_to(idx, &events).await {
                 Ok(_latency_us) => return Ok(()),
                 Err(e) => {
                     warn!(endpoint = %self.endpoints[idx], error = %e, "Emit failed, trying next endpoint");
@@ -720,7 +730,7 @@ impl Emitter for AhtiEmitter {
         while let Some(idx) = self.select_any_untried(&tried) {
             tried[idx] = true;
 
-            match self.try_emit_to(idx, events).await {
+            match self.try_emit_to(idx, &events).await {
                 Ok(_latency_us) => {
                     info!(endpoint = %self.endpoints[idx], "Unhealthy endpoint recovered");
                     return Ok(());
@@ -731,7 +741,7 @@ impl Emitter for AhtiEmitter {
             }
         }
 
-        error!(event_count = events.len(), "All AHTI endpoints failed");
+        error!(event_count = messages.len(), "All AHTI endpoints failed");
 
         Err(last_error
             .unwrap_or_else(|| PluginError::Send("No AHTI endpoints available".to_string())))

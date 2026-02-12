@@ -3,11 +3,13 @@
 //! Delegates event emission to an external gRPC service implementing
 //! the EmitterPlugin protocol.
 
-use super::{Emitter, Event, PluginError};
+use super::{Emitter, PluginError};
+use crate::message::Message;
 use crate::proto::emitter_plugin_client::EmitterPluginClient;
 use crate::proto::{EmitRequest, ShutdownResponse};
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use polku_core::Event;
 use std::sync::Arc;
 use tonic::transport::Channel;
 
@@ -114,12 +116,12 @@ impl Emitter for ExternalEmitter {
         self.name_static
     }
 
-    async fn emit(&self, events: &[Event]) -> Result<(), PluginError> {
+    async fn emit(&self, messages: &[Message]) -> Result<(), PluginError> {
         let mut client = self.get_client().await?;
 
-        let request = EmitRequest {
-            events: events.to_vec(),
-        };
+        // Convert Messages to Events at the gRPC boundary
+        let events: Vec<Event> = messages.iter().map(|m| Event::from(m.clone())).collect();
+        let request = EmitRequest { events };
 
         let response = client.emit(request).await.map_err(|status| {
             // Clear cached client on error (it might be stale)
@@ -291,7 +293,10 @@ mod tests {
             }))
         }
 
-        async fn emit(&self, request: Request<EmitRequest>) -> Result<Response<EmitResponse>, Status> {
+        async fn emit(
+            &self,
+            request: Request<EmitRequest>,
+        ) -> Result<Response<EmitResponse>, Status> {
             // Check if we should return an error
             if let Some(ref msg) = self.error_message {
                 return Err(Status::internal(msg.clone()));
@@ -393,22 +398,12 @@ mod tests {
 
         let emitter = ExternalEmitter::new("test", format!("http://{}", addr));
 
-        let events = vec![
-            Event {
-                id: "evt-1".to_string(),
-                source: "test".to_string(),
-                event_type: "test.event".to_string(),
-                ..Default::default()
-            },
-            Event {
-                id: "evt-2".to_string(),
-                source: "test".to_string(),
-                event_type: "test.event".to_string(),
-                ..Default::default()
-            },
+        let messages = vec![
+            Message::with_id("evt-1", 0, "test", "test.event", bytes::Bytes::new()),
+            Message::with_id("evt-2", 0, "test", "test.event", bytes::Bytes::new()),
         ];
 
-        let result = emitter.emit(&events).await;
+        let result = emitter.emit(&messages).await;
         assert!(result.is_ok(), "Expected Ok, got: {:?}", result);
     }
 
@@ -426,12 +421,9 @@ mod tests {
         // No server running at this address
         let emitter = ExternalEmitter::new("test", "http://127.0.0.1:59998");
 
-        let events = vec![Event {
-            id: "evt-1".to_string(),
-            ..Default::default()
-        }];
+        let messages = vec![Message::with_id("evt-1", 0, "", "", bytes::Bytes::new())];
 
-        let result = emitter.emit(&events).await;
+        let result = emitter.emit(&messages).await;
         assert!(result.is_err());
 
         match result {
@@ -445,29 +437,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_partial_failure() {
-        let (addr, _shutdown) =
-            start_mock_server(MockEmitterPlugin::with_failing_events(vec!["evt-2".to_string()]))
-                .await;
+        // Create messages first so we can extract the serialized ID
+        // (MessageId::to_string() returns ULID encoding, not the original string)
+        let messages = vec![
+            Message::with_id("evt-1", 0, "", "", bytes::Bytes::new()),
+            Message::with_id("evt-2", 0, "", "", bytes::Bytes::new()),
+        ];
+        let evt2_serialized = messages[1].id.to_string();
+
+        let (addr, _shutdown) = start_mock_server(MockEmitterPlugin::with_failing_events(vec![
+            evt2_serialized.clone(),
+        ]))
+        .await;
 
         let emitter = ExternalEmitter::new("test", format!("http://{}", addr));
 
-        let events = vec![
-            Event {
-                id: "evt-1".to_string(),
-                ..Default::default()
-            },
-            Event {
-                id: "evt-2".to_string(),
-                ..Default::default()
-            },
-        ];
-
-        let result = emitter.emit(&events).await;
+        let result = emitter.emit(&messages).await;
         assert!(result.is_err());
 
         match result {
             Err(PluginError::Send(msg)) => {
-                assert!(msg.contains("evt-2"));
+                assert!(msg.contains(&evt2_serialized));
                 assert!(msg.contains("1 events")); // 1 failed
             }
             Err(e) => panic!("Expected Send error, got: {:?}", e),
@@ -482,12 +472,9 @@ mod tests {
 
         let emitter = ExternalEmitter::new("test", format!("http://{}", addr));
 
-        let events = vec![Event {
-            id: "evt-1".to_string(),
-            ..Default::default()
-        }];
+        let messages = vec![Message::with_id("evt-1", 0, "", "", bytes::Bytes::new())];
 
-        let result = emitter.emit(&events).await;
+        let result = emitter.emit(&messages).await;
         assert!(result.is_err());
 
         match result {
@@ -541,11 +528,14 @@ mod tests {
         let emitter = ExternalEmitter::new("test", format!("http://{}", addr));
 
         for i in 0..3 {
-            let events = vec![Event {
-                id: format!("evt-{}", i),
-                ..Default::default()
-            }];
-            let result = emitter.emit(&events).await;
+            let messages = vec![Message::with_id(
+                format!("evt-{}", i),
+                0,
+                "",
+                "",
+                bytes::Bytes::new(),
+            )];
+            let result = emitter.emit(&messages).await;
             assert!(result.is_ok(), "Call {} failed: {:?}", i, result);
         }
     }

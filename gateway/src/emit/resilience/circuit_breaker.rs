@@ -4,9 +4,9 @@
 
 use crate::emit::Emitter;
 use crate::error::PluginError;
+use crate::message::Message;
 use async_trait::async_trait;
 use parking_lot::RwLock;
-use polku_core::Event;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -223,12 +223,12 @@ impl Emitter for CircuitBreakerEmitter {
         "circuit_breaker"
     }
 
-    async fn emit(&self, events: &[Event]) -> Result<(), PluginError> {
+    async fn emit(&self, messages: &[Message]) -> Result<(), PluginError> {
         if !self.should_allow_request() {
             return Err(PluginError::NotReady);
         }
 
-        match self.inner.emit(events).await {
+        match self.inner.emit(messages).await {
             Ok(()) => {
                 self.record_success();
                 Ok(())
@@ -267,7 +267,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "always_failing"
         }
-        async fn emit(&self, _: &[Event]) -> Result<(), PluginError> {
+        async fn emit(&self, _: &[Message]) -> Result<(), PluginError> {
             Err(PluginError::Connection("always fails".into()))
         }
         async fn health(&self) -> bool {
@@ -295,7 +295,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "recoverable"
         }
-        async fn emit(&self, _: &[Event]) -> Result<(), PluginError> {
+        async fn emit(&self, _: &[Message]) -> Result<(), PluginError> {
             let count = self.fail_count.fetch_add(1, Ordering::SeqCst);
             if count < self.max_failures {
                 Err(PluginError::Connection("temporary failure".into()))
@@ -316,7 +316,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "success"
         }
-        async fn emit(&self, _: &[Event]) -> Result<(), PluginError> {
+        async fn emit(&self, _: &[Message]) -> Result<(), PluginError> {
             Ok(())
         }
         async fn health(&self) -> bool {
@@ -324,19 +324,8 @@ mod tests {
         }
     }
 
-    fn make_test_event() -> Event {
-        Event {
-            id: "test-1".to_string(),
-            timestamp_unix_ns: 0,
-            source: "test".to_string(),
-            event_type: "test".to_string(),
-            metadata: std::collections::HashMap::new(),
-            payload: vec![],
-            route_to: vec![],
-            severity: 0,
-            outcome: 0,
-            data: None,
-        }
+    fn make_test_message() -> Message {
+        Message::new("test", "test", bytes::Bytes::new())
     }
 
     #[tokio::test]
@@ -352,7 +341,7 @@ mod tests {
         let inner = Arc::new(SuccessEmitter);
         let cb = CircuitBreakerEmitter::with_defaults(inner);
 
-        let result = cb.emit(&[make_test_event()]).await;
+        let result = cb.emit(&[make_test_message()]).await;
 
         assert!(result.is_ok());
         assert_eq!(cb.current_state(), CircuitState::Closed);
@@ -371,7 +360,7 @@ mod tests {
 
         // First 3 failures should go through
         for _ in 0..3 {
-            let _ = cb.emit(&[make_test_event()]).await;
+            let _ = cb.emit(&[make_test_message()]).await;
         }
 
         // Circuit should now be open
@@ -392,11 +381,11 @@ mod tests {
         );
 
         // Open circuit
-        let _ = cb.emit(&[make_test_event()]).await;
+        let _ = cb.emit(&[make_test_message()]).await;
         assert_eq!(cb.current_state(), CircuitState::Open);
 
         // Next request should fail fast with NotReady
-        let result = cb.emit(&[make_test_event()]).await;
+        let result = cb.emit(&[make_test_message()]).await;
         assert!(matches!(result, Err(PluginError::NotReady)));
         assert_eq!(cb.rejected_count(), 1);
     }
@@ -414,14 +403,14 @@ mod tests {
         );
 
         // Open circuit
-        let _ = cb.emit(&[make_test_event()]).await;
+        let _ = cb.emit(&[make_test_message()]).await;
         assert_eq!(cb.current_state(), CircuitState::Open);
 
         // Wait for reset timeout
         tokio::time::sleep(Duration::from_millis(15)).await;
 
         // Next request should be allowed (half-open probe)
-        let _ = cb.emit(&[make_test_event()]).await;
+        let _ = cb.emit(&[make_test_message()]).await;
 
         // But it failed, so back to open
         assert_eq!(cb.current_state(), CircuitState::Open);
@@ -441,21 +430,21 @@ mod tests {
         );
 
         // Open circuit (1 failure)
-        let _ = cb.emit(&[make_test_event()]).await;
+        let _ = cb.emit(&[make_test_message()]).await;
         assert_eq!(cb.current_state(), CircuitState::Open);
 
         // Wait for half-open
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         // Probe fails (2nd failure)
-        let _ = cb.emit(&[make_test_event()]).await;
+        let _ = cb.emit(&[make_test_message()]).await;
         assert_eq!(cb.current_state(), CircuitState::Open);
 
         // Wait again
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         // This probe succeeds (3rd attempt, recoverable allows it)
-        let result = cb.emit(&[make_test_event()]).await;
+        let result = cb.emit(&[make_test_message()]).await;
         assert!(result.is_ok());
         assert_eq!(cb.current_state(), CircuitState::Closed);
     }
@@ -475,7 +464,7 @@ mod tests {
         assert!(!cb.health().await); // Inner always returns false
 
         // Open circuit
-        let _ = cb.emit(&[make_test_event()]).await;
+        let _ = cb.emit(&[make_test_message()]).await;
         assert_eq!(cb.current_state(), CircuitState::Open);
 
         // Open - always unhealthy
@@ -494,11 +483,11 @@ mod tests {
         );
 
         // Two failures
-        let _ = cb.emit(&[make_test_event()]).await;
-        let _ = cb.emit(&[make_test_event()]).await;
+        let _ = cb.emit(&[make_test_message()]).await;
+        let _ = cb.emit(&[make_test_message()]).await;
 
         // Third succeeds
-        let result = cb.emit(&[make_test_event()]).await;
+        let result = cb.emit(&[make_test_message()]).await;
         assert!(result.is_ok());
 
         // Circuit should still be closed (failures reset)

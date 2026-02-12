@@ -347,7 +347,7 @@ impl MessageSender {
 /// Raw bytes sender for injecting data that needs ingestion
 ///
 /// This sender accepts raw bytes along with context (source, cluster, format)
-/// and uses the registered ingestors to transform them into Events before
+/// and uses the registered ingestors to transform them into Messages before
 /// sending them into the pipeline.
 ///
 /// # Example
@@ -374,7 +374,7 @@ impl RawSender {
     /// Send raw bytes into the pipeline after ingestion
     ///
     /// The ingestor for the given source will transform the raw bytes into
-    /// one or more Events, which are then converted to Messages and sent.
+    /// one or more Messages and send them into the pipeline.
     ///
     /// # Arguments
     /// * `source` - Source identifier (used to find the ingestor)
@@ -397,13 +397,11 @@ impl RawSender {
             format,
         };
 
-        // Transform raw bytes to Events using the ingestor
-        let events = self.registry.ingest(&ctx, data)?;
-        let count = events.len();
+        // Transform raw bytes to Messages using the ingestor
+        let messages = self.registry.ingest(&ctx, data)?;
+        let count = messages.len();
 
-        // Convert Events to Messages and send
-        for event in events {
-            let msg: Message = event.into();
+        for msg in messages {
             self.tx
                 .send(msg)
                 .await
@@ -427,11 +425,10 @@ impl RawSender {
             format,
         };
 
-        let events = self.registry.ingest(&ctx, data)?;
-        let count = events.len();
+        let messages = self.registry.ingest(&ctx, data)?;
+        let count = messages.len();
 
-        for event in events {
-            let msg: Message = event.into();
+        for msg in messages {
             self.tx
                 .try_send(msg)
                 .map_err(|e| PluginError::Send(e.to_string()))?;
@@ -450,7 +447,7 @@ impl RawSender {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::emit::{Event, StdoutEmitter};
+    use crate::emit::StdoutEmitter;
     use crate::middleware::{Filter, Transform};
     use bytes::Bytes;
     use runner::partition_by_destination_owned;
@@ -547,8 +544,8 @@ mod tests {
             fn name(&self) -> &'static str {
                 "counter"
             }
-            async fn emit(&self, events: &[Event]) -> Result<(), crate::error::PluginError> {
-                self.0.fetch_add(events.len() as u64, Ordering::SeqCst);
+            async fn emit(&self, messages: &[Message]) -> Result<(), crate::error::PluginError> {
+                self.0.fetch_add(messages.len() as u64, Ordering::SeqCst);
                 Ok(())
             }
             async fn health(&self) -> bool {
@@ -615,8 +612,9 @@ mod tests {
                 "counter"
             }
 
-            async fn emit(&self, events: &[Event]) -> Result<(), crate::error::PluginError> {
-                self.count.fetch_add(events.len() as u64, Ordering::SeqCst);
+            async fn emit(&self, messages: &[Message]) -> Result<(), crate::error::PluginError> {
+                self.count
+                    .fetch_add(messages.len() as u64, Ordering::SeqCst);
                 Ok(())
             }
 
@@ -666,7 +664,7 @@ mod tests {
         fn name(&self) -> &'static str {
             self.name
         }
-        async fn emit(&self, _: &[Event]) -> Result<(), crate::error::PluginError> {
+        async fn emit(&self, _: &[Message]) -> Result<(), crate::error::PluginError> {
             Ok(())
         }
         async fn health(&self) -> bool {
@@ -684,15 +682,11 @@ mod tests {
         ];
 
         // 5 broadcast messages (empty route_to = goes everywhere)
-        let events: Vec<Event> = (0..5)
-            .map(|i| Event {
-                id: format!("msg-{i}"),
-                route_to: vec![], // broadcast
-                ..Default::default()
-            })
+        let messages: Vec<Message> = (0..5)
+            .map(|i| Message::with_id(format!("msg-{i}"), 0, "test", "test", Bytes::new()))
             .collect();
 
-        let batches = partition_by_destination_owned(events, &emitters);
+        let batches = partition_by_destination_owned(messages, &emitters);
 
         // Each emitter should get all 5 messages
         assert_eq!(batches.get("kafka").map(|v| v.len()), Some(5));
@@ -713,45 +707,37 @@ mod tests {
         // - msg-1: stdout only
         // - msg-2: kafka + webhook
         // - msg-3: broadcast (empty)
-        let events = vec![
-            Event {
-                id: "msg-0".into(),
-                route_to: vec!["kafka".into()],
-                ..Default::default()
-            },
-            Event {
-                id: "msg-1".into(),
-                route_to: vec!["stdout".into()],
-                ..Default::default()
-            },
-            Event {
-                id: "msg-2".into(),
-                route_to: vec!["kafka".into(), "webhook".into()],
-                ..Default::default()
-            },
-            Event {
-                id: "msg-3".into(),
-                route_to: vec![], // broadcast
-                ..Default::default()
-            },
+        let messages = vec![
+            Message::with_id("msg-0", 0, "test", "test", Bytes::new())
+                .with_routes(vec!["kafka".to_string()]),
+            Message::with_id("msg-1", 0, "test", "test", Bytes::new())
+                .with_routes(vec!["stdout".to_string()]),
+            Message::with_id("msg-2", 0, "test", "test", Bytes::new())
+                .with_routes(vec!["kafka".to_string(), "webhook".to_string()]),
+            Message::with_id("msg-3", 0, "test", "test", Bytes::new()),
+            // msg-3 has empty route_to = broadcast
         ];
 
-        let batches = partition_by_destination_owned(events, &emitters);
+        let batches = partition_by_destination_owned(messages, &emitters);
 
         // kafka: msg-0, msg-2, msg-3
-        let kafka_events = batches.get("kafka").unwrap();
-        let kafka_ids: Vec<_> = kafka_events.iter().map(|e| e.id.as_str()).collect();
-        assert_eq!(kafka_ids, &["msg-0", "msg-2", "msg-3"]);
+        let kafka_batch = batches.get("kafka").unwrap();
+        assert_eq!(kafka_batch.len(), 3);
+        assert!(kafka_batch[0].id == "msg-0");
+        assert!(kafka_batch[1].id == "msg-2");
+        assert!(kafka_batch[2].id == "msg-3");
 
         // stdout: msg-1, msg-3
-        let stdout_events = batches.get("stdout").unwrap();
-        let stdout_ids: Vec<_> = stdout_events.iter().map(|e| e.id.as_str()).collect();
-        assert_eq!(stdout_ids, &["msg-1", "msg-3"]);
+        let stdout_batch = batches.get("stdout").unwrap();
+        assert_eq!(stdout_batch.len(), 2);
+        assert!(stdout_batch[0].id == "msg-1");
+        assert!(stdout_batch[1].id == "msg-3");
 
         // webhook: msg-2, msg-3
-        let webhook_events = batches.get("webhook").unwrap();
-        let webhook_ids: Vec<_> = webhook_events.iter().map(|e| e.id.as_str()).collect();
-        assert_eq!(webhook_ids, &["msg-2", "msg-3"]);
+        let webhook_batch = batches.get("webhook").unwrap();
+        assert_eq!(webhook_batch.len(), 2);
+        assert!(webhook_batch[0].id == "msg-2");
+        assert!(webhook_batch[1].id == "msg-3");
     }
 
     #[test]
@@ -760,13 +746,12 @@ mod tests {
             vec![Arc::new(NamedEmitter { name: "kafka" })];
 
         // Message routed to non-existent emitter
-        let events = vec![Event {
-            id: "msg-0".into(),
-            route_to: vec!["nonexistent".into()],
-            ..Default::default()
-        }];
+        let messages = vec![
+            Message::with_id("msg-0", 0, "test", "test", Bytes::new())
+                .with_routes(vec!["nonexistent".to_string()]),
+        ];
 
-        let batches = partition_by_destination_owned(events, &emitters);
+        let batches = partition_by_destination_owned(messages, &emitters);
 
         // kafka should get nothing (route_to doesn't match)
         assert_eq!(batches.get("kafka").map(|v| v.len()), Some(0));
@@ -780,22 +765,26 @@ mod tests {
             Arc::new(NamedEmitter { name: "stdout" }),
         ];
 
-        // Create events with large payloads to make clone cost visible
-        let events: Vec<Event> = (0..3)
-            .map(|i| Event {
-                id: format!("msg-{i}"),
-                // Each goes to only one destination
-                route_to: if i % 2 == 0 {
-                    vec!["kafka".into()]
+        // Create messages with large payloads to make clone cost visible
+        let messages: Vec<Message> = (0..3)
+            .map(|i| {
+                let routes = if i % 2 == 0 {
+                    vec!["kafka".to_string()]
                 } else {
-                    vec!["stdout".into()]
-                },
-                payload: vec![0u8; 10_000], // 10KB payload
-                ..Default::default()
+                    vec!["stdout".to_string()]
+                };
+                Message::with_id(
+                    format!("msg-{i}"),
+                    0,
+                    "test",
+                    "test",
+                    Bytes::from(vec![0u8; 10_000]),
+                )
+                .with_routes(routes)
             })
             .collect();
 
-        let batches = partition_by_destination_owned(events, &emitters);
+        let batches = partition_by_destination_owned(messages, &emitters);
 
         // kafka: msg-0, msg-2
         assert_eq!(batches.get("kafka").map(|v| v.len()), Some(2));
@@ -817,22 +806,23 @@ mod tests {
             Arc::new(NamedEmitter { name: "webhook" }),
         ];
 
-        // One event going to all 3 destinations
-        let events = vec![Event {
-            id: "broadcast-msg".into(),
-            route_to: vec![], // broadcast = all destinations
-            payload: vec![42u8; 100],
-            ..Default::default()
-        }];
+        // One message going to all 3 destinations
+        let messages = vec![Message::with_id(
+            "broadcast-msg",
+            0,
+            "test",
+            "test",
+            Bytes::from(vec![42u8; 100]),
+        )];
 
-        let batches = partition_by_destination_owned(events, &emitters);
+        let batches = partition_by_destination_owned(messages, &emitters);
 
-        // Each emitter should have the event
+        // Each emitter should have the message
         for name in ["kafka", "stdout", "webhook"] {
             let batch = batches.get(name).unwrap();
             assert_eq!(batch.len(), 1);
-            assert_eq!(batch[0].id, "broadcast-msg");
-            assert_eq!(batch[0].payload, vec![42u8; 100]);
+            assert!(batch[0].id == "broadcast-msg");
+            assert_eq!(&batch[0].payload[..], &vec![42u8; 100][..]);
         }
     }
 
@@ -854,9 +844,9 @@ mod tests {
             fn name(&self) -> &'static str {
                 "counter"
             }
-            async fn emit(&self, events: &[Event]) -> Result<(), PluginError> {
+            async fn emit(&self, messages: &[Message]) -> Result<(), PluginError> {
                 self.count
-                    .fetch_add(events.len(), std::sync::atomic::Ordering::SeqCst);
+                    .fetch_add(messages.len(), std::sync::atomic::Ordering::SeqCst);
                 Ok(())
             }
             async fn health(&self) -> bool {
@@ -922,7 +912,7 @@ mod tests {
             fn name(&self) -> &'static str {
                 "failing"
             }
-            async fn emit(&self, _events: &[Event]) -> Result<(), PluginError> {
+            async fn emit(&self, _messages: &[Message]) -> Result<(), PluginError> {
                 Err(PluginError::Send("intentional failure".into()))
             }
             async fn health(&self) -> bool {
@@ -989,8 +979,9 @@ mod tests {
                 "timing"
             }
 
-            async fn emit(&self, events: &[Event]) -> Result<(), crate::error::PluginError> {
-                self.count.fetch_add(events.len() as u64, Ordering::SeqCst);
+            async fn emit(&self, messages: &[Message]) -> Result<(), crate::error::PluginError> {
+                self.count
+                    .fetch_add(messages.len() as u64, Ordering::SeqCst);
                 let mut first = self.first_emit_time.lock();
                 if first.is_none() {
                     *first = Some(Instant::now());
@@ -1101,8 +1092,9 @@ mod tests {
                 "counter"
             }
 
-            async fn emit(&self, events: &[Event]) -> Result<(), crate::error::PluginError> {
-                self.count.fetch_add(events.len() as u64, Ordering::SeqCst);
+            async fn emit(&self, messages: &[Message]) -> Result<(), crate::error::PluginError> {
+                self.count
+                    .fetch_add(messages.len() as u64, Ordering::SeqCst);
                 Ok(())
             }
 
@@ -1197,8 +1189,9 @@ mod tests {
             fn name(&self) -> &'static str {
                 "capture"
             }
-            async fn emit(&self, events: &[Event]) -> Result<(), crate::error::PluginError> {
-                self.count.fetch_add(events.len() as u64, Ordering::SeqCst);
+            async fn emit(&self, messages: &[Message]) -> Result<(), crate::error::PluginError> {
+                self.count
+                    .fetch_add(messages.len() as u64, Ordering::SeqCst);
                 Ok(())
             }
             async fn health(&self) -> bool {

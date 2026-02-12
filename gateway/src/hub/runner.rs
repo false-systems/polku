@@ -4,7 +4,7 @@
 
 use super::buffer::HubBuffer;
 use crate::checkpoint::CheckpointStore;
-use crate::emit::{Emitter, Event};
+use crate::emit::Emitter;
 use crate::error::PluginError;
 use crate::message::Message;
 use crate::metrics::Metrics;
@@ -150,11 +150,8 @@ impl HubRunner {
             .sequence
             .fetch_add(messages.len() as u64, Ordering::SeqCst);
 
-        // Convert Messages to proto Events for outputs
-        let events: Vec<Event> = messages.into_iter().map(Event::from).collect();
-
-        // Partition events by destination with zero-copy optimization
-        let batches = partition_by_destination_owned(events, &self.emitters);
+        // Partition messages by destination with zero-copy optimization
+        let batches = partition_by_destination_owned(messages, &self.emitters);
 
         // Pre-aggregate metrics to reduce Prometheus HashMap lookups.
         // Key: (emitter_name, event_type), Value: count
@@ -203,13 +200,13 @@ impl HubRunner {
                     "Emitted (inline)"
                 );
                 // Aggregate counts locally instead of per-event Prometheus updates
-                for event in routed_events {
+                for msg in routed_events {
                     *forward_counts
-                        .entry((emitter.name(), event.event_type.as_str()))
+                        .entry((emitter.name(), &msg.message_type))
                         .or_default() += 1;
                 }
-                // Update checkpoint: advance by number of events this emitter processed.
-                // Uses batch_start_seq + emitter's event count - 1 as the checkpoint.
+                // Update checkpoint: advance by number of messages this emitter processed.
+                // Uses batch_start_seq + emitter's message count - 1 as the checkpoint.
                 // This ensures each emitter tracks its own progress independently.
                 if let Some(ref store) = self.checkpoint_store {
                     let emitter_end_seq = batch_start_seq + routed_events.len() as u64 - 1;
@@ -238,66 +235,66 @@ impl HubRunner {
     }
 }
 
-/// Partition events by destination, returning ready-to-emit batches
+/// Partition messages by destination, returning ready-to-emit batches
 ///
-/// For events that go to only ONE emitter, moves the event (no clone).
-/// For events that go to MULTIPLE emitters, clones N-1 times (last one is moved).
+/// For messages that go to only ONE emitter, moves the message (no clone).
+/// For messages that go to MULTIPLE emitters, clones N-1 times (last one is moved).
 ///
 /// # Performance
 ///
-/// - Single pass to count destinations per event: O(events × emitters)
-/// - Second pass to distribute: O(events × avg_destinations)
-/// - Multi-destination events: N-1 clones instead of N (last destination gets moved value)
+/// - Single pass to count destinations per message: O(messages × emitters)
+/// - Second pass to distribute: O(messages × avg_destinations)
+/// - Multi-destination messages: N-1 clones instead of N (last destination gets moved value)
 pub(crate) fn partition_by_destination_owned(
-    events: Vec<Event>,
+    messages: Vec<Message>,
     emitters: &[Arc<dyn Emitter>],
-) -> std::collections::HashMap<&'static str, Vec<Event>> {
-    if emitters.is_empty() || events.is_empty() {
+) -> std::collections::HashMap<&'static str, Vec<Message>> {
+    if emitters.is_empty() || messages.is_empty() {
         return std::collections::HashMap::new();
     }
 
-    let mut batches: std::collections::HashMap<&'static str, Vec<Event>> =
+    let mut batches: std::collections::HashMap<&'static str, Vec<Message>> =
         std::collections::HashMap::new();
 
     // Pre-allocate for each emitter
     for emitter in emitters {
         batches.insert(
             emitter.name(),
-            Vec::with_capacity(events.len() / emitters.len()),
+            Vec::with_capacity(messages.len() / emitters.len()),
         );
     }
 
-    // First pass: count destinations for each event
-    let mut dest_counts: Vec<usize> = vec![0; events.len()];
+    // First pass: count destinations for each message
+    let mut dest_counts: Vec<usize> = vec![0; messages.len()];
     let mut destinations: Vec<Vec<&'static str>> =
-        vec![Vec::with_capacity(emitters.len()); events.len()];
+        vec![Vec::with_capacity(emitters.len()); messages.len()];
 
-    for (idx, event) in events.iter().enumerate() {
-        let broadcast = event.route_to.is_empty();
+    for (idx, msg) in messages.iter().enumerate() {
+        let broadcast = msg.route_to.is_empty();
 
         for emitter in emitters {
-            if broadcast || event.route_to.iter().any(|r| r == emitter.name()) {
+            if broadcast || msg.route_to.iter().any(|r| r == emitter.name()) {
                 dest_counts[idx] += 1;
                 destinations[idx].push(emitter.name());
             }
         }
     }
 
-    // Second pass: distribute events
+    // Second pass: distribute messages
     // - Single destination: move (no clone)
     // - Multiple destinations: clone N-1 times, move on final access
-    for (idx, event) in events.into_iter().enumerate() {
+    for (idx, msg) in messages.into_iter().enumerate() {
         let count = dest_counts[idx];
         let dests = &destinations[idx];
 
         match count {
             0 => {
-                // Event has no matching emitters, drop it
+                // Message has no matching emitters, drop it
             }
             1 => {
                 // Single destination: move without cloning
                 if let Some(batch) = batches.get_mut(dests[0]) {
-                    batch.push(event);
+                    batch.push(msg);
                 }
             }
             _ => {
@@ -307,11 +304,11 @@ pub(crate) fn partition_by_destination_owned(
                     if let Some(batch) = batches.get_mut(*dest) {
                         if i == dests.len() - 1 {
                             // Last destination: move the original
-                            batch.push(event);
+                            batch.push(msg);
                             break;
                         } else {
                             // Not last: clone
-                            batch.push(event.clone());
+                            batch.push(msg.clone());
                         }
                     }
                 }
@@ -368,13 +365,10 @@ pub(crate) async fn flush_loop(
         // Each message gets a unique sequence number for precise tracking.
         let batch_start_seq = sequence.fetch_add(messages.len() as u64, Ordering::SeqCst);
 
-        // Convert Messages to proto Events for outputs
-        let events: Vec<Event> = messages.into_iter().map(Event::from).collect();
-
-        // Partition events by destination with zero-copy optimization
-        // - Single-destination events: moved, not cloned
-        // - Multi-destination events: N-1 clones (last one moved)
-        let batches = partition_by_destination_owned(events, &emitters);
+        // Partition messages by destination with zero-copy optimization
+        // - Single-destination messages: moved, not cloned
+        // - Multi-destination messages: N-1 clones (last one moved)
+        let batches = partition_by_destination_owned(messages, &emitters);
 
         // Pre-aggregate metrics to reduce Prometheus HashMap lookups.
         // Key: (emitter_name, event_type), Value: count
@@ -424,13 +418,13 @@ pub(crate) async fn flush_loop(
                     "Emitted"
                 );
                 // Aggregate counts locally instead of per-event Prometheus updates
-                for event in routed_events {
+                for msg in routed_events {
                     *forward_counts
-                        .entry((emitter.name(), event.event_type.as_str()))
+                        .entry((emitter.name(), &msg.message_type))
                         .or_default() += 1;
                 }
-                // Update checkpoint: advance by number of events this emitter processed.
-                // Uses batch_start_seq + emitter's event count - 1 as the checkpoint.
+                // Update checkpoint: advance by number of messages this emitter processed.
+                // Uses batch_start_seq + emitter's message count - 1 as the checkpoint.
                 // This ensures each emitter tracks its own progress independently.
                 if let Some(ref store) = checkpoint_store {
                     let emitter_end_seq = batch_start_seq + routed_events.len() as u64 - 1;

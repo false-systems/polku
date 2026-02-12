@@ -125,8 +125,8 @@ impl ResilientEmitter {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::emit::Event;
     use crate::error::PluginError;
+    use crate::message::Message;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
@@ -151,7 +151,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "recoverable"
         }
-        async fn emit(&self, _: &[Event]) -> Result<(), PluginError> {
+        async fn emit(&self, _: &[Message]) -> Result<(), PluginError> {
             let count = self.fail_count.fetch_add(1, Ordering::SeqCst);
             if count < self.max_failures {
                 Err(PluginError::Connection("temporary failure".into()))
@@ -172,7 +172,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "always_failing"
         }
-        async fn emit(&self, _: &[Event]) -> Result<(), PluginError> {
+        async fn emit(&self, _: &[Message]) -> Result<(), PluginError> {
             Err(PluginError::Connection("always fails".into()))
         }
         async fn health(&self) -> bool {
@@ -180,19 +180,8 @@ mod tests {
         }
     }
 
-    fn make_test_event() -> Event {
-        Event {
-            id: "test-1".to_string(),
-            timestamp_unix_ns: 0,
-            source: "test".to_string(),
-            event_type: "test".to_string(),
-            metadata: std::collections::HashMap::new(),
-            payload: vec![],
-            route_to: vec![],
-            severity: 0,
-            outcome: 0,
-            data: None,
-        }
+    fn make_test_message() -> Message {
+        Message::new("test", "test", bytes::Bytes::new())
     }
 
     #[tokio::test]
@@ -210,7 +199,7 @@ mod tests {
             .build();
 
         // Should succeed after retries
-        let result = resilient.emit(&[make_test_event()]).await;
+        let result = resilient.emit(&[make_test_message()]).await;
         assert!(result.is_ok());
         assert!(buffer.is_empty()); // No events captured
     }
@@ -229,7 +218,7 @@ mod tests {
             .with_default_failure_capture(buffer.clone())
             .build();
 
-        let result = resilient.emit(&[make_test_event()]).await;
+        let result = resilient.emit(&[make_test_message()]).await;
         assert!(result.is_err());
         assert_eq!(buffer.len(), 1); // Event captured to buffer
     }
@@ -253,11 +242,11 @@ mod tests {
             .build();
 
         // First 2 failures open circuit
-        let _ = resilient.emit(&[make_test_event()]).await;
-        let _ = resilient.emit(&[make_test_event()]).await;
+        let _ = resilient.emit(&[make_test_message()]).await;
+        let _ = resilient.emit(&[make_test_message()]).await;
 
         // Third request should fail fast with NotReady
-        let result = resilient.emit(&[make_test_event()]).await;
+        let result = resilient.emit(&[make_test_message()]).await;
         assert!(matches!(result, Err(PluginError::NotReady)));
 
         // Buffer should have events from first two failures + circuit open
@@ -283,7 +272,7 @@ mod tests {
             .build();
 
         // Should recover after 1 retry
-        let result = resilient.emit(&[make_test_event()]).await;
+        let result = resilient.emit(&[make_test_message()]).await;
         assert!(result.is_ok());
         assert!(buffer.is_empty());
     }
@@ -297,7 +286,7 @@ mod tests {
             .with_default_circuit_breaker()
             .build();
 
-        let result = resilient.emit(&[make_test_event()]).await;
+        let result = resilient.emit(&[make_test_message()]).await;
         assert!(result.is_ok());
     }
 
@@ -309,7 +298,7 @@ mod tests {
             .with_default_retry()
             .build();
 
-        let result = resilient.emit(&[make_test_event()]).await;
+        let result = resilient.emit(&[make_test_message()]).await;
         assert!(result.is_ok());
     }
 }
