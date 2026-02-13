@@ -42,6 +42,7 @@ use crate::checkpoint::CheckpointStore;
 use crate::emit::Emitter;
 use crate::error::PluginError;
 use crate::ingest::{IngestContext, Ingestor};
+use crate::manifest::{BufferDesc, ComponentDesc, PipelineManifest, TuningDesc};
 use crate::message::Message;
 use crate::middleware::{Middleware, MiddlewareChain};
 use crate::registry::PluginRegistry;
@@ -300,15 +301,53 @@ impl Hub {
             .and_then(|store| store.all().values().max().map(|max| max + 1))
             .unwrap_or(0);
 
+        let buffer = self.buffer_strategy.build();
+
+        // Generate pipeline manifest (self-describing topology)
+        let manifest = Arc::new(PipelineManifest {
+            version: "1".to_string(),
+            middleware: self
+                .middleware
+                .names()
+                .into_iter()
+                .enumerate()
+                .map(|(i, name)| ComponentDesc {
+                    name: name.to_string(),
+                    kind: "middleware".to_string(),
+                    position: i,
+                })
+                .collect(),
+            emitters: self
+                .emitters
+                .iter()
+                .enumerate()
+                .map(|(i, e)| ComponentDesc {
+                    name: e.name().to_string(),
+                    kind: "emitter".to_string(),
+                    position: i,
+                })
+                .collect(),
+            buffer: BufferDesc {
+                strategy: buffer.strategy_name().to_string(),
+                capacity: buffer.capacity(),
+            },
+            tuning: TuningDesc {
+                batch_size: self.batch_size,
+                flush_interval_ms: self.flush_interval_ms,
+                channel_capacity: self.channel_capacity,
+            },
+        });
+
         let runner = HubRunner {
             rx,
-            buffer: self.buffer_strategy.build(),
+            buffer,
             batch_size: self.batch_size,
             flush_interval_ms: self.flush_interval_ms,
             middleware: self.middleware,
             emitters: self.emitters,
             checkpoint_store: self.checkpoint_store,
             sequence: Arc::new(AtomicU64::new(initial_sequence)),
+            manifest,
         };
 
         (raw_sender, msg_sender, runner)

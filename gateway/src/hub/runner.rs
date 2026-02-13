@@ -6,6 +6,7 @@ use super::buffer::HubBuffer;
 use crate::checkpoint::CheckpointStore;
 use crate::emit::Emitter;
 use crate::error::PluginError;
+use crate::manifest::PipelineManifest;
 use crate::message::Message;
 use crate::metrics::Metrics;
 use crate::middleware::MiddlewareChain;
@@ -26,6 +27,8 @@ pub struct HubRunner {
     pub(crate) checkpoint_store: Option<Arc<dyn CheckpointStore>>,
     /// Monotonically increasing sequence number for checkpoint tracking
     pub(crate) sequence: Arc<AtomicU64>,
+    /// Self-describing pipeline topology (generated at build time)
+    pub(crate) manifest: Arc<PipelineManifest>,
 }
 
 impl HubRunner {
@@ -226,6 +229,8 @@ impl HubRunner {
                 let events_per_sec = total_events as f64 / flush_duration.as_secs_f64();
                 metrics.set_events_per_second(events_per_sec);
             }
+
+            update_pressure(metrics, &self.emitters);
         }
     }
 
@@ -233,6 +238,43 @@ impl HubRunner {
     pub fn buffer(&self) -> &Arc<dyn HubBuffer> {
         &self.buffer
     }
+
+    /// Get the pipeline manifest (self-describing topology)
+    pub fn manifest(&self) -> &PipelineManifest {
+        &self.manifest
+    }
+
+    /// Get a shareable reference to the manifest
+    pub fn manifest_arc(&self) -> Arc<PipelineManifest> {
+        Arc::clone(&self.manifest)
+    }
+}
+
+/// Update the composite pipeline pressure metric from current state
+fn update_pressure(metrics: &Metrics, emitters: &[Arc<dyn Emitter>]) {
+    let buf_cap = metrics.buffer_capacity.get();
+    let buffer_fill = if buf_cap > 0.0 {
+        metrics.buffer_size.get() / buf_cap
+    } else {
+        0.0
+    };
+    let emitter_count = emitters.len();
+    let emit_failure_rate = if emitter_count > 0 {
+        let unhealthy: f64 = emitters
+            .iter()
+            .map(|e| {
+                if metrics.emitter_health.with_label_values(&[e.name()]).get() < 1.0 {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+            .sum();
+        unhealthy / emitter_count as f64
+    } else {
+        0.0
+    };
+    metrics.update_pipeline_pressure(buffer_fill, emit_failure_rate, 0.0);
 }
 
 /// Partition messages by destination, returning ready-to-emit batches
@@ -444,6 +486,8 @@ pub(crate) async fn flush_loop(
                 let events_per_sec = total_events as f64 / flush_duration.as_secs_f64();
                 metrics.set_events_per_second(events_per_sec);
             }
+
+            update_pressure(metrics, &emitters);
         }
     }
 }

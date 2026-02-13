@@ -22,3 +22,11 @@ pub const TRACE_ID: &str = "polku.trace_id";
 
 /// Distributed span ID
 pub const SPAN_ID: &str = "polku.span_id";
+
+/// Set to "true" to enable per-message processing trace through middleware
+pub const TRACE_ENABLED: &str = "polku.trace";
+
+/// JSON array of trace entries recorded by the middleware chain (read-only)
+///
+/// Each entry: `{"mw":"<name>","action":"passed"|"filtered","us":<microseconds>}`
+pub const TRACE_LOG: &str = "_polku.trace";

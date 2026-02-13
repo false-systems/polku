@@ -5,7 +5,7 @@
 //!
 //! - [`Message`] - the universal pipeline envelope (zero-copy, protocol-agnostic)
 //! - [`Emitter`] trait - async interface for sending messages to destinations
-//! - [`PluginError`] - error type for plugin operations
+//! - [`PluginError`] - error type for plugin operations (with structured [`ErrorContext`])
 //! - [`Event`] - the proto-generated wire format (gRPC boundaries only)
 //! - [`InternedStr`] - zero-cost string interning for high-frequency fields
 //! - [`metadata_keys`] - reserved metadata key constants
@@ -54,7 +54,7 @@ pub mod proto {
 }
 
 pub use emit::Emitter;
-pub use error::PluginError;
+pub use error::{ErrorContext, PipelineStage, PluginError};
 pub use intern::InternedStr;
 pub use message::{Message, MessageId, Metadata, Routes};
 pub use proto::Event;
