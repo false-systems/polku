@@ -202,6 +202,48 @@ mod tests {
     }
 
     #[test]
+    fn test_passthrough_ingestor_preserves_severity() {
+        use polku_core::Event;
+
+        let ingestor = PassthroughIngestor::new();
+        let ctx = IngestContext {
+            source: "passthrough",
+            cluster: "prod",
+            format: "protobuf",
+        };
+
+        // Create an Event with severity and outcome set
+        let event = Event {
+            id: "sev-1".to_string(),
+            timestamp_unix_ns: 1000,
+            source: "tapio".to_string(),
+            event_type: "network.connection".to_string(),
+            metadata: Default::default(),
+            payload: b"data".to_vec(),
+            route_to: vec![],
+            severity: 4, // ERROR
+            outcome: 2,  // FAILURE
+            data: None,
+        };
+        let data = prost::Message::encode_to_vec(&event);
+
+        let msgs = ingestor.ingest(&ctx, &data).unwrap();
+        assert_eq!(msgs.len(), 1);
+
+        // Bug #5: PassthroughIngestor uses From<Event> which drops severity/outcome
+        assert_eq!(
+            msgs[0].metadata().get(polku_core::metadata_keys::SEVERITY),
+            Some(&"4".to_string()),
+            "PassthroughIngestor must preserve Event severity in metadata"
+        );
+        assert_eq!(
+            msgs[0].metadata().get(polku_core::metadata_keys::OUTCOME),
+            Some(&"2".to_string()),
+            "PassthroughIngestor must preserve Event outcome in metadata"
+        );
+    }
+
+    #[test]
     fn test_passthrough_ingestor_invalid_protobuf() {
         let ingestor = PassthroughIngestor::new();
         let ctx = IngestContext {

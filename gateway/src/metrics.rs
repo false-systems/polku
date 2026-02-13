@@ -437,6 +437,32 @@ impl Metrics {
             .set(if healthy { 1.0 } else { 0.0 });
     }
 
+    /// Count healthy and unhealthy emitters from the emitter_health GaugeVec
+    ///
+    /// Iterates registered label values to determine counts.
+    /// Returns (healthy_count, unhealthy_count).
+    pub fn emitter_health_counts(&self) -> (usize, usize) {
+        use prometheus::core::Collector;
+        use prometheus::proto::MetricFamily;
+
+        let families: Vec<MetricFamily> = self.emitter_health.collect();
+        let mut healthy = 0usize;
+        let mut unhealthy = 0usize;
+
+        for family in &families {
+            for metric in family.get_metric() {
+                let value = metric.get_gauge().get_value();
+                if value >= 1.0 {
+                    healthy += 1;
+                } else {
+                    unhealthy += 1;
+                }
+            }
+        }
+
+        (healthy, unhealthy)
+    }
+
     /// Set circuit breaker state for an emitter
     ///
     /// States: 0 = Closed (normal), 1 = Open (rejecting), 2 = HalfOpen (testing)

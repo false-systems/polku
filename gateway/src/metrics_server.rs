@@ -126,6 +126,8 @@ async fn health_handler() -> impl IntoResponse {
         "healthy"
     };
 
+    let (healthy_count, unhealthy_count) = metrics.emitter_health_counts();
+
     let summary = HealthSummary {
         status,
         pipeline_pressure: pressure,
@@ -135,8 +137,8 @@ async fn health_handler() -> impl IntoResponse {
             fill_ratio,
         },
         emitters: EmittersSummary {
-            healthy_count: 0, // populated by per-emitter gauge scraping below
-            unhealthy_count: 0,
+            healthy_count,
+            unhealthy_count,
             events_per_second: metrics.events_per_second.get(),
         },
     };

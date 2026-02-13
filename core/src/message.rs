@@ -332,40 +332,159 @@ impl Message {
     }
 }
 
+// ============================================================================
+// Typed data encoding/decoding helpers for Event<->Message conversion
+// ============================================================================
+
+use crate::proto::event;
+
+/// Encode typed event data oneof into protobuf bytes + discriminator string
+fn encode_typed_data(data: &event::Data) -> (&'static str, Vec<u8>) {
+    match data {
+        event::Data::Network(d) => ("network", prost::Message::encode_to_vec(d)),
+        event::Data::Kernel(d) => ("kernel", prost::Message::encode_to_vec(d)),
+        event::Data::Container(d) => ("container", prost::Message::encode_to_vec(d)),
+        event::Data::K8s(d) => ("k8s", prost::Message::encode_to_vec(d)),
+        event::Data::Process(d) => ("process", prost::Message::encode_to_vec(d)),
+        event::Data::Resource(d) => ("resource", prost::Message::encode_to_vec(d)),
+    }
+}
+
+/// Decode typed event data from discriminator string + protobuf bytes
+fn decode_typed_data(data_type: &str, payload: &[u8]) -> Option<event::Data> {
+    use prost::Message;
+    match data_type {
+        "network" => crate::NetworkEventData::decode(payload)
+            .ok()
+            .map(event::Data::Network),
+        "kernel" => crate::KernelEventData::decode(payload)
+            .ok()
+            .map(event::Data::Kernel),
+        "container" => crate::ContainerEventData::decode(payload)
+            .ok()
+            .map(event::Data::Container),
+        "k8s" => crate::K8sEventData::decode(payload)
+            .ok()
+            .map(event::Data::K8s),
+        "process" => crate::ProcessEventData::decode(payload)
+            .ok()
+            .map(event::Data::Process),
+        "resource" => crate::ResourceEventData::decode(payload)
+            .ok()
+            .map(event::Data::Resource),
+        _ => None,
+    }
+}
+
 /// Convert from proto Event to Message
+///
+/// Preserves typed Event fields in metadata:
+/// - `severity` > 0 → `metadata["polku.severity"]`
+/// - `outcome` > 0 → `metadata["polku.outcome"]`
+/// - `data` oneof → serialized into `payload`, discriminator in `metadata["polku.data_type"]`
 impl From<Event> for Message {
     fn from(event: Event) -> Self {
+        let mut metadata = event.metadata;
+
+        // Preserve severity if non-default (0 = UNSPECIFIED)
+        if event.severity != 0 {
+            metadata.insert(
+                crate::metadata_keys::SEVERITY.to_string(),
+                event.severity.to_string(),
+            );
+        }
+
+        // Preserve outcome if non-default (0 = UNSPECIFIED)
+        if event.outcome != 0 {
+            metadata.insert(
+                crate::metadata_keys::OUTCOME.to_string(),
+                event.outcome.to_string(),
+            );
+        }
+
+        // Determine payload: typed data takes priority over legacy payload
+        let payload = if let Some(ref data) = event.data {
+            let (data_type, encoded) = encode_typed_data(data);
+            metadata.insert(
+                crate::metadata_keys::DATA_TYPE.to_string(),
+                data_type.to_string(),
+            );
+            metadata.insert(
+                crate::metadata_keys::CONTENT_TYPE.to_string(),
+                "application/protobuf".to_string(),
+            );
+            Bytes::from(encoded)
+        } else {
+            Bytes::from(event.payload)
+        };
+
         Self {
             id: MessageId::from_string(&event.id),
             timestamp: event.timestamp_unix_ns,
             source: event.source.into(),
             message_type: event.event_type.into(),
-            metadata: if event.metadata.is_empty() {
+            metadata: if metadata.is_empty() {
                 None
             } else {
-                Some(Box::new(event.metadata))
+                Some(Box::new(metadata))
             },
-            payload: Bytes::from(event.payload),
+            payload,
             route_to: SmallVec::from_vec(event.route_to),
         }
     }
 }
 
 /// Convert from Message to proto Event
+///
+/// Reads typed fields back from metadata:
+/// - `metadata["polku.severity"]` → `severity`
+/// - `metadata["polku.outcome"]` → `outcome`
+/// - `metadata["polku.data_type"]` + payload → `data` oneof
+///
+/// Metadata keys consumed by this conversion are removed from the Event's
+/// metadata map to avoid duplication.
 impl From<Message> for Event {
     fn from(msg: Message) -> Self {
+        let mut metadata = msg.metadata.map(|b| *b).unwrap_or_default();
+
+        // Read severity from metadata (default 0 = UNSPECIFIED)
+        let severity = metadata
+            .remove(crate::metadata_keys::SEVERITY)
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(0);
+
+        // Read outcome from metadata (default 0 = UNSPECIFIED)
+        let outcome = metadata
+            .remove(crate::metadata_keys::OUTCOME)
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(0);
+
+        // Reconstruct typed data from payload + data_type discriminator
+        let data = metadata
+            .remove(crate::metadata_keys::DATA_TYPE)
+            .and_then(|dt| decode_typed_data(&dt, &msg.payload));
+
+        // Remove content_type (internal metadata, not needed on Event)
+        metadata.remove(crate::metadata_keys::CONTENT_TYPE);
+
+        // Determine payload: if typed data was reconstructed, legacy payload is empty
+        let payload = if data.is_some() {
+            vec![]
+        } else {
+            msg.payload.to_vec()
+        };
+
         Self {
             id: msg.id.to_string(),
             timestamp_unix_ns: msg.timestamp,
             source: msg.source.into(),
             event_type: msg.message_type.into(),
-            metadata: msg.metadata.map(|b| *b).unwrap_or_default(),
-            payload: msg.payload.to_vec(),
+            metadata,
+            payload,
             route_to: msg.route_to.into_vec(),
-            // New typed fields - defaults for legacy messages
-            severity: 0, // SEVERITY_UNSPECIFIED
-            outcome: 0,  // OUTCOME_UNSPECIFIED
-            data: None,  // No typed data for messages converted from internal format
+            severity,
+            outcome,
+            data,
         }
     }
 }
@@ -484,5 +603,158 @@ mod tests {
         // Different strings = different IDs
         let id5 = MessageId::from_string("other-id");
         assert_ne!(id3, id5);
+    }
+
+    // ==================================================================
+    // Bug-revealing tests: Event<->Message round-trip
+    // ==================================================================
+
+    #[test]
+    fn test_event_to_message_preserves_severity() {
+        let event = Event {
+            id: "test-1".into(),
+            timestamp_unix_ns: 1000,
+            source: "tapio".into(),
+            event_type: "network.connection".into(),
+            severity: 4, // SEVERITY_ERROR
+            outcome: 1,  // OUTCOME_SUCCESS
+            metadata: Default::default(),
+            payload: vec![1, 2, 3],
+            route_to: vec![],
+            data: None,
+        };
+
+        let msg: Message = event.into();
+
+        // Bug #1: severity is dropped during From<Event> for Message
+        assert_eq!(
+            msg.metadata().get(crate::metadata_keys::SEVERITY),
+            Some(&"4".to_string()),
+            "Event severity should be preserved in metadata"
+        );
+        assert_eq!(
+            msg.metadata().get(crate::metadata_keys::OUTCOME),
+            Some(&"1".to_string()),
+            "Event outcome should be preserved in metadata"
+        );
+    }
+
+    #[test]
+    fn test_message_to_event_reads_severity_from_metadata() {
+        let msg = Message::new("tapio", "network.connection", Bytes::from(vec![1, 2, 3]))
+            .with_metadata(crate::metadata_keys::SEVERITY, "4")
+            .with_metadata(crate::metadata_keys::OUTCOME, "2");
+
+        let event: Event = msg.into();
+
+        // Bug #2: From<Message> for Event hardcodes severity: 0, outcome: 0
+        assert_eq!(
+            event.severity, 4,
+            "Event severity should be read from metadata"
+        );
+        assert_eq!(
+            event.outcome, 2,
+            "Event outcome should be read from metadata"
+        );
+    }
+
+    #[test]
+    fn test_severity_round_trip() {
+        // Event -> Message -> Event should preserve severity/outcome
+        let original = Event {
+            id: "rt-1".into(),
+            timestamp_unix_ns: 1000,
+            source: "svc".into(),
+            event_type: "evt".into(),
+            severity: 5, // CRITICAL
+            outcome: 3,  // TIMEOUT
+            metadata: Default::default(),
+            payload: vec![],
+            route_to: vec![],
+            data: None,
+        };
+
+        let msg: Message = original.clone().into();
+        let round_tripped: Event = msg.into();
+
+        assert_eq!(
+            round_tripped.severity, original.severity,
+            "Severity lost in round-trip"
+        );
+        assert_eq!(
+            round_tripped.outcome, original.outcome,
+            "Outcome lost in round-trip"
+        );
+    }
+
+    #[test]
+    fn test_event_to_message_preserves_typed_data() {
+        use crate::proto::{NetworkEventData, event};
+
+        let net_data = NetworkEventData {
+            protocol: "TCP".into(),
+            src_ip: "10.0.0.1".into(),
+            dst_ip: "10.0.0.2".into(),
+            src_port: 8080,
+            dst_port: 443,
+            ..Default::default()
+        };
+
+        let event = Event {
+            id: "typed-1".into(),
+            timestamp_unix_ns: 1000,
+            source: "tapio".into(),
+            event_type: "network.connection".into(),
+            severity: 2,
+            outcome: 1,
+            metadata: Default::default(),
+            payload: vec![],
+            route_to: vec![],
+            data: Some(event::Data::Network(net_data.clone())),
+        };
+
+        let msg: Message = event.into();
+
+        // Bug #1 extended: typed data is dropped during conversion
+        assert_eq!(
+            msg.metadata().get(crate::metadata_keys::DATA_TYPE),
+            Some(&"network".to_string()),
+            "Typed data discriminator should be stored in metadata"
+        );
+
+        // The typed data should be serialized into the payload
+        assert!(
+            !msg.payload.is_empty(),
+            "Typed data should be serialized into payload"
+        );
+    }
+
+    #[test]
+    fn test_unspecified_severity_not_stored() {
+        // When severity/outcome are 0 (unspecified), don't clutter metadata
+        let event = Event {
+            id: "zero-1".into(),
+            timestamp_unix_ns: 1000,
+            source: "svc".into(),
+            event_type: "evt".into(),
+            severity: 0,
+            outcome: 0,
+            metadata: Default::default(),
+            payload: vec![],
+            route_to: vec![],
+            data: None,
+        };
+
+        let msg: Message = event.into();
+
+        // Unspecified (0) should not pollute metadata
+        assert!(
+            msg.metadata().get(crate::metadata_keys::SEVERITY).is_none(),
+            "Unspecified severity should not be stored in metadata"
+        );
+        assert!(
+            msg.metadata().get(crate::metadata_keys::OUTCOME).is_none(),
+            "Unspecified outcome should not be stored in metadata"
+        );
     }
 }

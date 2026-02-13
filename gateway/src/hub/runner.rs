@@ -53,6 +53,11 @@ impl HubRunner {
         // Initialize Prometheus metrics (ignore error if already initialized)
         if let Ok(metrics) = Metrics::init() {
             metrics.set_buffer_capacity(self.buffer.capacity());
+            // Initialize emitter health to healthy (1.0) so unpolled emitters
+            // don't show as unhealthy in pipeline pressure calculations
+            for emitter in &self.emitters {
+                metrics.set_emitter_health(emitter.name(), true);
+            }
         }
 
         if self.emitters.is_empty() {
