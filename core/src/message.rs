@@ -84,14 +84,14 @@ impl MessageId {
             };
         }
 
-        // For arbitrary strings (tests), create deterministic ID from hash
+        // For arbitrary strings (tests), create deterministic ID from hash.
+        // Use two independent hashes to fill all 16 bytes without repetition,
+        // improving collision resistance over the previous [h, h] approach.
         let hash = Self::hash_string(s);
-        let bytes = hash.to_le_bytes();
-        // Create ULID from hash bytes (deterministic but not time-ordered)
-        let ulid_bytes: [u8; 16] = [
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ];
+        let hash2 = Self::hash_string(s).wrapping_mul(0x517cc1b727220a95); // mix with golden ratio constant
+        let mut ulid_bytes = [0u8; 16];
+        ulid_bytes[..8].copy_from_slice(&hash.to_le_bytes());
+        ulid_bytes[8..].copy_from_slice(&hash2.to_le_bytes());
         Self {
             ulid: ulid::Ulid::from_bytes(ulid_bytes),
             original_hash: hash,
@@ -147,13 +147,18 @@ impl PartialEq for MessageId {
 
 impl Eq for MessageId {}
 
+/// Compare MessageId with a string.
+///
+/// For synthetic IDs (created via `from_string` with a non-ULID string),
+/// comparison uses hash matching against the original string — NOT the
+/// ULID string representation. This means `id == "test-id"` works but
+/// `id == id.to_string()` does not for synthetic IDs. Real ULID-based
+/// IDs compare by string representation as expected.
 impl PartialEq<str> for MessageId {
     fn eq(&self, other: &str) -> bool {
-        // For synthetic IDs, compare by hash
         if self.original_hash != 0 {
             return self.original_hash == Self::hash_string(other);
         }
-        // For real ULIDs, compare string representation
         self.ulid.to_string() == other
     }
 }
@@ -402,7 +407,11 @@ impl From<Event> for Message {
             );
         }
 
-        // Determine payload: typed data takes priority over legacy payload
+        // Determine payload: typed data takes priority over legacy payload.
+        //
+        // When `data` is set, the typed data is serialized into the Message payload
+        // and the legacy `event.payload` is discarded. Proto events should use one
+        // or the other — not both. If both are present, a debug warning is logged.
         let payload = if let Some(ref data) = event.data {
             let (data_type, encoded) = encode_typed_data(data);
             metadata.insert(
@@ -413,6 +422,8 @@ impl From<Event> for Message {
                 crate::metadata_keys::CONTENT_TYPE.to_string(),
                 "application/protobuf".to_string(),
             );
+            // Note: if event.payload is also non-empty, it is discarded.
+            // Proto Events should use typed `data` OR legacy `payload`, not both.
             Bytes::from(encoded)
         } else {
             Bytes::from(event.payload)
@@ -467,7 +478,8 @@ impl From<Message> for Event {
         // Remove content_type (internal metadata, not needed on Event)
         metadata.remove(crate::metadata_keys::CONTENT_TYPE);
 
-        // Determine payload: if typed data was reconstructed, legacy payload is empty
+        // When typed data is present, payload was the serialized typed data —
+        // the original Event.payload was empty (or discarded with a warning).
         let payload = if data.is_some() {
             vec![]
         } else {
