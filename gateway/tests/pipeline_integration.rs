@@ -5,7 +5,7 @@
 //! - DST: deterministic flush timing with `tokio::time::pause()`
 //! - Processing trace: middleware audit trail flows through Hub
 
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use bytes::Bytes;
 use polku_gateway::{Emitter, Hub, Message, PluginError, Transform};

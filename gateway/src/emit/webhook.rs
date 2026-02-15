@@ -224,7 +224,6 @@ mod tests {
         routing::{get, post},
     };
     use serde::{Deserialize, Serialize};
-    use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
