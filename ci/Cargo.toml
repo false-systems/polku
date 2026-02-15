@@ -9,4 +9,4 @@ name = "sykli"
 path = "src/main.rs"
 
 [dependencies]
-sykli = "0.2"
+sykli = "0.4"

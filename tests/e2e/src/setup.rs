@@ -80,6 +80,80 @@ impl PolkuTestEnv {
     }
 }
 
+/// POLKU test environment with receiver access for verification tests
+pub struct PolkuWithReceiverEnv {
+    pub polku_addr: String,
+    pub receiver_addr: String,
+    /// Keep the port forwards alive for the duration of the test
+    #[allow(dead_code)]
+    _polku_pf: PortForward,
+    #[allow(dead_code)]
+    _receiver_pf: PortForward,
+}
+
+impl PolkuWithReceiverEnv {
+    /// Deploy POLKU and test-receiver, returning addresses for both
+    ///
+    /// # Arguments
+    /// * `ctx` - Seppo test context
+    /// * `log_level` - POLKU log level ("debug", "info", etc.)
+    pub async fn setup(ctx: &Context, log_level: &str) -> anyhow::Result<Self> {
+        // Deploy test-receiver first
+        let receiver_deploy = deployment("test-receiver")
+            .image("polku-test-receiver:latest")
+            .image_pull_policy("Never")
+            .port(9001)
+            .env("RECEIVER_ADDR", "0.0.0.0:9001")
+            .build();
+
+        let receiver_svc = service("test-receiver")
+            .selector("app", "test-receiver")
+            .port(9001, 9001)
+            .build();
+
+        ctx.apply(&receiver_deploy).await?;
+        ctx.apply(&receiver_svc).await?;
+        ctx.wait_ready("deployment/test-receiver").await?;
+
+        // Deploy POLKU configured to emit to test-receiver
+        let polku_deploy = deployment("polku")
+            .image("polku-gateway:latest")
+            .image_pull_policy("Never")
+            .port(50051)
+            .env("POLKU_GRPC_ADDR", "0.0.0.0:50051")
+            .env("POLKU_EMIT_GRPC_ENDPOINTS", "http://test-receiver:9001")
+            .env("POLKU_EMIT_GRPC_LAZY", "true")
+            .env("POLKU_LOG_LEVEL", log_level)
+            .build();
+
+        let polku_svc = service("polku")
+            .selector("app", "polku")
+            .port(50051, 50051)
+            .build();
+
+        ctx.apply(&polku_deploy).await?;
+        ctx.apply(&polku_svc).await?;
+        ctx.wait_ready("deployment/polku").await?;
+
+        // Port forward to both services
+        let polku_pf = ctx.port_forward("svc/polku", 50051).await?;
+        let receiver_pf = ctx.port_forward("svc/test-receiver", 9001).await?;
+
+        let polku_addr = format!("http://{}", polku_pf.local_addr());
+        let receiver_addr = format!("http://{}", receiver_pf.local_addr());
+
+        // Wait for services to be ready
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        Ok(Self {
+            polku_addr,
+            receiver_addr,
+            _polku_pf: polku_pf,
+            _receiver_pf: receiver_pf,
+        })
+    }
+}
+
 /// Helper to create POLKU deployment without receiver (for testing graceful degradation)
 pub fn polku_deployment_no_receiver() -> k8s_openapi::api::apps::v1::Deployment {
     deployment("polku")

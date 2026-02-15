@@ -66,6 +66,13 @@ pub use proto::{
 };
 
 #[cfg(test)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::inconsistent_digit_grouping,
+    clippy::field_reassign_with_default
+)]
 mod tests {
     use super::*;
 

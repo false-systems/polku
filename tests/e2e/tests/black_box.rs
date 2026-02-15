@@ -250,79 +250,25 @@ async fn test_performance_latency(ctx: Context) {
 // REAL PROTOBUF TESTS - typed eBPF/kernel events with verification
 // ============================================================================
 
-/// Test 8: Send 20,000 real eBPF kernel events with typed protobuf data
+/// Test 8: Send 200,000 real eBPF kernel events with typed protobuf data
 /// Verify events arrive at receiver via health endpoint
 #[seppo::test]
 #[ignore] // Requires Kind cluster with POLKU images
-async fn test_real_ebpf_20k_events(ctx: Context) {
-    use seppo::{deployment, service};
+async fn test_real_ebpf_200k_events(ctx: Context) {
+    use polku_e2e::PolkuWithReceiverEnv;
 
-    // Deploy test-receiver first
-    let receiver_deploy = deployment("test-receiver")
-        .image("polku-test-receiver:latest")
-        .image_pull_policy("Never")
-        .port(9001)
-        .env("RECEIVER_ADDR", "0.0.0.0:9001")
-        .build();
-
-    let receiver_svc = service("test-receiver")
-        .selector("app", "test-receiver")
-        .port(9001, 9001)
-        .build();
-
-    ctx.apply(&receiver_deploy).await.expect("Deploy receiver");
-    ctx.apply(&receiver_svc)
+    // Deploy POLKU + receiver using shared helper
+    let env = PolkuWithReceiverEnv::setup(&ctx, "debug")
         .await
-        .expect("Deploy receiver service");
-    ctx.wait_ready("deployment/test-receiver")
-        .await
-        .expect("Wait for receiver");
-
-    // Deploy POLKU configured to emit to test-receiver
-    let polku_deploy = deployment("polku")
-        .image("polku-gateway:latest")
-        .image_pull_policy("Never")
-        .port(50051)
-        .env("POLKU_GRPC_ADDR", "0.0.0.0:50051")
-        .env("POLKU_EMIT_GRPC_ENDPOINTS", "http://test-receiver:9001")
-        .env("POLKU_EMIT_GRPC_LAZY", "true")
-        .env("POLKU_LOG_LEVEL", "debug")
-        .build();
-
-    let polku_svc = service("polku")
-        .selector("app", "polku")
-        .port(50051, 50051)
-        .build();
-
-    ctx.apply(&polku_deploy).await.expect("Deploy POLKU");
-    ctx.apply(&polku_svc).await.expect("Deploy POLKU service");
-    ctx.wait_ready("deployment/polku")
-        .await
-        .expect("Wait for POLKU");
-
-    // Port forward to both POLKU (to send) and receiver (to verify)
-    let polku_pf = ctx
-        .port_forward("svc/polku", 50051)
-        .await
-        .expect("Port forward POLKU");
-    let receiver_pf = ctx
-        .port_forward("svc/test-receiver", 9001)
-        .await
-        .expect("Port forward receiver");
-
-    let polku_addr = format!("http://{}", polku_pf.local_addr());
-    let receiver_addr = format!("http://{}", receiver_pf.local_addr());
-
-    // Wait for services to be ready
-    tokio::time::sleep(Duration::from_secs(2)).await;
+        .expect("Setup should succeed");
 
     // Connect to POLKU
-    let mut client = PolkuClient::connect(&polku_addr)
+    let mut client = PolkuClient::connect(&env.polku_addr)
         .await
         .expect("Connect to POLKU");
 
     // Get initial receiver event count
-    let mut receiver_client = GatewayClient::connect(receiver_addr.clone())
+    let mut receiver_client = GatewayClient::connect(env.receiver_addr.clone())
         .await
         .expect("Connect to receiver");
     let initial_health = receiver_client
@@ -359,15 +305,47 @@ async fn test_real_ebpf_20k_events(ctx: Context) {
         total_sent, send_time, send_rate
     );
 
-    // Wait for events to propagate through POLKU to receiver
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Wait for events to propagate through POLKU to receiver by polling the health endpoint.
+    // This avoids relying on a fixed sleep duration and makes the test more robust on slower clusters.
+    let wait_start = std::time::Instant::now();
+    let max_wait = Duration::from_secs(30);
+    let poll_interval = Duration::from_millis(500);
 
-    // Verify events arrived at receiver via health endpoint
+    loop {
+        let health = receiver_client.health(HealthRequest {}).await.expect("Health during wait");
+        let current_count = health.into_inner().events_processed;
+        let currently_received = current_count - initial_count;
+
+        if currently_received >= (total_sent as u64 * 95 / 100) {
+            break;
+        }
+
+        if wait_start.elapsed() >= max_wait {
+            break;
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+
+    // Verify events arrived at receiver via final health snapshot
     let final_health = receiver_client
         .health(HealthRequest {})
         .await
         .expect("Final health");
     let final_count = final_health.into_inner().events_processed;
+
+    assert!(
+        final_count >= initial_count,
+        "Receiver event count decreased between health checks: initial={}, final={}",
+        initial_count,
+        final_count
+    );
+    assert!(
+        final_count >= initial_count,
+        "Receiver event count decreased: initial={}, final={}",
+        initial_count,
+        final_count
+    );
 
     let received = final_count - initial_count;
     eprintln!(
@@ -465,74 +443,20 @@ async fn test_network_events(ctx: Context) {
 #[seppo::test]
 #[ignore] // Requires Kind cluster with POLKU images
 async fn test_streaming_500k_events(ctx: Context) {
-    use seppo::{deployment, service};
+    use polku_e2e::PolkuWithReceiverEnv;
 
-    // Deploy test-receiver first
-    let receiver_deploy = deployment("test-receiver")
-        .image("polku-test-receiver:latest")
-        .image_pull_policy("Never")
-        .port(9001)
-        .env("RECEIVER_ADDR", "0.0.0.0:9001")
-        .build();
-
-    let receiver_svc = service("test-receiver")
-        .selector("app", "test-receiver")
-        .port(9001, 9001)
-        .build();
-
-    ctx.apply(&receiver_deploy).await.expect("Deploy receiver");
-    ctx.apply(&receiver_svc)
+    // Deploy POLKU + receiver using shared helper (info log level for reduced overhead)
+    let env = PolkuWithReceiverEnv::setup(&ctx, "info")
         .await
-        .expect("Deploy receiver service");
-    ctx.wait_ready("deployment/test-receiver")
-        .await
-        .expect("Wait for receiver");
-
-    // Deploy POLKU configured to emit to test-receiver
-    let polku_deploy = deployment("polku")
-        .image("polku-gateway:latest")
-        .image_pull_policy("Never")
-        .port(50051)
-        .env("POLKU_GRPC_ADDR", "0.0.0.0:50051")
-        .env("POLKU_EMIT_GRPC_ENDPOINTS", "http://test-receiver:9001")
-        .env("POLKU_EMIT_GRPC_LAZY", "true")
-        .env("POLKU_LOG_LEVEL", "info") // Reduce logging overhead
-        .build();
-
-    let polku_svc = service("polku")
-        .selector("app", "polku")
-        .port(50051, 50051)
-        .build();
-
-    ctx.apply(&polku_deploy).await.expect("Deploy POLKU");
-    ctx.apply(&polku_svc).await.expect("Deploy POLKU service");
-    ctx.wait_ready("deployment/polku")
-        .await
-        .expect("Wait for POLKU");
-
-    // Port forward to both POLKU (to send) and receiver (to verify)
-    let polku_pf = ctx
-        .port_forward("svc/polku", 50051)
-        .await
-        .expect("Port forward POLKU");
-    let receiver_pf = ctx
-        .port_forward("svc/test-receiver", 9001)
-        .await
-        .expect("Port forward receiver");
-
-    let polku_addr = format!("http://{}", polku_pf.local_addr());
-    let receiver_addr = format!("http://{}", receiver_pf.local_addr());
-
-    // Wait for services to be ready
-    tokio::time::sleep(Duration::from_secs(2)).await;
+        .expect("Setup should succeed");
 
     // Connect to POLKU
-    let mut client = PolkuClient::connect(&polku_addr)
+    let mut client = PolkuClient::connect(&env.polku_addr)
         .await
         .expect("Connect to POLKU");
 
     // Get initial receiver event count
-    let mut receiver_client = GatewayClient::connect(receiver_addr.clone())
+    let mut receiver_client = GatewayClient::connect(env.receiver_addr.clone())
         .await
         .expect("Connect to receiver");
     let initial_health = receiver_client
@@ -550,7 +474,15 @@ async fn test_streaming_500k_events(ctx: Context) {
     let total = 500_000usize;
     let batch_size = 1000; // Events per streaming batch
 
+    // NOTE: We generate all events in memory upfront intentionally.
+    // This test measures streaming RPC performance, so we isolate network/server
+    // processing from event generation. In production, generate events on demand.
     eprintln!(">>> [STREAMING] Generating {} events...", total);
+    // NOTE: We intentionally generate all events up front in memory here.
+    // This test is meant to measure the performance of the streaming RPC
+    // (network + server processing) and to keep the cost of event generation
+    // out of the measurement. In production code, events should typically be
+    // generated in smaller batches or on demand to reduce peak memory usage.
     let events = PolkuClient::make_real_ebpf_batch(total);
 
     eprintln!(
@@ -581,6 +513,13 @@ async fn test_streaming_500k_events(ctx: Context) {
         .await
         .expect("Final health");
     let final_count = final_health.into_inner().events_processed;
+
+    assert!(
+        final_count >= initial_count,
+        "Receiver event count decreased: initial={}, final={}",
+        initial_count,
+        final_count
+    );
 
     let received = final_count - initial_count;
     eprintln!(

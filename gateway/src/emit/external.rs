@@ -199,7 +199,7 @@ impl Emitter for ExternalEmitter {
 // =============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::proto::emitter_plugin_server::{EmitterPlugin, EmitterPluginServer};

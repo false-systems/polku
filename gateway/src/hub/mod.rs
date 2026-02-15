@@ -41,11 +41,10 @@ pub use runner::HubRunner;
 use crate::checkpoint::CheckpointStore;
 use crate::emit::Emitter;
 use crate::error::PluginError;
-use crate::ingest::{IngestContext, Ingestor};
+use crate::ingest::{IngestContext, Ingestor, IngestorRegistry};
 use crate::manifest::{BufferDesc, ComponentDesc, PipelineManifest, TuningDesc};
 use crate::message::Message;
 use crate::middleware::{Middleware, MiddlewareChain};
-use crate::registry::PluginRegistry;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tokio::sync::mpsc;
@@ -79,8 +78,8 @@ pub struct Hub {
     emitters: Vec<Arc<dyn Emitter>>,
     /// Optional checkpoint store for reliable delivery tracking
     checkpoint_store: Option<Arc<dyn CheckpointStore>>,
-    /// Plugin registry for ingestors
-    registry: PluginRegistry,
+    /// Ingestor registry (Ingest Context)
+    ingestors: IngestorRegistry,
 }
 
 impl Hub {
@@ -94,7 +93,7 @@ impl Hub {
             middleware: MiddlewareChain::new(),
             emitters: Vec::new(),
             checkpoint_store: None,
-            registry: PluginRegistry::new(),
+            ingestors: IngestorRegistry::new(),
         }
     }
 
@@ -181,13 +180,13 @@ impl Hub {
     ///     .build();
     /// ```
     pub fn ingestor<I: Ingestor + 'static>(mut self, ingestor: I) -> Self {
-        self.registry.add_ingestor(Arc::new(ingestor));
+        self.ingestors.add(Arc::new(ingestor));
         self
     }
 
     /// Add an ingestor (Arc version)
     pub fn ingestor_arc(mut self, ingestor: Arc<dyn Ingestor>) -> Self {
-        self.registry.add_ingestor(ingestor);
+        self.ingestors.add(ingestor);
         self
     }
 
@@ -206,7 +205,7 @@ impl Hub {
     ///     .build();
     /// ```
     pub fn default_ingestor<I: Ingestor + 'static>(mut self, ingestor: I) -> Self {
-        self.registry.set_default_ingestor(Arc::new(ingestor));
+        self.ingestors.set_default(Arc::new(ingestor));
         self
     }
 
@@ -282,12 +281,12 @@ impl Hub {
     pub fn build(self) -> (RawSender, MessageSender, HubRunner) {
         let (tx, rx) = mpsc::channel(self.channel_capacity);
 
-        // Wrap registry in Arc for sharing with RawSender
-        let registry = Arc::new(self.registry);
+        // Wrap ingestors in Arc for sharing with RawSender
+        let ingestors = Arc::new(self.ingestors);
 
         let raw_sender = RawSender {
             tx: tx.clone(),
-            registry,
+            ingestors,
         };
 
         let msg_sender = MessageSender { tx };
@@ -406,7 +405,7 @@ impl MessageSender {
 #[derive(Clone)]
 pub struct RawSender {
     tx: mpsc::Sender<Message>,
-    registry: Arc<PluginRegistry>,
+    ingestors: Arc<IngestorRegistry>,
 }
 
 impl RawSender {
@@ -437,7 +436,7 @@ impl RawSender {
         };
 
         // Transform raw bytes to Messages using the ingestor
-        let messages = self.registry.ingest(&ctx, data)?;
+        let messages = self.ingestors.ingest(&ctx, data)?;
         let count = messages.len();
 
         for msg in messages {
@@ -464,7 +463,7 @@ impl RawSender {
             format,
         };
 
-        let messages = self.registry.ingest(&ctx, data)?;
+        let messages = self.ingestors.ingest(&ctx, data)?;
         let count = messages.len();
 
         for msg in messages {
@@ -478,7 +477,7 @@ impl RawSender {
 
     /// Check if an ingestor is registered for a source
     pub fn has_ingestor(&self, source: &str) -> bool {
-        self.registry.has_ingestor(source)
+        self.ingestors.has(source)
     }
 }
 

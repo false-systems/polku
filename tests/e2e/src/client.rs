@@ -72,10 +72,14 @@ impl PolkuClient {
         events: Vec<Event>,
         batch_size: usize,
     ) -> Result<Ack, tonic::Status> {
+        assert!(batch_size > 0, "batch_size must be greater than 0");
+
         let source = self.source.clone();
         let cluster = self.cluster.clone();
 
-        // Create batches
+        // NOTE: We collect batches into a Vec here intentionally for performance measurement.
+        // This isolates the streaming RPC performance from event generation overhead.
+        // In production code, consider using an iterator-based approach for memory efficiency.
         let batches: Vec<IngestBatch> = events
             .chunks(batch_size)
             .map(|chunk| IngestBatch {
@@ -119,7 +123,9 @@ impl PolkuClient {
             timestamp_unix_ns: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_nanos() as i64,
+                .as_nanos()
+                .try_into()
+                .unwrap_or(i64::MAX),
             ..Default::default()
         }
     }
@@ -184,7 +190,9 @@ impl PolkuClient {
             timestamp_unix_ns: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_nanos() as i64,
+                .as_nanos()
+                .try_into()
+                .unwrap_or(i64::MAX),
             severity: Severity::Info as i32,
             outcome: if retval >= 0 {
                 Outcome::Success as i32
@@ -220,7 +228,9 @@ impl PolkuClient {
             timestamp_unix_ns: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_nanos() as i64,
+                .as_nanos()
+                .try_into()
+                .unwrap_or(i64::MAX),
             severity: Severity::Info as i32,
             outcome: Outcome::Success as i32,
             data: Some(Data::Network(NetworkEventData {

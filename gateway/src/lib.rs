@@ -59,10 +59,14 @@ pub use emit::resilience::{
     BackoffConfig, CircuitBreakerConfig, CircuitBreakerEmitter, CircuitState, FailedEvent,
     FailureBuffer, FailureCaptureConfig, FailureCaptureEmitter, ResilientEmitter, RetryEmitter,
 };
-pub use emit::{Emitter, ExternalEmitter, GrpcEmitter, StdoutEmitter, WebhookEmitter};
+pub use emit::{
+    Emitter, EmitterRegistry, ExternalEmitter, GrpcEmitter, StdoutEmitter, WebhookEmitter,
+};
 pub use error::{PluginError, PolkuError, Result};
 pub use hub::{BufferStrategy, Hub, HubBuffer, HubRunner, MessageSender, RawSender};
-pub use ingest::{ExternalIngestor, IngestContext, Ingestor, JsonIngestor, PassthroughIngestor};
+pub use ingest::{
+    ExternalIngestor, IngestContext, Ingestor, IngestorRegistry, JsonIngestor, PassthroughIngestor,
+};
 pub use intern::InternedStr;
 pub use manifest::PipelineManifest;
 pub use message::{Message, MessageId};
