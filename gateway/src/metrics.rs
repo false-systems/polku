@@ -101,6 +101,14 @@ pub struct Metrics {
 
     /// Plugin health (1 = healthy, 0 = unhealthy)
     pub plugin_health: Gauge,
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Pipeline pressure (AI-native composite metric)
+    // ─────────────────────────────────────────────────────────────────────────
+    /// Composite pipeline pressure: 0.0 (idle) to 1.0 (overloaded)
+    ///
+    /// Formula: buffer_fill * 0.4 + emit_failure_rate * 0.3 + channel_fill * 0.3
+    pub pipeline_pressure: Gauge,
 }
 
 impl Metrics {
@@ -287,6 +295,12 @@ impl Metrics {
                 "Plugin health status (1 = healthy, 0 = unhealthy)"
             )
             .map_err(|e| PolkuError::Metrics(format!("plugin_health: {e}")))?,
+
+            pipeline_pressure: register_gauge!(
+                "polku_pipeline_pressure",
+                "Composite pipeline pressure (0.0=idle, 1.0=overloaded)"
+            )
+            .map_err(|e| PolkuError::Metrics(format!("pipeline_pressure: {e}")))?,
         };
 
         // Set the metrics (only succeeds once)
@@ -423,6 +437,32 @@ impl Metrics {
             .set(if healthy { 1.0 } else { 0.0 });
     }
 
+    /// Count healthy and unhealthy emitters from the emitter_health GaugeVec
+    ///
+    /// Iterates registered label values to determine counts.
+    /// Returns (healthy_count, unhealthy_count).
+    pub fn emitter_health_counts(&self) -> (usize, usize) {
+        use prometheus::core::Collector;
+        use prometheus::proto::MetricFamily;
+
+        let families: Vec<MetricFamily> = self.emitter_health.collect();
+        let mut healthy = 0usize;
+        let mut unhealthy = 0usize;
+
+        for family in &families {
+            for metric in family.get_metric() {
+                let value = metric.get_gauge().get_value();
+                if value >= 1.0 {
+                    healthy += 1;
+                } else {
+                    unhealthy += 1;
+                }
+            }
+        }
+
+        (healthy, unhealthy)
+    }
+
     /// Set circuit breaker state for an emitter
     ///
     /// States: 0 = Closed (normal), 1 = Open (rejecting), 2 = HalfOpen (testing)
@@ -483,6 +523,24 @@ impl Metrics {
     /// Record a failover event
     pub fn record_grpc_failover(&self) {
         self.grpc_failover_total.inc();
+    }
+
+    /// Update composite pipeline pressure from current metric values
+    ///
+    /// Call this after each flush cycle when buffer and emitter state is fresh.
+    ///
+    /// * `buffer_fill` - buffer_size / buffer_capacity (0.0-1.0)
+    /// * `emit_failure_rate` - fraction of recent emits that failed (0.0-1.0)
+    /// * `channel_fill` - channel utilization ratio (0.0-1.0)
+    pub fn update_pipeline_pressure(
+        &self,
+        buffer_fill: f64,
+        emit_failure_rate: f64,
+        channel_fill: f64,
+    ) {
+        let pressure =
+            (buffer_fill * 0.4 + emit_failure_rate * 0.3 + channel_fill * 0.3).clamp(0.0, 1.0);
+        self.pipeline_pressure.set(pressure);
     }
 
     /// Record all per-emitter flush metrics in one call

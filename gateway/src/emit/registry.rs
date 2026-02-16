@@ -9,8 +9,9 @@
 //! - Routing filters by emitter name
 //! - Order is preserved (first registered = first in list)
 
-use crate::emit::{Emitter, Event};
+use crate::emit::Emitter;
 use crate::error::PluginError;
+use crate::message::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -73,7 +74,7 @@ impl EmitterRegistry {
     /// stop delivery to other emitters.
     ///
     /// Returns the number of successful deliveries.
-    pub async fn emit_to_all(&self, events: &[Event]) -> usize {
+    pub async fn emit_to_all(&self, messages: &[Message]) -> usize {
         if self.emitters.is_empty() {
             warn!("No emitters registered, events will be dropped");
             return 0;
@@ -82,12 +83,12 @@ impl EmitterRegistry {
         let mut success_count = 0;
 
         for emitter in &self.emitters {
-            match emitter.emit(events).await {
+            match emitter.emit(messages).await {
                 Ok(()) => {
                     debug!(
                         emitter = emitter.name(),
-                        count = events.len(),
-                        "Events emitted"
+                        count = messages.len(),
+                        "Messages emitted"
                     );
                     success_count += 1;
                 }
@@ -95,8 +96,8 @@ impl EmitterRegistry {
                     error!(
                         emitter = emitter.name(),
                         error = %e,
-                        count = events.len(),
-                        "Failed to emit events"
+                        count = messages.len(),
+                        "Failed to emit messages"
                     );
                 }
             }
@@ -105,20 +106,20 @@ impl EmitterRegistry {
         success_count
     }
 
-    /// Emit events with routing hints
+    /// Emit messages with routing hints
     ///
-    /// Events are sent only to emitters whose names match the route_to field.
+    /// Messages are sent only to emitters whose names match the route_to field.
     /// If route_to is empty, sends to all emitters (broadcast).
-    pub async fn emit_with_routing(&self, events: &[Event]) -> usize {
-        let mut all_emitters: Vec<&Event> = Vec::new();
-        let mut routed: HashMap<&str, Vec<&Event>> = HashMap::new();
+    pub async fn emit_with_routing(&self, messages: &[Message]) -> usize {
+        let mut all_emitters: Vec<&Message> = Vec::new();
+        let mut routed: HashMap<&str, Vec<&Message>> = HashMap::new();
 
-        for event in events {
-            if event.route_to.is_empty() {
-                all_emitters.push(event);
+        for msg in messages {
+            if msg.route_to.is_empty() {
+                all_emitters.push(msg);
             } else {
-                for route in &event.route_to {
-                    routed.entry(route.as_str()).or_default().push(event);
+                for route in &msg.route_to {
+                    routed.entry(route.as_str()).or_default().push(msg);
                 }
             }
         }
@@ -126,19 +127,19 @@ impl EmitterRegistry {
         let mut success_count = 0;
 
         if !all_emitters.is_empty() {
-            let events_vec: Vec<Event> = all_emitters.into_iter().cloned().collect();
-            success_count += self.emit_to_all(&events_vec).await;
+            let messages_vec: Vec<Message> = all_emitters.into_iter().cloned().collect();
+            success_count += self.emit_to_all(&messages_vec).await;
         }
 
         for emitter in &self.emitters {
-            if let Some(events) = routed.get(emitter.name()) {
-                let events_vec: Vec<Event> = events.iter().copied().cloned().collect();
-                match emitter.emit(&events_vec).await {
+            if let Some(messages) = routed.get(emitter.name()) {
+                let messages_vec: Vec<Message> = messages.iter().copied().cloned().collect();
+                match emitter.emit(&messages_vec).await {
                     Ok(()) => {
                         debug!(
                             emitter = emitter.name(),
-                            count = events_vec.len(),
-                            "Routed events emitted"
+                            count = messages_vec.len(),
+                            "Routed messages emitted"
                         );
                         success_count += 1;
                     }
@@ -146,7 +147,7 @@ impl EmitterRegistry {
                         error!(
                             emitter = emitter.name(),
                             error = %e,
-                            count = events_vec.len(),
+                            count = messages_vec.len(),
                             "Failed to emit routed events"
                         );
                     }
@@ -193,6 +194,7 @@ impl Default for EmitterRegistry {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     // ==========================================================================
@@ -249,8 +251,8 @@ mod tests {
             self.name
         }
 
-        async fn emit(&self, events: &[Event]) -> Result<(), PluginError> {
-            self.emit_count.fetch_add(events.len(), Ordering::SeqCst);
+        async fn emit(&self, messages: &[Message]) -> Result<(), PluginError> {
+            self.emit_count.fetch_add(messages.len(), Ordering::SeqCst);
             Ok(())
         }
 
@@ -362,20 +364,9 @@ mod tests {
         registry.add(emitter1.clone());
         registry.add(emitter2.clone());
 
-        let events = vec![Event {
-            id: "test".to_string(),
-            timestamp_unix_ns: 0,
-            source: "test".to_string(),
-            event_type: "test".to_string(),
-            metadata: Default::default(),
-            payload: vec![],
-            route_to: vec![],
-            severity: 0,
-            outcome: 0,
-            data: None,
-        }];
+        let messages = vec![Message::new("test", "test", Bytes::new())];
 
-        let success = registry.emit_to_all(&events).await;
+        let success = registry.emit_to_all(&messages).await;
 
         assert_eq!(success, 2);
         assert_eq!(emitter1.emit_count(), 1);
@@ -386,12 +377,9 @@ mod tests {
     async fn emit_to_all_with_no_emitters_returns_zero() {
         let registry = EmitterRegistry::new();
 
-        let events = vec![Event {
-            id: "test".to_string(),
-            ..Default::default()
-        }];
+        let messages = vec![Message::new("test", "test", Bytes::new())];
 
-        let success = registry.emit_to_all(&events).await;
+        let success = registry.emit_to_all(&messages).await;
         assert_eq!(success, 0);
     }
 
@@ -404,20 +392,12 @@ mod tests {
         registry.add(kafka.clone());
         registry.add(stdout.clone());
 
-        let events = vec![
-            Event {
-                id: "to-kafka".to_string(),
-                route_to: vec!["kafka".to_string()],
-                ..Default::default()
-            },
-            Event {
-                id: "to-stdout".to_string(),
-                route_to: vec!["stdout".to_string()],
-                ..Default::default()
-            },
+        let messages = vec![
+            Message::new("test", "to-kafka", Bytes::new()).with_routes(vec!["kafka".into()]),
+            Message::new("test", "to-stdout", Bytes::new()).with_routes(vec!["stdout".into()]),
         ];
 
-        registry.emit_with_routing(&events).await;
+        registry.emit_with_routing(&messages).await;
 
         assert_eq!(kafka.emit_count(), 1);
         assert_eq!(stdout.emit_count(), 1);
@@ -432,13 +412,9 @@ mod tests {
         registry.add(kafka.clone());
         registry.add(stdout.clone());
 
-        let events = vec![Event {
-            id: "broadcast".to_string(),
-            route_to: vec![], // Empty = broadcast to all
-            ..Default::default()
-        }];
+        let messages = vec![Message::new("test", "broadcast", Bytes::new())];
 
-        registry.emit_with_routing(&events).await;
+        registry.emit_with_routing(&messages).await;
 
         assert_eq!(kafka.emit_count(), 1);
         assert_eq!(stdout.emit_count(), 1);

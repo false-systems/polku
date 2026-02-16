@@ -3,7 +3,7 @@
 use thiserror::Error;
 
 // Re-export PluginError from polku-core
-pub use polku_core::PluginError;
+pub use polku_core::{ErrorContext, PipelineStage, PluginError};
 
 /// Result type alias for POLKU operations
 pub type Result<T> = std::result::Result<T, PolkuError>;

@@ -9,9 +9,9 @@
 //! - Unknown sources use default ingestor (if set) or return error
 //! - Sources are case-sensitive strings
 
-use crate::emit::Event;
 use crate::error::PluginError;
 use crate::ingest::{IngestContext, Ingestor};
+use crate::message::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -114,7 +114,7 @@ impl IngestorRegistry {
     /// Looks up the ingestor by source name and calls its ingest method.
     /// Falls back to the default ingestor if one is set.
     /// Returns an error if no ingestor is registered for the source and no default exists.
-    pub fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Event>, PluginError> {
+    pub fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Message>, PluginError> {
         let ingestor = self
             .ingestors
             .get(ctx.source)
@@ -137,7 +137,7 @@ impl IngestorRegistry {
     }
 
     /// Alias for `ingest` - kept for backward compatibility
-    pub fn transform(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Event>, PluginError> {
+    pub fn transform(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Message>, PluginError> {
         self.ingest(ctx, data)
     }
 }
@@ -152,6 +152,7 @@ impl Default for IngestorRegistry {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     // ==========================================================================
     // Mock Ingestor for testing
@@ -184,19 +185,14 @@ mod tests {
             self.sources
         }
 
-        fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Event>, PluginError> {
-            Ok(vec![Event {
-                id: format!("{}:{}", ctx.source, data.len()),
-                timestamp_unix_ns: 0,
-                source: self.name.to_string(), // Use ingestor name as source for testing
-                event_type: "test".to_string(),
-                metadata: Default::default(),
-                payload: data.to_vec(),
-                route_to: vec![],
-                severity: 0,
-                outcome: 0,
-                data: None,
-            }])
+        fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Message>, PluginError> {
+            Ok(vec![Message::with_id(
+                format!("{}:{}", ctx.source, data.len()),
+                0,
+                self.name, // Use ingestor name as source for testing
+                "test",
+                Bytes::copy_from_slice(data),
+            )])
         }
     }
 

@@ -6,7 +6,7 @@
 
 use bytes::Bytes;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use polku_gateway::{Emitter, Event, Hub, Message, PluginError};
+use polku_gateway::{Emitter, Hub, Message, PluginError};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -33,8 +33,9 @@ impl Emitter for NullEmitter {
         "null"
     }
 
-    async fn emit(&self, events: &[Event]) -> Result<(), PluginError> {
-        self.count.fetch_add(events.len() as u64, Ordering::SeqCst);
+    async fn emit(&self, messages: &[Message]) -> Result<(), PluginError> {
+        self.count
+            .fetch_add(messages.len() as u64, Ordering::SeqCst);
         Ok(())
     }
 

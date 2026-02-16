@@ -49,7 +49,7 @@ impl Emitter for FailNTimesEmitter {
         "fail_n_times"
     }
 
-    async fn emit(&self, _events: &[polku_gateway::Event]) -> Result<(), PluginError> {
+    async fn emit(&self, _messages: &[Message]) -> Result<(), PluginError> {
         self.emit_count.fetch_add(1, Ordering::SeqCst);
         let remaining = self.failures_remaining.load(Ordering::SeqCst);
         if remaining > 0 {
@@ -88,7 +88,7 @@ impl Emitter for AlwaysFailEmitter {
         "always_fail"
     }
 
-    async fn emit(&self, _: &[polku_gateway::Event]) -> Result<(), PluginError> {
+    async fn emit(&self, _: &[Message]) -> Result<(), PluginError> {
         self.emit_count.fetch_add(1, Ordering::SeqCst);
         Err(PluginError::Connection("always fails".into()))
     }
@@ -121,9 +121,9 @@ impl Emitter for TrackingEmitter {
         "tracking"
     }
 
-    async fn emit(&self, events: &[polku_gateway::Event]) -> Result<(), PluginError> {
+    async fn emit(&self, messages: &[Message]) -> Result<(), PluginError> {
         self.event_count
-            .fetch_add(events.len() as u64, Ordering::SeqCst);
+            .fetch_add(messages.len() as u64, Ordering::SeqCst);
         Ok(())
     }
 
@@ -150,18 +150,17 @@ async fn test_typed_event_data_flows_through_resilient_emitter() {
         })
         .build();
 
-    // Create event with typed network data
-    let event = make_typed_network_event("typed-net-1");
+    // Create message with typed network data in metadata
+    let msg = make_typed_network_message("typed-net-1");
 
-    // Verify the event has typed data populated
-    assert!(event.data.is_some(), "Event should have typed data");
-    assert_eq!(event.severity, 2, "Severity should be Info (2)");
-    assert_eq!(event.outcome, 1, "Outcome should be Success (1)");
+    // Verify metadata carries the typed data
+    assert_eq!(msg.metadata().get("polku.severity"), Some(&"2".to_string()));
+    assert_eq!(msg.metadata().get("polku.outcome"), Some(&"1".to_string()));
 
     // Emit through resilient wrapper
-    let result = resilient.emit(&[event]).await;
+    let result = resilient.emit(&[msg]).await;
     assert!(result.is_ok(), "Emit should succeed");
-    assert_eq!(inner.event_count(), 1, "One event should be tracked");
+    assert_eq!(inner.event_count(), 1, "One message should be tracked");
 }
 
 // ============================================================================
@@ -187,7 +186,7 @@ async fn test_retry_prevents_circuit_breaker_opening_on_transient_failure() {
         })
         .build();
 
-    let event = make_test_event("evt-1");
+    let event = make_test_message("evt-1");
 
     // Should succeed after retries
     let result = resilient.emit(&[event]).await;
@@ -224,7 +223,7 @@ async fn test_circuit_breaker_prevents_retry_storms() {
     // First two requests exhaust retries and open circuit
     for i in 0..2 {
         let result = resilient
-            .emit(&[make_test_event(&format!("evt-{i}"))])
+            .emit(&[make_test_message(&format!("evt-{i}"))])
             .await;
         assert!(result.is_err());
     }
@@ -232,7 +231,7 @@ async fn test_circuit_breaker_prevents_retry_storms() {
     let calls_before = inner.emit_count();
 
     // Next request should fail fast (NotReady) without calling inner
-    let result = resilient.emit(&[make_test_event("evt-fast-fail")]).await;
+    let result = resilient.emit(&[make_test_message("evt-fast-fail")]).await;
     assert!(
         matches!(result, Err(PluginError::NotReady)),
         "Should fail fast with NotReady"
@@ -267,7 +266,7 @@ async fn test_failure_capture_after_all_retries_exhausted() {
         .with_default_failure_capture(buffer.clone())
         .build();
 
-    let events = vec![make_test_event("evt-1"), make_test_event("evt-2")];
+    let events = vec![make_test_message("evt-1"), make_test_message("evt-2")];
     let result = resilient.emit(&events).await;
 
     assert!(result.is_err());
@@ -279,8 +278,8 @@ async fn test_failure_capture_after_all_retries_exhausted() {
     assert_eq!(buffer.len(), 2);
 
     let failed = buffer.drain(10);
-    assert_eq!(failed[0].event.id, "evt-1");
-    assert_eq!(failed[1].event.id, "evt-2");
+    assert!(failed[0].message.id == "evt-1");
+    assert!(failed[1].message.id == "evt-2");
     assert_eq!(failed[0].attempts, 1); // Buffer sees it as first attempt from its perspective
 }
 
@@ -298,7 +297,7 @@ async fn test_successful_retry_means_no_capture() {
         .with_default_failure_capture(buffer.clone())
         .build();
 
-    let result = resilient.emit(&[make_test_event("evt-1")]).await;
+    let result = resilient.emit(&[make_test_message("evt-1")]).await;
 
     assert!(result.is_ok());
     assert!(buffer.is_empty(), "Buffer should be empty on success");
@@ -336,12 +335,12 @@ async fn test_full_resilience_stack_recovery_scenario() {
     // Total inner calls: 6, all fail (inner has 8 failures)
     for i in 0..3 {
         let _ = resilient
-            .emit(&[make_test_event(&format!("phase1-{i}"))])
+            .emit(&[make_test_message(&format!("phase1-{i}"))])
             .await;
     }
 
     // Circuit should be open, requests fail fast
-    let fast_fail = resilient.emit(&[make_test_event("fast-fail")]).await;
+    let fast_fail = resilient.emit(&[make_test_message("fast-fail")]).await;
     assert!(
         matches!(fast_fail, Err(PluginError::NotReady)),
         "Circuit should be open, got {:?}",
@@ -352,17 +351,17 @@ async fn test_full_resilience_stack_recovery_scenario() {
     tokio::time::sleep(Duration::from_millis(15)).await;
 
     // Half-open probe: inner will fail (calls 7,8), back to open
-    let _ = resilient.emit(&[make_test_event("probe-1")]).await;
+    let _ = resilient.emit(&[make_test_message("probe-1")]).await;
 
     // Wait again
     tokio::time::sleep(Duration::from_millis(15)).await;
 
     // Now inner has exhausted 8 failures, will succeed
-    let recovery = resilient.emit(&[make_test_event("recovery")]).await;
+    let recovery = resilient.emit(&[make_test_message("recovery")]).await;
     assert!(recovery.is_ok(), "Should recover after backend comes up");
 
     // Subsequent requests should succeed
-    let after_recovery = resilient.emit(&[make_test_event("after-recovery")]).await;
+    let after_recovery = resilient.emit(&[make_test_message("after-recovery")]).await;
     assert!(after_recovery.is_ok());
 }
 
@@ -392,7 +391,7 @@ async fn test_concurrent_emissions_with_resilience() {
         let emitter = Arc::clone(&resilient);
         handles.push(tokio::spawn(async move {
             emitter
-                .emit(&[make_test_event(&format!("concurrent-{i}"))])
+                .emit(&[make_test_message(&format!("concurrent-{i}"))])
                 .await
         }));
     }
@@ -583,14 +582,14 @@ async fn test_high_load_with_intermittent_failures() {
             "intermittent"
         }
 
-        async fn emit(&self, events: &[polku_gateway::Event]) -> Result<(), PluginError> {
+        async fn emit(&self, messages: &[Message]) -> Result<(), PluginError> {
             let count = self.counter.fetch_add(1, Ordering::SeqCst);
             if count % 5 == 4 {
                 // Fail every 5th call
                 Err(PluginError::Connection("intermittent failure".into()))
             } else {
                 self.success_count
-                    .fetch_add(events.len() as u64, Ordering::SeqCst);
+                    .fetch_add(messages.len() as u64, Ordering::SeqCst);
                 Ok(())
             }
         }
@@ -619,7 +618,7 @@ async fn test_high_load_with_intermittent_failures() {
 
     for i in 0..100 {
         match resilient
-            .emit(&[make_test_event(&format!("load-{i}"))])
+            .emit(&[make_test_message(&format!("load-{i}"))])
             .await
         {
             Ok(()) => success_count += 1,
@@ -661,7 +660,7 @@ async fn test_buffer_capacity_under_sustained_failure() {
     // Send 100 events that will all fail
     for i in 0..100 {
         let _ = resilient
-            .emit(&[make_test_event(&format!("overflow-{i}"))])
+            .emit(&[make_test_message(&format!("overflow-{i}"))])
             .await;
     }
 
@@ -675,61 +674,34 @@ async fn test_buffer_capacity_under_sustained_failure() {
         "50 events should have been dropped"
     );
 
-    // Verify we have the newest events
-    let events = buffer.drain(100);
-    assert!(events[0].event.id.starts_with("overflow-5")); // 50+ onwards
+    // Verify we have the newest messages (overflow-50 onwards)
+    let captured = buffer.drain(100);
+    assert!(captured[0].message.id == "overflow-50");
 }
 
 // ============================================================================
 // Helper Functions
 // ============================================================================
 
-fn make_test_event(id: &str) -> polku_gateway::Event {
-    polku_gateway::Event {
-        id: id.to_string(),
-        timestamp_unix_ns: 0,
-        source: "test".to_string(),
-        event_type: "test".to_string(),
-        metadata: std::collections::HashMap::new(),
-        payload: vec![],
-        route_to: vec![],
-        severity: 0,
-        outcome: 0,
-        data: None,
-    }
+fn make_test_message(id: &str) -> Message {
+    Message::with_id(id, 0, "test", "test", Bytes::new())
 }
 
-/// Create a test event with typed network data
-fn make_typed_network_event(id: &str) -> polku_gateway::Event {
-    use polku_core::NetworkEventData;
-    use polku_core::proto::event::Data as EventData;
-
-    polku_gateway::Event {
-        id: id.to_string(),
-        timestamp_unix_ns: 1704067200_000_000_000, // 2024-01-01T00:00:00Z
-        source: "tapio".to_string(),
-        event_type: "network.connection".to_string(),
-        metadata: [
-            ("cluster".to_string(), "prod".to_string()),
-            ("namespace".to_string(), "default".to_string()),
-        ]
-        .into_iter()
-        .collect(),
-        payload: vec![],
-        route_to: vec![],
-        severity: 2, // Info
-        outcome: 1,  // Success
-        data: Some(EventData::Network(NetworkEventData {
-            protocol: "TCP".to_string(),
-            src_ip: "10.0.0.1".to_string(),
-            dst_ip: "10.0.0.2".to_string(),
-            src_port: 54321,
-            dst_port: 443,
-            direction: "outbound".to_string(),
-            latency_ms: 15.5,
-            bytes_sent: 1024,
-            bytes_received: 2048,
-            ..Default::default()
-        })),
-    }
+/// Create a test message with typed network data metadata
+///
+/// In the message-first pipeline, typed data like severity, outcome, and
+/// network event data are carried as metadata + payload rather than
+/// dedicated proto fields.
+fn make_typed_network_message(id: &str) -> Message {
+    Message::with_id(
+        id,
+        1704067200_000_000_000, // 2024-01-01T00:00:00Z
+        "tapio",
+        "network.connection",
+        Bytes::new(),
+    )
+    .with_metadata("polku.severity", "2")
+    .with_metadata("polku.outcome", "1")
+    .with_metadata("cluster", "prod")
+    .with_metadata("namespace", "default")
 }

@@ -32,6 +32,7 @@
 
 use crate::message::Message;
 use async_trait::async_trait;
+use std::fmt::Write;
 
 /// Middleware trait for message processing
 ///
@@ -97,10 +98,68 @@ impl MiddlewareChain {
     /// Process a message through all middleware in order
     ///
     /// Returns `None` if any middleware filters the message.
+    ///
+    /// When `metadata["polku.trace"] == "true"`, a JSON trace is recorded in
+    /// `metadata["_polku.trace"]` with an entry per middleware showing action
+    /// and duration in microseconds.
     pub async fn process(&self, mut msg: Message) -> Option<Message> {
-        for mw in &self.middlewares {
-            msg = mw.process(msg).await?;
+        let tracing_enabled = msg
+            .metadata()
+            .get(polku_core::metadata_keys::TRACE_ENABLED)
+            .is_some_and(|v| v == "true");
+
+        if !tracing_enabled {
+            // Hot path: no tracing overhead
+            for mw in &self.middlewares {
+                msg = mw.process(msg).await?;
+            }
+            return Some(msg);
         }
+
+        // Traced path: record each middleware step
+        let mut trace = String::from("[");
+        for (i, mw) in self.middlewares.iter().enumerate() {
+            let start = std::time::Instant::now();
+            match mw.process(msg).await {
+                Some(m) => {
+                    let us = start.elapsed().as_micros();
+                    if i > 0 {
+                        trace.push(',');
+                    }
+                    let _ = write!(
+                        trace,
+                        r#"{{"mw":"{}","action":"passed","us":{}}}"#,
+                        mw.name(),
+                        us
+                    );
+                    msg = m;
+                }
+                None => {
+                    let us = start.elapsed().as_micros();
+                    if i > 0 {
+                        trace.push(',');
+                    }
+                    let _ = write!(
+                        trace,
+                        r#"{{"mw":"{}","action":"filtered","us":{}}}"#,
+                        mw.name(),
+                        us
+                    );
+                    trace.push(']');
+                    // Message was filtered — we can't attach trace to it.
+                    // Log for observability instead.
+                    tracing::debug!(
+                        trace = %trace,
+                        middleware = mw.name(),
+                        "Message filtered (trace attached to log)"
+                    );
+                    return None;
+                }
+            }
+        }
+        trace.push(']');
+        msg.metadata_mut()
+            .insert(polku_core::metadata_keys::TRACE_LOG.to_string(), trace);
         Some(msg)
     }
 
@@ -112,6 +171,11 @@ impl MiddlewareChain {
     /// Get number of middleware in the chain
     pub fn len(&self) -> usize {
         self.middlewares.len()
+    }
+
+    /// Get names of all middleware in chain order
+    pub fn names(&self) -> Vec<&'static str> {
+        self.middlewares.iter().map(|mw| mw.name()).collect()
     }
 
     /// Flush all middleware in the chain
@@ -261,7 +325,7 @@ mod tests {
     async fn test_passthrough() {
         let mw = PassThrough;
         let msg = Message::new("test", "evt", Bytes::new());
-        let id = msg.id.clone();
+        let id = msg.id; // MessageId is Copy
 
         let result = mw.process(msg).await;
         assert!(result.is_some());
@@ -353,5 +417,87 @@ mod tests {
         let result = chain.process(msg).await;
 
         assert!(result.is_none());
+    }
+
+    // ======================================================================
+    // Processing Trace Tests
+    // ======================================================================
+
+    #[tokio::test]
+    async fn test_trace_not_recorded_by_default() {
+        let mut chain = MiddlewareChain::new();
+        chain.add(PassThrough);
+
+        let msg = Message::new("test", "evt", Bytes::new());
+        let result = chain.process(msg).await.unwrap();
+
+        assert!(
+            result
+                .metadata()
+                .get(polku_core::metadata_keys::TRACE_LOG)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trace_recorded_when_enabled() {
+        let mut chain = MiddlewareChain::new();
+        chain.add(PassThrough);
+        chain.add(Transform::new(|mut msg: Message| {
+            msg.metadata_mut().insert("x".into(), "y".into());
+            msg
+        }));
+
+        let msg = Message::new("test", "evt", Bytes::new())
+            .with_metadata(polku_core::metadata_keys::TRACE_ENABLED, "true");
+
+        let result = chain.process(msg).await.unwrap();
+        let trace = result
+            .metadata()
+            .get(polku_core::metadata_keys::TRACE_LOG)
+            .expect("trace should be present");
+
+        // Parse as JSON to validate structure
+        let entries: Vec<serde_json::Value> = serde_json::from_str(trace).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["mw"], "passthrough");
+        assert_eq!(entries[0]["action"], "passed");
+        assert!(entries[0]["us"].is_number());
+        assert_eq!(entries[1]["mw"], "transform");
+        assert_eq!(entries[1]["action"], "passed");
+    }
+
+    #[tokio::test]
+    async fn test_trace_records_filter_action() {
+        let mut chain = MiddlewareChain::new();
+        chain.add(PassThrough);
+        chain.add(Filter::new(|_: &Message| false)); // drops message
+        chain.add(PassThrough); // should not appear
+
+        let msg = Message::new("test", "evt", Bytes::new())
+            .with_metadata(polku_core::metadata_keys::TRACE_ENABLED, "true");
+
+        // Message gets filtered — returns None
+        let result = chain.process(msg).await;
+        assert!(result.is_none());
+        // Trace is logged via tracing::debug (can't easily assert on logs,
+        // but we verify the chain still returns None correctly)
+    }
+
+    #[tokio::test]
+    async fn test_trace_not_enabled_with_wrong_value() {
+        let mut chain = MiddlewareChain::new();
+        chain.add(PassThrough);
+
+        let msg = Message::new("test", "evt", Bytes::new())
+            .with_metadata(polku_core::metadata_keys::TRACE_ENABLED, "false");
+
+        let result = chain.process(msg).await.unwrap();
+        assert!(
+            result
+                .metadata()
+                .get(polku_core::metadata_keys::TRACE_LOG)
+                .is_none()
+        );
     }
 }

@@ -1,16 +1,19 @@
-//! polku-core - Core types for POLKU event gateway
+//! polku-core - Core types for POLKU protocol hub
 //!
 //! This crate provides the foundational types that are shared between
-//! the POLKU gateway and external emitter plugins:
+//! the POLKU gateway and external plugins (emitters, ingestors):
 //!
-//! - [`Emitter`] trait - async interface for sending events to destinations
-//! - [`PluginError`] - error type for plugin operations
-//! - [`Event`] - the proto-generated event envelope type
+//! - [`Message`] - the universal pipeline envelope (zero-copy, protocol-agnostic)
+//! - [`Emitter`] trait - async interface for sending messages to destinations
+//! - [`PluginError`] - error type for plugin operations (with structured [`ErrorContext`])
+//! - [`Event`] - the proto-generated wire format (gRPC boundaries only)
+//! - [`InternedStr`] - zero-cost string interning for high-frequency fields
+//! - [`metadata_keys`] - reserved metadata key constants
 //!
 //! # Why this crate exists
 //!
 //! External emitter plugins (like `ahti-emitter`) need to implement the `Emitter`
-//! trait and use the `Event` type. Without `polku-core`, they would depend on
+//! trait and use the `Message` type. Without `polku-core`, they would depend on
 //! `polku-gateway`, but `polku-gateway` might also want to optionally depend on
 //! those emitters, creating a cyclic dependency.
 //!
@@ -32,6 +35,12 @@
 
 mod emit;
 mod error;
+/// String interning for zero-cost cloning of repeated strings
+pub mod intern;
+/// The universal message envelope
+pub mod message;
+/// Reserved metadata key constants for POLKU messages
+pub mod metadata_keys;
 
 // Proto types generated from polku/v1/event.proto
 pub mod proto {
@@ -45,7 +54,9 @@ pub mod proto {
 }
 
 pub use emit::Emitter;
-pub use error::PluginError;
+pub use error::{ErrorContext, PipelineStage, PluginError};
+pub use intern::InternedStr;
+pub use message::{Message, MessageId, Metadata, Routes};
 pub use proto::Event;
 
 // Re-export typed event data types for convenience
@@ -204,10 +215,10 @@ mod tests {
             self.name
         }
 
-        async fn emit(&self, events: &[Event]) -> Result<(), PluginError> {
+        async fn emit(&self, messages: &[Message]) -> Result<(), PluginError> {
             self.emit_count.fetch_add(1, Ordering::Relaxed);
             self.last_batch_size
-                .store(events.len() as u64, Ordering::Relaxed);
+                .store(messages.len() as u64, Ordering::Relaxed);
             Ok(())
         }
 
@@ -240,15 +251,11 @@ mod tests {
     async fn test_emitter_emit_batch() {
         let emitter = TestEmitter::new("test");
 
-        let events: Vec<Event> = (0..5)
-            .map(|i| {
-                let mut e = Event::default();
-                e.id = format!("event-{}", i);
-                e
-            })
+        let messages: Vec<Message> = (0..5)
+            .map(|i| Message::new("test", format!("event-{}", i), bytes::Bytes::new()))
             .collect();
 
-        let result = emitter.emit(&events).await;
+        let result = emitter.emit(&messages).await;
         assert!(result.is_ok());
         assert_eq!(emitter.emit_count.load(Ordering::Relaxed), 1);
         assert_eq!(emitter.last_batch_size.load(Ordering::Relaxed), 5);
@@ -286,8 +293,8 @@ mod tests {
         assert_eq!(emitter.name(), "boxed");
         assert!(emitter.health().await);
 
-        let events = vec![Event::default()];
-        assert!(emitter.emit(&events).await.is_ok());
+        let messages = vec![Message::new("test", "test", bytes::Bytes::new())];
+        assert!(emitter.emit(&messages).await.is_ok());
     }
 
     /// Emitter that always fails - for testing error handling
@@ -299,7 +306,7 @@ mod tests {
             "failing"
         }
 
-        async fn emit(&self, _events: &[Event]) -> Result<(), PluginError> {
+        async fn emit(&self, _messages: &[Message]) -> Result<(), PluginError> {
             Err(PluginError::Send("always fails".to_string()))
         }
 
@@ -312,7 +319,9 @@ mod tests {
     async fn test_emitter_returns_error() {
         let emitter = FailingEmitter;
 
-        let result = emitter.emit(&[Event::default()]).await;
+        let result = emitter
+            .emit(&[Message::new("test", "test", bytes::Bytes::new())])
+            .await;
         assert!(result.is_err());
 
         match result {
@@ -331,7 +340,7 @@ mod tests {
             fn name(&self) -> &'static str {
                 "minimal"
             }
-            async fn emit(&self, _events: &[Event]) -> Result<(), PluginError> {
+            async fn emit(&self, _messages: &[Message]) -> Result<(), PluginError> {
                 Ok(())
             }
             async fn health(&self) -> bool {

@@ -137,11 +137,10 @@ impl Deduplicator {
         {
             let mut seen = self.seen.lock();
             for (key, old_ts) in expired {
-                #[allow(clippy::collapsible_if)]
-                if let Some(current_ts) = seen.get(&key) {
-                    if *current_ts == old_ts {
-                        seen.remove(&key);
-                    }
+                if let Some(current_ts) = seen.get(&key)
+                    && *current_ts == old_ts
+                {
+                    seen.remove(&key);
                 }
             }
         }

@@ -12,8 +12,8 @@
 
 use crate::emit::Emitter;
 use crate::error::PluginError;
+use crate::message::Message;
 use async_trait::async_trait;
-use polku_core::Event;
 use reqwest::Client;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -55,16 +55,16 @@ mod base64_bytes {
     }
 }
 
-impl From<&Event> for EventJson {
-    fn from(e: &Event) -> Self {
+impl From<&Message> for EventJson {
+    fn from(m: &Message) -> Self {
         Self {
-            id: e.id.clone(),
-            timestamp_unix_ns: e.timestamp_unix_ns,
-            source: e.source.clone(),
-            event_type: e.event_type.clone(),
-            metadata: e.metadata.clone(),
-            payload: e.payload.clone(),
-            route_to: e.route_to.clone(),
+            id: m.id.to_string(),
+            timestamp_unix_ns: m.timestamp,
+            source: m.source.to_string(),
+            event_type: m.message_type.to_string(),
+            metadata: m.metadata().clone(),
+            payload: m.payload.to_vec(),
+            route_to: m.route_to.to_vec(),
         }
     }
 }
@@ -126,13 +126,13 @@ impl Emitter for WebhookEmitter {
         "webhook"
     }
 
-    async fn emit(&self, events: &[Event]) -> Result<(), PluginError> {
-        if events.is_empty() {
+    async fn emit(&self, messages: &[Message]) -> Result<(), PluginError> {
+        if messages.is_empty() {
             return Ok(());
         }
 
         let payload = WebhookPayload {
-            events: events.iter().map(EventJson::from).collect(),
+            events: messages.iter().map(EventJson::from).collect(),
         };
 
         let mut request = self.client.post(&self.url).json(&payload);
@@ -146,7 +146,7 @@ impl Emitter for WebhookEmitter {
                 if response.status().is_success() {
                     debug!(
                         url = %self.url,
-                        count = events.len(),
+                        count = messages.len(),
                         status = %response.status(),
                         "Webhook delivered"
                     );
@@ -224,7 +224,6 @@ mod tests {
         routing::{get, post},
     };
     use serde::{Deserialize, Serialize};
-    use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -290,19 +289,14 @@ mod tests {
         StatusCode::OK
     }
 
-    fn make_event(id: &str, event_type: &str) -> Event {
-        Event {
-            id: id.to_string(),
-            timestamp_unix_ns: 1234567890,
-            source: "test-source".to_string(),
-            event_type: event_type.to_string(),
-            metadata: HashMap::new(),
-            payload: vec![1, 2, 3],
-            route_to: vec![],
-            severity: 0,
-            outcome: 0,
-            data: None,
-        }
+    fn make_message(id: &str, event_type: &str) -> Message {
+        Message::with_id(
+            id,
+            1234567890,
+            "test-source",
+            event_type,
+            bytes::Bytes::from_static(&[1, 2, 3]),
+        )
     }
 
     #[tokio::test]
@@ -318,18 +312,19 @@ mod tests {
 
         let emitter = WebhookEmitter::new(&url).unwrap();
         let events = vec![
-            make_event("e1", "user.created"),
-            make_event("e2", "user.updated"),
+            make_message("e1", "user.created"),
+            make_message("e2", "user.updated"),
         ];
 
         let result = emitter.emit(&events).await;
         assert!(result.is_ok(), "Should emit events successfully");
 
         // Verify events were received
+        // Note: MessageId::to_string() returns ULID encoding, not the original string
         let received = state.received_events.lock().await;
         assert_eq!(received.len(), 2);
-        assert_eq!(received[0].id, "e1");
-        assert_eq!(received[1].id, "e2");
+        assert_eq!(received[0].id, events[0].id.to_string());
+        assert_eq!(received[1].id, events[1].id.to_string());
     }
 
     #[tokio::test]
@@ -385,7 +380,7 @@ mod tests {
     #[tokio::test]
     async fn test_webhook_emitter_failure_on_bad_url() {
         let emitter = WebhookEmitter::new("http://127.0.0.1:1/events").unwrap();
-        let events = vec![make_event("e1", "test")];
+        let events = vec![make_message("e1", "test")];
 
         let result = emitter.emit(&events).await;
         assert!(result.is_err(), "Should fail on connection error");
@@ -407,7 +402,7 @@ mod tests {
 
         let url = format!("http://{}/events", addr);
         let emitter = WebhookEmitter::new(&url).unwrap();
-        let events = vec![make_event("e1", "test")];
+        let events = vec![make_message("e1", "test")];
 
         // Should fail fast on connection reset (not hang)
         let start = std::time::Instant::now();

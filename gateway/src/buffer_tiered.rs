@@ -248,11 +248,10 @@ impl TieredBuffer {
 
         // Primary full - add to accumulator for batch compression
         // Check if we should flush due to age first
-        #[allow(clippy::collapsible_if)]
-        if self.accumulator.should_flush_by_age() {
-            if let Some(batch) = self.accumulator.flush() {
-                self.store_compressed_batch(batch);
-            }
+        if self.accumulator.should_flush_by_age()
+            && let Some(batch) = self.accumulator.flush()
+        {
+            self.store_compressed_batch(batch);
         }
 
         // Now add the message to accumulator
@@ -282,14 +281,13 @@ impl TieredBuffer {
         }
 
         // Flush accumulator - if store fails, return messages directly to avoid loss
-        #[allow(clippy::collapsible_if)]
-        if let Some(batch) = self.accumulator.flush() {
-            if !self.store_compressed_batch_internal(&batch) {
-                // Store failed - return batch messages directly to avoid data loss
-                result.extend(batch);
-                if result.len() >= n {
-                    return result;
-                }
+        if let Some(batch) = self.accumulator.flush()
+            && !self.store_compressed_batch_internal(&batch)
+        {
+            // Store failed - return batch messages directly to avoid data loss
+            result.extend(batch);
+            if result.len() >= n {
+                return result;
             }
         }
 
@@ -390,7 +388,7 @@ impl TieredBuffer {
         }
 
         let count = messages.len();
-        let first_id = messages[0].id.clone();
+        let first_id = messages[0].id;
         let first_timestamp = messages[0].timestamp;
         let serialized = self.serialize_batch(messages);
         let original_size = serialized.len();
@@ -751,7 +749,7 @@ impl TieredBuffer {
         }
 
         let count = messages.len();
-        let first_id = messages[0].id.clone();
+        let first_id = messages[0].id;
         let first_timestamp = messages[0].timestamp;
         let serialized = self.serialize_batch(&messages);
         let original_size = serialized.len();

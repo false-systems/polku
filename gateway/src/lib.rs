@@ -28,6 +28,7 @@ pub mod error;
 pub mod hub;
 pub mod ingest;
 pub mod intern;
+pub mod manifest;
 pub mod message;
 pub mod metrics;
 pub mod metrics_server;
@@ -67,6 +68,7 @@ pub use ingest::{
     ExternalIngestor, IngestContext, Ingestor, IngestorRegistry, JsonIngestor, PassthroughIngestor,
 };
 pub use intern::InternedStr;
+pub use manifest::PipelineManifest;
 pub use message::{Message, MessageId};
 pub use metrics_server::MetricsServer;
 pub use middleware::{

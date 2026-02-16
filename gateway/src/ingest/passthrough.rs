@@ -1,20 +1,20 @@
-//! Passthrough ingestor - for events already in polku.Event format
+//! Passthrough ingestor - for events already in polku.Event proto format
 //!
 //! Use this when the source is already sending properly formatted Events,
-//! for example from an SDK or another Polku instance.
+//! for example from an SDK or another Polku instance. Decodes the proto
+//! Event and converts to Message, preserving severity/outcome/typed data
+//! in metadata.
 
 use super::{IngestContext, Ingestor};
-use crate::emit::Event;
 use crate::error::PluginError;
-use prost::Message;
+use crate::message::Message;
+use polku_core::Event;
 
 /// Passthrough ingestor for pre-formatted Events
 ///
 /// Expects data to be a protobuf-encoded `polku.event.v1.Event`.
-/// Useful for:
-/// - SDK clients that produce Events directly
-/// - Forwarding between Polku instances
-/// - Testing
+/// Converts to Message at the wire boundary, preserving typed fields
+/// in metadata using `polku.severity`, `polku.outcome`, etc.
 ///
 /// # Example
 ///
@@ -49,10 +49,13 @@ impl Ingestor for PassthroughIngestor {
         &["passthrough", "polku"]
     }
 
-    fn ingest(&self, _ctx: &IngestContext, data: &[u8]) -> Result<Vec<Event>, PluginError> {
-        let event = Event::decode(data)
+    fn ingest(&self, _ctx: &IngestContext, data: &[u8]) -> Result<Vec<Message>, PluginError> {
+        let event = <Event as prost::Message>::decode(data)
             .map_err(|e| PluginError::Transform(format!("Invalid protobuf Event: {}", e)))?;
 
-        Ok(vec![event])
+        // Convert proto Event to Message (From impl handles the core mapping)
+        let msg: Message = event.into();
+
+        Ok(vec![msg])
     }
 }

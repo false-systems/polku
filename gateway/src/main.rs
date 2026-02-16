@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize metrics and start metrics server
     Metrics::init()?;
-    let _metrics_handle = MetricsServer::start(config.metrics_addr.port());
+    let _metrics_handle = MetricsServer::start(config.metrics_addr.port(), None);
     info!(addr = %config.metrics_addr, "Metrics server started");
 
     // Create shared buffer (used for backpressure signaling)

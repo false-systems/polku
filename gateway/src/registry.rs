@@ -3,9 +3,10 @@
 //! Manages ingestors and emitters. Ingestors are keyed by source name for O(1) lookup
 //! during ingestion. Emitters are stored in a vector for fan-out delivery.
 
-use crate::emit::{Emitter, Event};
+use crate::emit::Emitter;
 use crate::error::PluginError;
 use crate::ingest::{IngestContext, Ingestor};
+use crate::message::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -113,7 +114,7 @@ impl PluginRegistry {
     /// Looks up the ingestor by source name and calls its ingest method.
     /// Falls back to the default ingestor if one is set.
     /// Returns an error if no ingestor is registered for the source and no default exists.
-    pub fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Event>, PluginError> {
+    pub fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Message>, PluginError> {
         // Try source-specific ingestor first, then default
         let ingestor = self
             .ingestors
@@ -137,31 +138,31 @@ impl PluginRegistry {
     }
 
     // Keep old name for compatibility during transition
-    pub fn transform(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Event>, PluginError> {
+    pub fn transform(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Message>, PluginError> {
         self.ingest(ctx, data)
     }
 
-    /// Emit events to all emitters
+    /// Emit messages to all emitters
     ///
-    /// Events are sent to each emitter. Failures are logged but don't
+    /// Messages are sent to each emitter. Failures are logged but don't
     /// stop delivery to other emitters.
     ///
     /// Returns the number of successful deliveries.
-    pub async fn emit_to_all(&self, events: &[Event]) -> usize {
+    pub async fn emit_to_all(&self, messages: &[Message]) -> usize {
         if self.emitters.is_empty() {
-            warn!("No emitters registered, events will be dropped");
+            warn!("No emitters registered, messages will be dropped");
             return 0;
         }
 
         let mut success_count = 0;
 
         for emitter in &self.emitters {
-            match emitter.emit(events).await {
+            match emitter.emit(messages).await {
                 Ok(()) => {
                     debug!(
                         emitter = emitter.name(),
-                        count = events.len(),
-                        "Events emitted"
+                        count = messages.len(),
+                        "Messages emitted"
                     );
                     success_count += 1;
                 }
@@ -169,8 +170,8 @@ impl PluginRegistry {
                     error!(
                         emitter = emitter.name(),
                         error = %e,
-                        count = events.len(),
-                        "Failed to emit events"
+                        count = messages.len(),
+                        "Failed to emit messages"
                     );
                 }
             }
@@ -180,24 +181,24 @@ impl PluginRegistry {
     }
 
     // Keep old name for compatibility
-    pub async fn send_to_outputs(&self, events: &[Event]) -> usize {
-        self.emit_to_all(events).await
+    pub async fn send_to_outputs(&self, messages: &[Message]) -> usize {
+        self.emit_to_all(messages).await
     }
 
-    /// Emit events with routing hints
+    /// Emit messages with routing hints
     ///
-    /// Events are sent only to emitters whose names match the route_to field.
+    /// Messages are sent only to emitters whose names match the route_to field.
     /// If route_to is empty, sends to all emitters.
-    pub async fn emit_with_routing(&self, events: &[Event]) -> usize {
-        let mut all_emitters: Vec<&Event> = Vec::new();
-        let mut routed: HashMap<&str, Vec<&Event>> = HashMap::new();
+    pub async fn emit_with_routing(&self, messages: &[Message]) -> usize {
+        let mut all_emitters: Vec<&Message> = Vec::new();
+        let mut routed: HashMap<&str, Vec<&Message>> = HashMap::new();
 
-        for event in events {
-            if event.route_to.is_empty() {
-                all_emitters.push(event);
+        for msg in messages {
+            if msg.route_to.is_empty() {
+                all_emitters.push(msg);
             } else {
-                for route in &event.route_to {
-                    routed.entry(route.as_str()).or_default().push(event);
+                for route in &msg.route_to {
+                    routed.entry(route.as_str()).or_default().push(msg);
                 }
             }
         }
@@ -205,19 +206,20 @@ impl PluginRegistry {
         let mut success_count = 0;
 
         if !all_emitters.is_empty() {
-            let events_vec: Vec<Event> = all_emitters.into_iter().cloned().collect();
-            success_count += self.emit_to_all(&events_vec).await;
+            let messages_vec: Vec<Message> = all_emitters.into_iter().cloned().collect();
+            success_count += self.emit_to_all(&messages_vec).await;
         }
 
         for emitter in &self.emitters {
-            if let Some(events) = routed.get(emitter.name()) {
-                let events_vec: Vec<Event> = events.iter().copied().cloned().collect();
-                match emitter.emit(&events_vec).await {
+            if let Some(events_for_emitter) = routed.get(emitter.name()) {
+                let messages_vec: Vec<Message> =
+                    events_for_emitter.iter().copied().cloned().collect();
+                match emitter.emit(&messages_vec).await {
                     Ok(()) => {
                         debug!(
                             emitter = emitter.name(),
-                            count = events_vec.len(),
-                            "Routed events emitted"
+                            count = messages_vec.len(),
+                            "Routed messages emitted"
                         );
                         success_count += 1;
                     }
@@ -225,8 +227,8 @@ impl PluginRegistry {
                         error!(
                             emitter = emitter.name(),
                             error = %e,
-                            count = events_vec.len(),
-                            "Failed to emit routed events"
+                            count = messages_vec.len(),
+                            "Failed to emit routed messages"
                         );
                     }
                 }
@@ -292,19 +294,14 @@ mod tests {
             self.sources
         }
 
-        fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Event>, PluginError> {
-            Ok(vec![Event {
-                id: format!("{}:{}", ctx.source, data.len()),
-                timestamp_unix_ns: 0,
-                source: ctx.source.to_string(),
-                event_type: "test".to_string(),
-                metadata: Default::default(),
-                payload: data.to_vec(),
-                route_to: vec![],
-                severity: 0,
-                outcome: 0,
-                data: None,
-            }])
+        fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Message>, PluginError> {
+            Ok(vec![Message::with_id(
+                format!("{}:{}", ctx.source, data.len()),
+                0,
+                ctx.source,
+                "test",
+                bytes::Bytes::copy_from_slice(data),
+            )])
         }
     }
 
@@ -318,7 +315,7 @@ mod tests {
             self.name
         }
 
-        async fn emit(&self, _events: &[Event]) -> Result<(), PluginError> {
+        async fn emit(&self, _messages: &[Message]) -> Result<(), PluginError> {
             Ok(())
         }
 
@@ -394,20 +391,8 @@ mod tests {
         registry.register_emitter(Arc::new(MockEmitter { name: "emitter1" }));
         registry.register_emitter(Arc::new(MockEmitter { name: "emitter2" }));
 
-        let events = vec![Event {
-            id: "test".to_string(),
-            timestamp_unix_ns: 0,
-            source: "test".to_string(),
-            event_type: "test".to_string(),
-            metadata: Default::default(),
-            payload: vec![],
-            route_to: vec![],
-            severity: 0,
-            outcome: 0,
-            data: None,
-        }];
-
-        let success = registry.emit_to_all(&events).await;
+        let messages = vec![Message::new("test", "test", bytes::Bytes::new())];
+        let success = registry.emit_to_all(&messages).await;
         assert_eq!(success, 2);
     }
 

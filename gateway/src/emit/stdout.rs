@@ -5,8 +5,8 @@
 
 use crate::emit::Emitter;
 use crate::error::PluginError;
+use crate::message::Message;
 use async_trait::async_trait;
-use polku_core::Event;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Stdout emitter - prints events for debugging
@@ -52,34 +52,35 @@ impl Emitter for StdoutEmitter {
         "stdout"
     }
 
-    async fn emit(&self, events: &[Event]) -> Result<(), PluginError> {
+    async fn emit(&self, messages: &[Message]) -> Result<(), PluginError> {
         use std::io::Write;
 
         let mut stdout = std::io::stdout().lock();
         let mut emitted = 0u64;
 
-        for event in events {
-            // Write event and propagate I/O errors
+        for msg in messages {
+            let metadata = msg.metadata();
+            // Write message and propagate I/O errors
             let result = if self.pretty {
                 writeln!(
                     stdout,
-                    "┌─ Event ─────────────────────────────────────────────",
+                    "┌─ Message ───────────────────────────────────────────",
                 )
-                .and_then(|_| writeln!(stdout, "│ ID:        {}", event.id))
-                .and_then(|_| writeln!(stdout, "│ Source:    {}", event.source))
-                .and_then(|_| writeln!(stdout, "│ Type:      {}", event.event_type))
-                .and_then(|_| writeln!(stdout, "│ Timestamp: {} ns", event.timestamp_unix_ns))
+                .and_then(|_| writeln!(stdout, "│ ID:        {}", msg.id))
+                .and_then(|_| writeln!(stdout, "│ Source:    {}", msg.source))
+                .and_then(|_| writeln!(stdout, "│ Type:      {}", msg.message_type))
+                .and_then(|_| writeln!(stdout, "│ Timestamp: {} ns", msg.timestamp))
                 .and_then(|_| {
-                    if !event.metadata.is_empty() {
-                        writeln!(stdout, "│ Metadata:  {:?}", event.metadata)
+                    if !metadata.is_empty() {
+                        writeln!(stdout, "│ Metadata:  {:?}", metadata)
                     } else {
                         Ok(())
                     }
                 })
-                .and_then(|_| writeln!(stdout, "│ Payload:   {} bytes", event.payload.len()))
+                .and_then(|_| writeln!(stdout, "│ Payload:   {} bytes", msg.payload.len()))
                 .and_then(|_| {
-                    if !event.route_to.is_empty() {
-                        writeln!(stdout, "│ Route to:  {:?}", event.route_to)
+                    if !msg.route_to.is_empty() {
+                        writeln!(stdout, "│ Route to:  {:?}", msg.route_to)
                     } else {
                         Ok(())
                     }
@@ -94,10 +95,10 @@ impl Emitter for StdoutEmitter {
                 writeln!(
                     stdout,
                     "[{}] {}:{} ({} bytes)",
-                    event.source,
-                    event.event_type,
-                    event.id,
-                    event.payload.len()
+                    msg.source,
+                    msg.message_type,
+                    msg.id,
+                    msg.payload.len()
                 )
             };
 
@@ -126,27 +127,22 @@ impl Emitter for StdoutEmitter {
 mod tests {
     use super::*;
 
-    fn make_event(id: &str) -> Event {
-        Event {
-            id: id.to_string(),
-            timestamp_unix_ns: 1234567890,
-            source: "test-source".to_string(),
-            event_type: "test".to_string(),
-            metadata: Default::default(),
-            payload: vec![1, 2, 3],
-            route_to: vec![],
-            severity: 0,
-            outcome: 0,
-            data: None,
-        }
+    fn make_message(id: &str) -> Message {
+        Message::with_id(
+            id,
+            1234567890,
+            "test-source",
+            "test",
+            bytes::Bytes::from_static(&[1, 2, 3]),
+        )
     }
 
     #[tokio::test]
     async fn test_emit_events() {
         let emitter = StdoutEmitter::new();
-        let events = vec![make_event("e1"), make_event("e2")];
+        let messages = vec![make_message("e1"), make_message("e2")];
 
-        emitter.emit(&events).await.unwrap();
+        emitter.emit(&messages).await.unwrap();
 
         assert_eq!(emitter.emitted_count(), 2);
     }

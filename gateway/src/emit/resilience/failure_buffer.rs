@@ -1,26 +1,25 @@
 //! Failure buffer for capturing failed emissions
 //!
-//! In-memory buffer for inspecting failed events. NOT a persistent dead letter queue.
-//! Events are lost on process restart - this is for debugging/inspection only.
+//! In-memory buffer for inspecting failed messages. NOT a persistent dead letter queue.
+//! Messages are lost on process restart - this is for debugging/inspection only.
 //!
 //! For true dead letter queue semantics, use external infrastructure (Kafka, SQS, etc.)
 //!
 //! # Performance Note
 //!
-//! The buffer must clone events on failure because it stores them for inspection.
-//! The proto-generated `Event` type uses `Vec<u8>` for payload (not `Bytes`),
-//! which means each failed event incurs a full payload copy. For high-throughput
-//! scenarios with large payloads, consider:
+//! The buffer must clone messages on failure because it stores them for inspection.
+//! `Message` uses `Bytes` for payload, which is Arc-based and cheap to clone
+//! (just a reference count increment). For high-throughput scenarios, consider:
 //!
-//! - Using `store_full_batch: false` to only sample the first event
+//! - Using `store_full_batch: false` to only sample the first message
 //! - Setting a conservative capacity limit to bound memory usage
 //! - Monitoring `total_dropped` to detect capacity pressure
 
 use crate::emit::Emitter;
 use crate::error::PluginError;
+use crate::message::Message;
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use polku_core::Event;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,12 +27,12 @@ use std::time::Instant;
 
 /// A failed event with metadata about the failure
 ///
-/// Note: The `event` field is a clone of the original. See module docs for
+/// Note: The `message` field is a clone of the original. See module docs for
 /// performance implications when storing large payloads.
 #[derive(Debug, Clone)]
 pub struct FailedEvent {
-    /// The original event that failed (cloned from the emission batch)
-    pub event: Event,
+    /// The original message that failed (cloned from the emission batch)
+    pub message: Message,
     /// Error message from the failure
     pub error: String,
     /// Which emitter failed
@@ -180,16 +179,16 @@ impl Emitter for FailureCaptureEmitter {
         "failure_capture"
     }
 
-    async fn emit(&self, events: &[Event]) -> Result<(), PluginError> {
-        match self.inner.emit(events).await {
+    async fn emit(&self, messages: &[Message]) -> Result<(), PluginError> {
+        match self.inner.emit(messages).await {
             Ok(()) => Ok(()),
             Err(e) => {
-                // Capture failed events to buffer
+                // Capture failed messages to buffer
                 let failed_events: Vec<FailedEvent> = if self.config.store_full_batch {
-                    events
+                    messages
                         .iter()
-                        .map(|event| FailedEvent {
-                            event: event.clone(),
+                        .map(|msg| FailedEvent {
+                            message: msg.clone(),
                             error: e.to_string(),
                             emitter_name: self.inner.name().to_string(),
                             failed_at: Instant::now(),
@@ -197,12 +196,12 @@ impl Emitter for FailureCaptureEmitter {
                         })
                         .collect()
                 } else {
-                    // Store only first event as representative sample
-                    events
+                    // Store only first message as representative sample
+                    messages
                         .first()
-                        .map(|event| FailedEvent {
-                            event: event.clone(),
-                            error: format!("{} (batch of {})", e, events.len()),
+                        .map(|msg| FailedEvent {
+                            message: msg.clone(),
+                            error: format!("{} (batch of {})", e, messages.len()),
                             emitter_name: self.inner.name().to_string(),
                             failed_at: Instant::now(),
                             attempts: 1,
@@ -217,9 +216,9 @@ impl Emitter for FailureCaptureEmitter {
                 tracing::warn!(
                     emitter = self.inner.name(),
                     error = %e,
-                    events_captured = count,
+                    messages_captured = count,
                     buffer_size = self.buffer.len(),
-                    "events captured to failure buffer"
+                    "messages captured to failure buffer"
                 );
 
                 // Return the original error (capture is transparent)
@@ -260,7 +259,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "always_failing"
         }
-        async fn emit(&self, _: &[Event]) -> Result<(), PluginError> {
+        async fn emit(&self, _: &[Message]) -> Result<(), PluginError> {
             Err(PluginError::Connection("always fails".into()))
         }
         async fn health(&self) -> bool {
@@ -276,7 +275,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "success"
         }
-        async fn emit(&self, _: &[Event]) -> Result<(), PluginError> {
+        async fn emit(&self, _: &[Message]) -> Result<(), PluginError> {
             Ok(())
         }
         async fn health(&self) -> bool {
@@ -284,19 +283,8 @@ mod tests {
         }
     }
 
-    fn make_test_event(id: &str) -> Event {
-        Event {
-            id: id.to_string(),
-            timestamp_unix_ns: 0,
-            source: "test".to_string(),
-            event_type: "test".to_string(),
-            metadata: std::collections::HashMap::new(),
-            payload: vec![],
-            route_to: vec![],
-            severity: 0,
-            outcome: 0,
-            data: None,
-        }
+    fn make_test_message(id: &str) -> Message {
+        Message::with_id(id, 0, "test", "test", bytes::Bytes::new())
     }
 
     #[test]
@@ -304,7 +292,7 @@ mod tests {
         let buffer = FailureBuffer::new(100);
 
         buffer.push(vec![FailedEvent {
-            event: make_test_event("e1"),
+            message: make_test_message("e1"),
             error: "test error".into(),
             emitter_name: "test".into(),
             failed_at: Instant::now(),
@@ -322,7 +310,7 @@ mod tests {
         // Push 5 events
         for i in 0..5 {
             buffer.push(vec![FailedEvent {
-                event: make_test_event(&format!("evt-{i}")),
+                message: make_test_message(&format!("evt-{i}")),
                 error: "test".into(),
                 emitter_name: "test".into(),
                 failed_at: Instant::now(),
@@ -337,9 +325,9 @@ mod tests {
 
         let events = buffer.drain(10);
         assert_eq!(events.len(), 3);
-        assert_eq!(events[0].event.id, "evt-2");
-        assert_eq!(events[1].event.id, "evt-3");
-        assert_eq!(events[2].event.id, "evt-4");
+        assert_eq!(events[0].message.id, "evt-2");
+        assert_eq!(events[1].message.id, "evt-3");
+        assert_eq!(events[2].message.id, "evt-4");
     }
 
     #[test]
@@ -348,7 +336,7 @@ mod tests {
 
         for i in 0..5 {
             buffer.push(vec![FailedEvent {
-                event: make_test_event(&format!("evt-{i}")),
+                message: make_test_message(&format!("evt-{i}")),
                 error: "test".into(),
                 emitter_name: "test".into(),
                 failed_at: Instant::now(),
@@ -373,7 +361,7 @@ mod tests {
 
         for i in 0..3 {
             buffer.push(vec![FailedEvent {
-                event: make_test_event(&format!("evt-{i}")),
+                message: make_test_message(&format!("evt-{i}")),
                 error: "test".into(),
                 emitter_name: "test".into(),
                 failed_at: Instant::now(),
@@ -392,7 +380,7 @@ mod tests {
         let buffer = FailureBuffer::new(100);
 
         buffer.push(vec![FailedEvent {
-            event: make_test_event("e1"),
+            message: make_test_message("e1"),
             error: "test".into(),
             emitter_name: "test".into(),
             failed_at: Instant::now(),
@@ -410,7 +398,7 @@ mod tests {
         let buffer = Arc::new(FailureBuffer::new(100));
         let emitter = FailureCaptureEmitter::with_defaults(inner, buffer.clone());
 
-        let events = vec![make_test_event("e1"), make_test_event("e2")];
+        let events = vec![make_test_message("e1"), make_test_message("e2")];
         let result = emitter.emit(&events).await;
 
         assert!(result.is_err());
@@ -419,8 +407,8 @@ mod tests {
         let failed = buffer.drain(10);
         assert_eq!(failed.len(), 2);
         assert_eq!(failed[0].emitter_name, "always_failing");
-        assert_eq!(failed[0].event.id, "e1");
-        assert_eq!(failed[1].event.id, "e2");
+        assert_eq!(failed[0].message.id, "e1");
+        assert_eq!(failed[1].message.id, "e2");
     }
 
     #[tokio::test]
@@ -429,7 +417,7 @@ mod tests {
         let buffer = Arc::new(FailureBuffer::new(100));
         let emitter = FailureCaptureEmitter::with_defaults(inner, buffer.clone());
 
-        let result = emitter.emit(&[make_test_event("e1")]).await;
+        let result = emitter.emit(&[make_test_message("e1")]).await;
 
         assert!(result.is_ok());
         assert!(buffer.is_empty()); // Nothing captured on success
@@ -449,16 +437,16 @@ mod tests {
         );
 
         let events = vec![
-            make_test_event("e1"),
-            make_test_event("e2"),
-            make_test_event("e3"),
+            make_test_message("e1"),
+            make_test_message("e2"),
+            make_test_message("e3"),
         ];
         let _ = emitter.emit(&events).await;
 
         // Only first event stored
         assert_eq!(buffer.len(), 1);
         let failed = buffer.drain(10);
-        assert_eq!(failed[0].event.id, "e1");
+        assert_eq!(failed[0].message.id, "e1");
         assert!(failed[0].error.contains("batch of 3"));
     }
 
@@ -481,7 +469,7 @@ mod tests {
         let emitter = FailureCaptureEmitter::with_defaults(inner, buffer.clone());
 
         // Cause some events to be captured
-        let _ = emitter.emit(&[make_test_event("e1")]).await;
+        let _ = emitter.emit(&[make_test_message("e1")]).await;
         assert_eq!(buffer.len(), 1);
 
         // Shutdown should succeed
@@ -499,7 +487,7 @@ mod tests {
         let emitter = FailureCaptureEmitter::with_defaults(inner, buffer.clone());
 
         // No failures, buffer is empty
-        let _ = emitter.emit(&[make_test_event("e1")]).await;
+        let _ = emitter.emit(&[make_test_message("e1")]).await;
         assert!(buffer.is_empty());
 
         // Shutdown should succeed without warning

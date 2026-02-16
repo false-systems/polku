@@ -6,7 +6,7 @@
 
 use bytes::Bytes;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use polku_gateway::{Emitter, Event, Hub, Message, PluginError};
+use polku_gateway::{Emitter, Hub, Message, PluginError};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -36,9 +36,10 @@ impl Emitter for SlowEmitter {
         "slow"
     }
 
-    async fn emit(&self, events: &[Event]) -> Result<(), PluginError> {
+    async fn emit(&self, messages: &[Message]) -> Result<(), PluginError> {
         tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
-        self.count.fetch_add(events.len() as u64, Ordering::SeqCst);
+        self.count
+            .fetch_add(messages.len() as u64, Ordering::SeqCst);
         Ok(())
     }
 
@@ -56,8 +57,8 @@ impl Emitter for NullEmitter {
         "null"
     }
 
-    async fn emit(&self, events: &[Event]) -> Result<(), PluginError> {
-        self.0.fetch_add(events.len() as u64, Ordering::SeqCst);
+    async fn emit(&self, messages: &[Message]) -> Result<(), PluginError> {
+        self.0.fetch_add(messages.len() as u64, Ordering::SeqCst);
         Ok(())
     }
 
@@ -192,7 +193,7 @@ fn bench_buffer_overflow(c: &mut Criterion) {
                         fn name(&self) -> &'static str {
                             "blocking"
                         }
-                        async fn emit(&self, _: &[Event]) -> Result<(), PluginError> {
+                        async fn emit(&self, _: &[Message]) -> Result<(), PluginError> {
                             // Sleep long enough that buffer fills up
                             tokio::time::sleep(Duration::from_secs(10)).await;
                             Ok(())

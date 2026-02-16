@@ -1,18 +1,18 @@
 //! Ingestor system for POLKU
 //!
-//! Ingestors transform raw bytes from various protocols into typed Events.
+//! Ingestors transform raw bytes from various protocols into Messages.
 //! Each source registers an Ingestor that knows how to deserialize that format.
 //!
 //! # Architecture
 //!
 //! ```text
-//! Raw bytes ──► Ingestor ──► Vec<Event>
+//! Raw bytes ──► Ingestor ──► Vec<Message>
 //!               (lookup by source)
 //! ```
 //!
 //! # Built-in Ingestors
 //!
-//! - `PassthroughIngestor` - events already in polku.Event format
+//! - `PassthroughIngestor` - events already in polku.Event proto format
 //! - `JsonIngestor` - JSON matching Event schema
 //!
 //! # Plugin Ingestors
@@ -29,8 +29,8 @@ pub use json::JsonIngestor;
 pub use passthrough::PassthroughIngestor;
 pub use registry::IngestorRegistry;
 
-use crate::emit::Event;
 use crate::error::PluginError;
+use crate::message::Message;
 
 /// Context for ingestion
 #[derive(Debug, Clone)]
@@ -43,18 +43,19 @@ pub struct IngestContext<'a> {
     pub format: &'a str,
 }
 
-/// Ingestor trait - transforms raw bytes into typed Events
+/// Ingestor trait - transforms raw bytes into Messages
 ///
 /// Ingestors are the core abstraction for format transformation in Polku.
-/// They take raw bytes from a source and produce typed Events that flow
+/// They take raw bytes from a source and produce Messages that flow
 /// through the middleware pipeline.
 ///
 /// # Implementing an Ingestor
 ///
 /// ```ignore
 /// use polku_gateway::ingest::{Ingestor, IngestContext};
-/// use polku_gateway::emit::Event;
+/// use polku_gateway::message::Message;
 /// use polku_gateway::error::PluginError;
+/// use bytes::Bytes;
 ///
 /// struct MyIngestor;
 ///
@@ -67,9 +68,9 @@ pub struct IngestContext<'a> {
 ///         &["my-source", "my-source-v2"]
 ///     }
 ///
-///     fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Event>, PluginError> {
-///         // Parse data and return Events
-///         todo!()
+///     fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Message>, PluginError> {
+///         // Parse data and return Messages
+///         Ok(vec![Message::new(ctx.source, "my.event", Bytes::copy_from_slice(data))])
 ///     }
 /// }
 /// ```
@@ -83,19 +84,18 @@ pub trait Ingestor: Send + Sync {
     /// Multiple sources can map to the same ingestor (e.g., version aliases).
     fn sources(&self) -> &'static [&'static str];
 
-    /// Transform raw bytes into Events
+    /// Transform raw bytes into Messages
     ///
     /// # Arguments
     /// * `ctx` - Context with source, cluster, and format information
     /// * `data` - Raw bytes from the source
     ///
     /// # Returns
-    /// Vector of Events or a PluginError
+    /// Vector of Messages or a PluginError
     ///
     /// # Errors
-    /// - `PluginError::Decode` - if data cannot be parsed
-    /// - `PluginError::Transform` - if transformation logic fails
-    fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Event>, PluginError>;
+    /// - `PluginError::Transform` - if data cannot be parsed or transformation fails
+    fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Message>, PluginError>;
 }
 
 #[cfg(test)]
@@ -106,6 +106,8 @@ mod tests {
     // ==========================================================================
     // Ingestor trait tests
     // ==========================================================================
+
+    use bytes::Bytes;
 
     struct TestIngestor;
 
@@ -118,19 +120,14 @@ mod tests {
             &["test-source", "test-alias"]
         }
 
-        fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Event>, PluginError> {
-            Ok(vec![Event {
-                id: format!("{}:{}", ctx.source, data.len()),
-                timestamp_unix_ns: 0,
-                source: ctx.source.to_string(),
-                event_type: "test.event".to_string(),
-                metadata: Default::default(),
-                payload: data.to_vec(),
-                route_to: vec![],
-                severity: 0,
-                outcome: 0,
-                data: None,
-            }])
+        fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Message>, PluginError> {
+            Ok(vec![Message::with_id(
+                format!("{}:{}", ctx.source, data.len()),
+                0,
+                ctx.source,
+                "test.event",
+                Bytes::copy_from_slice(data),
+            )])
         }
     }
 
@@ -158,10 +155,10 @@ mod tests {
             format: "json",
         };
 
-        let events = ingestor.ingest(&ctx, b"hello world").unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].source, "test-source");
-        assert_eq!(events[0].id, "test-source:11");
+        let msgs = ingestor.ingest(&ctx, b"hello world").unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].source, "test-source");
+        assert_eq!(msgs[0].id, "test-source:11");
     }
 
     // ==========================================================================
@@ -176,7 +173,7 @@ mod tests {
 
     #[test]
     fn test_passthrough_ingestor_valid_protobuf() {
-        use prost::Message;
+        use polku_core::Event;
 
         let ingestor = PassthroughIngestor::new();
         let ctx = IngestContext {
@@ -198,12 +195,54 @@ mod tests {
             outcome: 0,
             data: None,
         };
-        let data = event.encode_to_vec();
+        let data = prost::Message::encode_to_vec(&event);
 
-        let events = ingestor.ingest(&ctx, &data).unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].id, "evt-123");
-        assert_eq!(events[0].source, "my-app");
+        let msgs = ingestor.ingest(&ctx, &data).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].id, "evt-123");
+        assert_eq!(msgs[0].source, "my-app");
+    }
+
+    #[test]
+    fn test_passthrough_ingestor_preserves_severity() {
+        use polku_core::Event;
+
+        let ingestor = PassthroughIngestor::new();
+        let ctx = IngestContext {
+            source: "passthrough",
+            cluster: "prod",
+            format: "protobuf",
+        };
+
+        // Create an Event with severity and outcome set
+        let event = Event {
+            id: "sev-1".to_string(),
+            timestamp_unix_ns: 1000,
+            source: "tapio".to_string(),
+            event_type: "network.connection".to_string(),
+            metadata: Default::default(),
+            payload: b"data".to_vec(),
+            route_to: vec![],
+            severity: 4, // ERROR
+            outcome: 2,  // FAILURE
+            data: None,
+        };
+        let data = prost::Message::encode_to_vec(&event);
+
+        let msgs = ingestor.ingest(&ctx, &data).unwrap();
+        assert_eq!(msgs.len(), 1);
+
+        // Bug #5: PassthroughIngestor uses From<Event> which drops severity/outcome
+        assert_eq!(
+            msgs[0].metadata().get(polku_core::metadata_keys::SEVERITY),
+            Some(&"4".to_string()),
+            "PassthroughIngestor must preserve Event severity in metadata"
+        );
+        assert_eq!(
+            msgs[0].metadata().get(polku_core::metadata_keys::OUTCOME),
+            Some(&"2".to_string()),
+            "PassthroughIngestor must preserve Event outcome in metadata"
+        );
     }
 
     #[test]
@@ -246,11 +285,11 @@ mod tests {
             "payload": "dGVzdA=="
         }"#;
 
-        let events = ingestor.ingest(&ctx, json.as_bytes()).unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].id, "evt-456");
-        assert_eq!(events[0].source, "my-service");
-        assert_eq!(events[0].event_type, "order.placed");
+        let msgs = ingestor.ingest(&ctx, json.as_bytes()).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].id, "evt-456");
+        assert_eq!(msgs[0].source, "my-service");
+        assert_eq!(msgs[0].message_type, "order.placed");
     }
 
     #[test]
@@ -267,10 +306,10 @@ mod tests {
             {"id": "evt-2", "source": "svc", "event_type": "b"}
         ]"#;
 
-        let events = ingestor.ingest(&ctx, json.as_bytes()).unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].id, "evt-1");
-        assert_eq!(events[1].id, "evt-2");
+        let msgs = ingestor.ingest(&ctx, json.as_bytes()).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].id, "evt-1");
+        assert_eq!(msgs[1].id, "evt-2");
     }
 
     #[test]
@@ -286,8 +325,8 @@ mod tests {
 {"id": "evt-2", "source": "svc", "event_type": "b"}
 {"id": "evt-3", "source": "svc", "event_type": "c"}"#;
 
-        let events = ingestor.ingest(&ctx, ndjson.as_bytes()).unwrap();
-        assert_eq!(events.len(), 3);
+        let msgs = ingestor.ingest(&ctx, ndjson.as_bytes()).unwrap();
+        assert_eq!(msgs.len(), 3);
     }
 
     #[test]
@@ -301,9 +340,10 @@ mod tests {
 
         let json = r#"{"source": "svc", "event_type": "test"}"#;
 
-        let events = ingestor.ingest(&ctx, json.as_bytes()).unwrap();
-        assert_eq!(events.len(), 1);
-        assert!(!events[0].id.is_empty());
+        let msgs = ingestor.ingest(&ctx, json.as_bytes()).unwrap();
+        assert_eq!(msgs.len(), 1);
+        // MessageId is always non-empty
+        assert!(!msgs[0].id.to_string().is_empty());
     }
 
     #[test]
