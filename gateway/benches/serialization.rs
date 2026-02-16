@@ -1,10 +1,13 @@
 //! Serialization benchmarks
 //!
-//! Measures Message <-> Event conversion overhead.
+//! Measures Message <-> Event conversion at gRPC boundaries.
+//! After the Message-first refactor, these conversions only happen at
+//! protocol boundaries (gRPC ingestion/emission), NOT in the hot path.
 
 use bytes::Bytes;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use polku_gateway::{Event, Message};
+use polku_core::Event;
+use polku_gateway::Message;
 use std::collections::HashMap;
 
 fn make_message() -> Message {
@@ -41,11 +44,11 @@ fn make_event() -> Event {
     }
 }
 
-fn bench_message_to_event(c: &mut Criterion) {
-    let mut group = c.benchmark_group("serialization");
+fn bench_boundary_conversion(c: &mut Criterion) {
+    let mut group = c.benchmark_group("boundary_conversion");
     group.throughput(Throughput::Elements(1000));
 
-    // Message -> Event (used when sending to emitters)
+    // Message -> Event at gRPC emission boundary
     group.bench_function("message_to_event", |b| {
         b.iter(|| {
             for _ in 0..1000 {
@@ -55,7 +58,7 @@ fn bench_message_to_event(c: &mut Criterion) {
         })
     });
 
-    // Event -> Message (used when receiving from gRPC)
+    // Event -> Message at gRPC ingestion boundary
     group.bench_function("event_to_message", |b| {
         b.iter(|| {
             for _ in 0..1000 {
@@ -72,7 +75,7 @@ fn bench_message_clone(c: &mut Criterion) {
     let mut group = c.benchmark_group("message_clone");
     group.throughput(Throughput::Elements(1000));
 
-    // Demonstrate zero-copy: cloning Message should be cheap
+    // Demonstrate zero-copy: cloning Message should be cheap (Arc-based Bytes)
     group.bench_function("clone_message", |b| {
         let msg = make_message();
         b.iter(|| {
@@ -82,7 +85,7 @@ fn bench_message_clone(c: &mut Criterion) {
         })
     });
 
-    // Compare with Event clone (not zero-copy)
+    // Compare with Event clone (Vec<u8> payload = full copy)
     group.bench_function("clone_event", |b| {
         let event = make_event();
         b.iter(|| {
@@ -118,7 +121,7 @@ fn bench_payload_sizes(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    bench_message_to_event,
+    bench_boundary_conversion,
     bench_message_clone,
     bench_payload_sizes
 );
