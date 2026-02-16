@@ -1,4 +1,4 @@
-//! Serialization benchmarks
+//! Boundary conversion benchmarks
 //!
 //! Measures Message <-> Event conversion at gRPC boundaries.
 //! After the Message-first refactor, these conversions only happen at

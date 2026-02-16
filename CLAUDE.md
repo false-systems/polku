@@ -92,6 +92,7 @@ pub struct Message {
 // Ingestor: decode protocol → Message
 pub trait Ingestor: Send + Sync {
     fn name(&self) -> &'static str;
+    fn sources(&self) -> &'static [&'static str];  // Source IDs this ingestor handles
     fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Message>, PluginError>;
 }
 
@@ -101,6 +102,7 @@ pub trait Emitter: Send + Sync {
     fn name(&self) -> &'static str;
     async fn emit(&self, messages: &[Message]) -> Result<(), PluginError>;
     async fn health(&self) -> bool;
+    async fn shutdown(&self) -> Result<(), PluginError> { Ok(()) }
 }
 
 // Middleware: transform, filter, route
