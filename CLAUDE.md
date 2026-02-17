@@ -102,6 +102,7 @@ pub trait Emitter: Send + Sync {
     fn name(&self) -> &'static str;
     async fn emit(&self, messages: &[Message]) -> Result<(), PluginError>;
     async fn health(&self) -> bool;
+    async fn shutdown(&self) -> Result<(), PluginError>;
     async fn shutdown(&self) -> Result<(), PluginError> { Ok(()) }
 }
 
