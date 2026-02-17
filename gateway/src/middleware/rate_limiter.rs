@@ -3,11 +3,11 @@
 //! Limits message throughput using the token bucket algorithm.
 //! Thread-safe, lock-free, O(1) per message.
 
+use super::token_bucket::TokenBucket;
 use crate::message::Message;
 use crate::middleware::Middleware;
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 
 /// Token bucket rate limiter
 ///
@@ -15,18 +15,7 @@ use std::time::Instant;
 /// Implemented as a continuously refilling token bucket.
 /// Thread-safe using atomics - no locks on hot path.
 pub struct RateLimiter {
-    /// Max tokens in bucket
-    capacity: u64,
-    /// Tokens added per refill interval
-    refill_amount: u64,
-    /// Nanoseconds between refills
-    refill_nanos: u64,
-    /// Current token count (scaled by 1000 for precision)
-    tokens: AtomicU64,
-    /// Last refill timestamp (nanos since start)
-    last_refill: AtomicU64,
-    /// Start instant for time tracking
-    start: Instant,
+    bucket: TokenBucket,
     /// Count of messages dropped due to rate limiting
     dropped: AtomicU64,
 }
@@ -38,22 +27,8 @@ impl RateLimiter {
     /// * `rate` - Messages per second allowed (0 = no refill)
     /// * `burst` - Max burst size (bucket capacity). If 0, no messages allowed.
     pub fn new(rate: u64, burst: u64) -> Self {
-        let refill_nanos = if rate == 0 {
-            u64::MAX
-        } else {
-            1_000_000_000 / rate
-        };
-
-        // Use saturating mul to prevent overflow with large burst values
-        let scaled_burst = burst.saturating_mul(1000);
-
         Self {
-            capacity: scaled_burst,
-            refill_amount: 1000, // 1 token scaled
-            refill_nanos,
-            tokens: AtomicU64::new(scaled_burst),
-            last_refill: AtomicU64::new(0),
-            start: Instant::now(),
+            bucket: TokenBucket::new(rate, burst),
             dropped: AtomicU64::new(0),
         }
     }
@@ -67,90 +42,7 @@ impl RateLimiter {
     ///
     /// Returns true if token acquired, false if rate limited.
     pub fn try_acquire(&self) -> bool {
-        self.refill();
-
-        loop {
-            let current = self.tokens.load(Ordering::Acquire);
-            if current < 1000 {
-                return false; // Not enough tokens
-            }
-
-            // Try to consume 1 token (1000 scaled)
-            if self
-                .tokens
-                .compare_exchange_weak(current, current - 1000, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return true;
-            }
-            // CAS failed, retry
-        }
-    }
-
-    /// Refill tokens based on elapsed time
-    ///
-    /// Uses CAS loop to ensure only one thread adds tokens for a given time interval.
-    fn refill(&self) {
-        let now_nanos = self.start.elapsed().as_nanos() as u64;
-
-        loop {
-            let last = self.last_refill.load(Ordering::Acquire);
-            let elapsed = now_nanos.saturating_sub(last);
-
-            if elapsed < self.refill_nanos {
-                return; // Not time to refill yet
-            }
-
-            let intervals = elapsed / self.refill_nanos;
-            if intervals == 0 {
-                return;
-            }
-
-            // Compute the new last refill time
-            let new_last = last + intervals * self.refill_nanos;
-
-            // Try to claim this time interval
-            match self.last_refill.compare_exchange_weak(
-                last,
-                new_last,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    // We won the race - add tokens for these intervals
-                    let tokens_to_add = intervals * self.refill_amount;
-                    if tokens_to_add == 0 {
-                        return;
-                    }
-
-                    // Add tokens (capped at capacity)
-                    loop {
-                        let current = self.tokens.load(Ordering::Acquire);
-                        let new_tokens = (current.saturating_add(tokens_to_add)).min(self.capacity);
-                        if current == new_tokens {
-                            break;
-                        }
-                        if self
-                            .tokens
-                            .compare_exchange_weak(
-                                current,
-                                new_tokens,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            )
-                            .is_ok()
-                        {
-                            break;
-                        }
-                    }
-                    return;
-                }
-                Err(_) => {
-                    // Another thread updated last_refill; retry with new value
-                    continue;
-                }
-            }
-        }
+        self.bucket.try_acquire()
     }
 }
 

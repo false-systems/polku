@@ -159,7 +159,16 @@ impl HubRunner {
             .fetch_add(messages.len() as u64, Ordering::SeqCst);
 
         // Partition messages by destination with zero-copy optimization
-        let batches = partition_by_destination_owned(messages, &self.emitters);
+        let PartitionResult {
+            batches,
+            unroutable,
+        } = partition_by_destination_owned(messages, &self.emitters);
+
+        if unroutable > 0
+            && let Some(m) = Metrics::get()
+        {
+            m.record_dropped("no_matching_emitter", unroutable);
+        }
 
         // Pre-aggregate metrics to reduce Prometheus HashMap lookups.
         // Key: (emitter_name, event_type), Value: count
@@ -282,6 +291,14 @@ fn update_pressure(metrics: &Metrics, emitters: &[Arc<dyn Emitter>]) {
     metrics.update_pipeline_pressure(buffer_fill, emit_failure_rate, 0.0);
 }
 
+/// Result of partitioning messages by destination
+pub(crate) struct PartitionResult<'a> {
+    /// Messages grouped by emitter name
+    pub batches: std::collections::HashMap<&'a str, Vec<Message>>,
+    /// Number of messages that matched no emitter (dropped)
+    pub unroutable: u64,
+}
+
 /// Partition messages by destination, returning ready-to-emit batches
 ///
 /// For messages that go to only ONE emitter, moves the message (no clone).
@@ -292,15 +309,18 @@ fn update_pressure(metrics: &Metrics, emitters: &[Arc<dyn Emitter>]) {
 /// - Single pass to count destinations per message: O(messages × emitters)
 /// - Second pass to distribute: O(messages × avg_destinations)
 /// - Multi-destination messages: N-1 clones instead of N (last destination gets moved value)
-pub(crate) fn partition_by_destination_owned(
+pub(crate) fn partition_by_destination_owned<'a>(
     messages: Vec<Message>,
-    emitters: &[Arc<dyn Emitter>],
-) -> std::collections::HashMap<&'static str, Vec<Message>> {
+    emitters: &'a [Arc<dyn Emitter>],
+) -> PartitionResult<'a> {
     if emitters.is_empty() || messages.is_empty() {
-        return std::collections::HashMap::new();
+        return PartitionResult {
+            batches: std::collections::HashMap::new(),
+            unroutable: 0,
+        };
     }
 
-    let mut batches: std::collections::HashMap<&'static str, Vec<Message>> =
+    let mut batches: std::collections::HashMap<&'a str, Vec<Message>> =
         std::collections::HashMap::new();
 
     // Pre-allocate for each emitter
@@ -313,7 +333,7 @@ pub(crate) fn partition_by_destination_owned(
 
     // First pass: count destinations for each message
     let mut dest_counts: Vec<usize> = vec![0; messages.len()];
-    let mut destinations: Vec<Vec<&'static str>> =
+    let mut destinations: Vec<Vec<&'a str>> =
         vec![Vec::with_capacity(emitters.len()); messages.len()];
 
     for (idx, msg) in messages.iter().enumerate() {
@@ -330,13 +350,19 @@ pub(crate) fn partition_by_destination_owned(
     // Second pass: distribute messages
     // - Single destination: move (no clone)
     // - Multiple destinations: clone N-1 times, move on final access
+    let mut unroutable = 0u64;
     for (idx, msg) in messages.into_iter().enumerate() {
         let count = dest_counts[idx];
         let dests = &destinations[idx];
 
         match count {
             0 => {
-                // Message has no matching emitters, drop it
+                tracing::debug!(
+                    id = %msg.id,
+                    route_to = ?msg.route_to,
+                    "message matched no emitters, dropping"
+                );
+                unroutable += 1;
             }
             1 => {
                 // Single destination: move without cloning
@@ -363,7 +389,10 @@ pub(crate) fn partition_by_destination_owned(
         }
     }
 
-    batches
+    PartitionResult {
+        batches,
+        unroutable,
+    }
 }
 
 /// Background flush loop - sends buffered messages to emitters
@@ -415,7 +444,16 @@ pub(crate) async fn flush_loop(
         // Partition messages by destination with zero-copy optimization
         // - Single-destination messages: moved, not cloned
         // - Multi-destination messages: N-1 clones (last one moved)
-        let batches = partition_by_destination_owned(messages, &emitters);
+        let PartitionResult {
+            batches,
+            unroutable,
+        } = partition_by_destination_owned(messages, &emitters);
+
+        if unroutable > 0
+            && let Some(m) = Metrics::get()
+        {
+            m.record_dropped("no_matching_emitter", unroutable);
+        }
 
         // Pre-aggregate metrics to reduce Prometheus HashMap lookups.
         // Key: (emitter_name, event_type), Value: count
