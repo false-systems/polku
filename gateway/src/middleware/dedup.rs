@@ -171,7 +171,7 @@ impl Deduplicator {
 
 #[async_trait]
 impl Middleware for Deduplicator {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "deduplicator"
     }
 

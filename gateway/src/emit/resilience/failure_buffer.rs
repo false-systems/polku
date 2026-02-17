@@ -175,7 +175,7 @@ impl FailureCaptureEmitter {
 
 #[async_trait]
 impl Emitter for FailureCaptureEmitter {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "failure_capture"
     }
 
@@ -256,7 +256,7 @@ mod tests {
 
     #[async_trait]
     impl Emitter for AlwaysFailingEmitter {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "always_failing"
         }
         async fn emit(&self, _: &[Message]) -> Result<(), PluginError> {
@@ -272,7 +272,7 @@ mod tests {
 
     #[async_trait]
     impl Emitter for SuccessEmitter {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "success"
         }
         async fn emit(&self, _: &[Message]) -> Result<(), PluginError> {

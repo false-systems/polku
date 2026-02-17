@@ -386,7 +386,7 @@ impl GrpcEmitter {
 
 #[async_trait]
 impl Emitter for GrpcEmitter {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "grpc"
     }
 

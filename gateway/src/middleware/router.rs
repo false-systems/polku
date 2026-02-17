@@ -75,7 +75,7 @@ impl Default for Router {
 
 #[async_trait]
 impl Middleware for Router {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "router"
     }
 

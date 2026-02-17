@@ -165,7 +165,7 @@ impl RetryEmitter {
 
 #[async_trait]
 impl Emitter for RetryEmitter {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "retry"
     }
 
@@ -253,7 +253,7 @@ mod tests {
 
     #[async_trait]
     impl Emitter for FailingEmitter {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "failing"
         }
 

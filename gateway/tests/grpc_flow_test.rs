@@ -57,7 +57,7 @@ impl CollectingEmitter {
 
 #[async_trait]
 impl Emitter for CollectingEmitter {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "collector"
     }
 

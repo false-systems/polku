@@ -21,7 +21,7 @@
 //!
 //! #[async_trait]
 //! impl Middleware for LoggingMiddleware {
-//!     fn name(&self) -> &'static str { "logging" }
+//!     fn name(&self) -> &str { "logging" }
 //!
 //!     async fn process(&self, msg: Message) -> Option<Message> {
 //!         tracing::info!(id = %msg.id, "Processing message");
@@ -52,7 +52,7 @@ use std::fmt::Write;
 #[async_trait]
 pub trait Middleware: Send + Sync {
     /// Middleware name for identification and logging
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
 
     /// Process a message
     ///
@@ -174,7 +174,7 @@ impl MiddlewareChain {
     }
 
     /// Get names of all middleware in chain order
-    pub fn names(&self) -> Vec<&'static str> {
+    pub fn names(&self) -> Vec<&str> {
         self.middlewares.iter().map(|mw| mw.name()).collect()
     }
 
@@ -204,7 +204,7 @@ pub struct PassThrough;
 
 #[async_trait]
 impl Middleware for PassThrough {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "passthrough"
     }
 
@@ -244,7 +244,7 @@ impl<F> Middleware for Filter<F>
 where
     F: Fn(&Message) -> bool + Send + Sync,
 {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "filter"
     }
 
@@ -289,7 +289,7 @@ impl<F> Middleware for Transform<F>
 where
     F: Fn(Message) -> Message + Send + Sync,
 {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "transform"
     }
 

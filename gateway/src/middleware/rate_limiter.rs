@@ -156,7 +156,7 @@ impl RateLimiter {
 
 #[async_trait]
 impl Middleware for RateLimiter {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "rate_limiter"
     }
 

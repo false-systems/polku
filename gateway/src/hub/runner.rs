@@ -292,15 +292,15 @@ fn update_pressure(metrics: &Metrics, emitters: &[Arc<dyn Emitter>]) {
 /// - Single pass to count destinations per message: O(messages × emitters)
 /// - Second pass to distribute: O(messages × avg_destinations)
 /// - Multi-destination messages: N-1 clones instead of N (last destination gets moved value)
-pub(crate) fn partition_by_destination_owned(
+pub(crate) fn partition_by_destination_owned<'a>(
     messages: Vec<Message>,
-    emitters: &[Arc<dyn Emitter>],
-) -> std::collections::HashMap<&'static str, Vec<Message>> {
+    emitters: &'a [Arc<dyn Emitter>],
+) -> std::collections::HashMap<&'a str, Vec<Message>> {
     if emitters.is_empty() || messages.is_empty() {
         return std::collections::HashMap::new();
     }
 
-    let mut batches: std::collections::HashMap<&'static str, Vec<Message>> =
+    let mut batches: std::collections::HashMap<&'a str, Vec<Message>> =
         std::collections::HashMap::new();
 
     // Pre-allocate for each emitter
@@ -313,7 +313,7 @@ pub(crate) fn partition_by_destination_owned(
 
     // First pass: count destinations for each message
     let mut dest_counts: Vec<usize> = vec![0; messages.len()];
-    let mut destinations: Vec<Vec<&'static str>> =
+    let mut destinations: Vec<Vec<&'a str>> =
         vec![Vec::with_capacity(emitters.len()); messages.len()];
 
     for (idx, msg) in messages.iter().enumerate() {

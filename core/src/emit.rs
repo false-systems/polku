@@ -33,7 +33,7 @@ use async_trait::async_trait;
 ///
 /// #[async_trait]
 /// impl Emitter for HttpEmitter {
-///     fn name(&self) -> &'static str {
+///     fn name(&self) -> &str {
 ///         "http"
 ///     }
 ///
@@ -65,7 +65,7 @@ pub trait Emitter: Send + Sync {
     ///
     /// This should be a short, descriptive name that uniquely identifies
     /// the emitter type. Examples: "stdout", "kafka", "ahti", "s3".
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
 
     /// Emit a batch of messages to the destination
     ///

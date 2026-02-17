@@ -43,7 +43,7 @@ impl CaptureEmitter {
 
 #[async_trait::async_trait]
 impl Emitter for CaptureEmitter {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "capture"
     }
 

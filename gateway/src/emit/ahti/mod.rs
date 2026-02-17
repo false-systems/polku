@@ -696,7 +696,7 @@ impl AhtiEmitter {
 
 #[async_trait::async_trait]
 impl Emitter for AhtiEmitter {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "ahti"
     }
 
@@ -766,6 +766,12 @@ impl Emitter for AhtiEmitter {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::inconsistent_digit_grouping
+)]
 mod tests {
     use super::*;
     use polku_core::proto::event::Data as PolkuEventData;

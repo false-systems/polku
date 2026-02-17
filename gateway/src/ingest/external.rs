@@ -37,11 +37,13 @@ pub struct ExternalIngestor {
     source: String,
     /// gRPC address of the plugin
     address: String,
-    /// Leaked static string for sources() return type
-    /// (Required because trait returns &'static [&'static str])
+    /// Name for trait identification
+    name: String,
+    /// Leaked sources slice for `sources()` return type.
+    /// The trait returns `&[&str]` which cannot reference owned Strings
+    /// without self-referential storage. This is a one-time startup cost
+    /// bounded by the number of external plugins (~50 bytes each).
     sources_static: &'static [&'static str],
-    /// Leaked static string for name
-    name_static: &'static str,
     /// Cached gRPC client (lazy initialized)
     client: Mutex<Option<IngestorPluginClient<Channel>>>,
 }
@@ -55,21 +57,20 @@ impl ExternalIngestor {
     pub fn new(source: impl Into<String>, address: impl Into<String>) -> Self {
         let source = source.into();
         let address = address.into();
-
-        // Leak strings to create static references
-        // This is fine because ingestors are long-lived (created once at startup)
-        let source_leaked: &'static str = Box::leak(source.clone().into_boxed_str());
-        let sources_vec: Vec<&'static str> = vec![source_leaked];
-        let sources_static: &'static [&'static str] = Box::leak(sources_vec.into_boxed_slice());
-
         let name = format!("external:{}", source);
-        let name_static: &'static str = Box::leak(name.into_boxed_str());
+
+        // Leak source string for sources() return type.
+        // The trait returns &[&str] which cannot be constructed from owned Strings.
+        // This is a one-time startup cost (~50 bytes per ExternalIngestor).
+        let source_leaked: &'static str = Box::leak(source.clone().into_boxed_str());
+        let sources_static: &'static [&'static str] =
+            Box::leak(vec![source_leaked].into_boxed_slice());
 
         Self {
             source,
             address,
+            name,
             sources_static,
-            name_static,
             client: Mutex::new(None),
         }
     }
@@ -153,11 +154,11 @@ impl ExternalIngestor {
 }
 
 impl Ingestor for ExternalIngestor {
-    fn name(&self) -> &'static str {
-        self.name_static
+    fn name(&self) -> &str {
+        &self.name
     }
 
-    fn sources(&self) -> &'static [&'static str] {
+    fn sources(&self) -> &[&str] {
         self.sources_static
     }
 

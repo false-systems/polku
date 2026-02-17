@@ -32,7 +32,7 @@ impl SlowEmitter {
 
 #[async_trait::async_trait]
 impl Emitter for SlowEmitter {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "slow"
     }
 
@@ -53,7 +53,7 @@ struct NullEmitter(AtomicU64);
 
 #[async_trait::async_trait]
 impl Emitter for NullEmitter {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "null"
     }
 
@@ -190,7 +190,7 @@ fn bench_buffer_overflow(c: &mut Criterion) {
 
                     #[async_trait::async_trait]
                     impl Emitter for BlockingEmitter {
-                        fn name(&self) -> &'static str {
+                        fn name(&self) -> &str {
                             "blocking"
                         }
                         async fn emit(&self, _: &[Message]) -> Result<(), PluginError> {
