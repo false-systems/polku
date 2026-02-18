@@ -91,6 +91,15 @@ pub struct Metrics {
     pub grpc_failover_total: Counter,
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Middleware metrics
+    // ─────────────────────────────────────────────────────────────────────────
+    /// Per-middleware processing duration in seconds
+    pub middleware_duration_seconds: HistogramVec,
+
+    /// Per-middleware message count by outcome (passed/filtered)
+    pub middleware_messages_total: CounterVec,
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Latency & streams
     // ─────────────────────────────────────────────────────────────────────────
     /// Event processing latency (by source)
@@ -272,6 +281,25 @@ impl Metrics {
                 "Total failover events (primary failed, tried another)"
             )
             .map_err(|e| PolkuError::Metrics(format!("grpc_failover_total: {e}")))?,
+
+            // ─────────────────────────────────────────────────────────────────
+            // Middleware metrics
+            // ─────────────────────────────────────────────────────────────────
+            middleware_duration_seconds: register_histogram_vec!(
+                "polku_middleware_duration_seconds",
+                "Per-middleware processing duration",
+                &["middleware"],
+                // Buckets: 1us to 100ms (middleware should be fast)
+                vec![0.000001, 0.00001, 0.0001, 0.001, 0.01, 0.1]
+            )
+            .map_err(|e| PolkuError::Metrics(format!("middleware_duration_seconds: {e}")))?,
+
+            middleware_messages_total: register_counter_vec!(
+                "polku_middleware_messages_total",
+                "Messages processed per middleware by outcome",
+                &["middleware", "action"]
+            )
+            .map_err(|e| PolkuError::Metrics(format!("middleware_messages_total: {e}")))?,
 
             // ─────────────────────────────────────────────────────────────────
             // Latency & streams
@@ -479,6 +507,20 @@ impl Metrics {
         self.emitter_throughput
             .with_label_values(&[emitter])
             .set(events_per_sec);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Middleware helpers
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Record middleware processing duration and outcome
+    pub fn record_middleware(&self, name: &str, duration: std::time::Duration, action: &str) {
+        self.middleware_duration_seconds
+            .with_label_values(&[name])
+            .observe(duration.as_secs_f64());
+        self.middleware_messages_total
+            .with_label_values(&[name, action])
+            .inc();
     }
 
     // ─────────────────────────────────────────────────────────────────────────
