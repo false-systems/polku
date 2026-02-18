@@ -164,10 +164,11 @@ impl HubRunner {
             unroutable,
         } = partition_by_destination_owned(messages, &self.emitters);
 
-        if unroutable > 0
-            && let Some(m) = Metrics::get()
-        {
-            m.record_dropped("no_matching_emitter", unroutable);
+        #[allow(clippy::collapsible_if)]
+        if unroutable > 0 {
+            if let Some(m) = Metrics::get() {
+                m.record_dropped("no_matching_emitter", unroutable);
+            }
         }
 
         // Pre-aggregate metrics to reduce Prometheus HashMap lookups.
@@ -449,10 +450,11 @@ pub(crate) async fn flush_loop(
             unroutable,
         } = partition_by_destination_owned(messages, &emitters);
 
-        if unroutable > 0
-            && let Some(m) = Metrics::get()
-        {
-            m.record_dropped("no_matching_emitter", unroutable);
+        #[allow(clippy::collapsible_if)]
+        if unroutable > 0 {
+            if let Some(m) = Metrics::get() {
+                m.record_dropped("no_matching_emitter", unroutable);
+            }
         }
 
         // Pre-aggregate metrics to reduce Prometheus HashMap lookups.
