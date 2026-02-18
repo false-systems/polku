@@ -83,10 +83,11 @@ impl EndpointState {
     fn record_failure(&self, endpoint: &str) {
         let failures = self.health.record_failure();
 
-        if !self.health.is_healthy()
-            && let Some(m) = Metrics::get()
-        {
-            m.set_grpc_endpoint_health(endpoint, false);
+        #[allow(clippy::collapsible_if)]
+        if !self.health.is_healthy() {
+            if let Some(m) = Metrics::get() {
+                m.set_grpc_endpoint_health(endpoint, false);
+            }
         }
 
         if let Some(m) = Metrics::get() {
