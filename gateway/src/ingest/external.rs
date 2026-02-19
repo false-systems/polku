@@ -33,8 +33,8 @@ use tonic::transport::Channel;
 ///     .build();
 /// ```
 pub struct ExternalIngestor {
-    /// Source identifier this ingestor handles
-    source: String,
+    /// Source identifier (leaked for `sources()` return type — one-time startup cost)
+    source: &'static str,
     /// gRPC address of the plugin
     address: String,
     /// Name for trait identification
@@ -55,16 +55,15 @@ impl ExternalIngestor {
     /// * `source` - Source identifier to handle
     /// * `address` - gRPC address (e.g., "localhost:9001")
     pub fn new(source: impl Into<String>, address: impl Into<String>) -> Self {
-        let source = source.into();
+        let source: String = source.into();
         let address = address.into();
-        let name = format!("external:{}", source);
+        let name = format!("external:{source}");
 
         // Leak source string for sources() return type.
         // The trait returns &[&str] which cannot be constructed from owned Strings.
         // This is a one-time startup cost (~50 bytes per ExternalIngestor).
-        let source_leaked: &'static str = Box::leak(source.clone().into_boxed_str());
-        let sources_static: &'static [&'static str] =
-            Box::leak(vec![source_leaked].into_boxed_slice());
+        let source: &'static str = Box::leak(source.into_boxed_str());
+        let sources_static: &'static [&'static str] = Box::leak(vec![source].into_boxed_slice());
 
         Self {
             source,
@@ -82,7 +81,7 @@ impl ExternalIngestor {
 
     /// Get the source identifier
     pub fn source(&self) -> &str {
-        &self.source
+        self.source
     }
 
     /// Get or create the gRPC client (async)
