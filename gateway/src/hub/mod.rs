@@ -524,10 +524,11 @@ mod tests {
         sender.send(msg).await.expect("should send");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_hub_with_middleware() {
         // Track how many messages pass through
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        COUNTER.store(0, Ordering::Relaxed);
 
         struct CountingMiddleware;
 
@@ -547,24 +548,15 @@ mod tests {
 
         let (_, sender, runner) = hub.build();
 
-        // Send messages in background
-        let sender_handle = tokio::spawn(async move {
-            for i in 0..5 {
-                let msg = Message::new("test", format!("evt-{i}"), Bytes::new());
-                sender.send(msg).await.ok();
-            }
-            // Drop sender to close channel
-        });
+        // Send 5 messages then drop sender to trigger shutdown
+        for i in 0..5 {
+            let msg = Message::new("test", format!("evt-{i}"), Bytes::new());
+            sender.send(msg).await.ok();
+        }
+        drop(sender);
 
-        // Run hub briefly
-        let runner_handle = tokio::spawn(async move {
-            tokio::time::timeout(tokio::time::Duration::from_millis(100), runner.run())
-                .await
-                .ok();
-        });
-
-        sender_handle.await.ok();
-        runner_handle.await.ok();
+        // Run hub to completion (graceful shutdown)
+        runner.run().await.ok();
 
         // All 5 messages should have been processed
         assert_eq!(COUNTER.load(Ordering::Relaxed), 5);
@@ -868,7 +860,7 @@ mod tests {
     // Checkpoint tests
     // ========================================================================
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_checkpoint_updates_on_successful_emit() {
         use crate::checkpoint::MemoryCheckpointStore;
         use std::sync::atomic::AtomicUsize;
@@ -915,8 +907,10 @@ mod tests {
                 .unwrap();
         }
 
-        // Give time for processing
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        // Yield to let the runner process + inline flush
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
 
         // Checkpoint should be updated (seq 0-4, so checkpoint = 4)
         assert_eq!(checkpoint_store.get("counter"), Some(4));
@@ -929,7 +923,9 @@ mod tests {
                 .unwrap();
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
 
         // Checkpoint should be updated (seq 5-9, so checkpoint = 9)
         assert_eq!(checkpoint_store.get("counter"), Some(9));
@@ -939,7 +935,7 @@ mod tests {
         let _ = handle.await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_checkpoint_not_updated_on_emit_failure() {
         use crate::checkpoint::MemoryCheckpointStore;
 
@@ -978,7 +974,9 @@ mod tests {
                 .unwrap();
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
 
         // Checkpoint should NOT be updated due to failure
         assert_eq!(checkpoint_store.get("failing"), None);
@@ -991,39 +989,23 @@ mod tests {
     // Inline flush tests
     // ========================================================================
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_inline_flush_triggers_at_threshold() {
         use std::sync::atomic::AtomicU64;
-        use std::time::Instant;
 
-        // Emitter that records when it receives events
-        struct TimingEmitter {
+        struct CountingEmitter {
             count: AtomicU64,
-            first_emit_time: parking_lot::Mutex<Option<Instant>>,
-        }
-
-        impl TimingEmitter {
-            fn new() -> Self {
-                Self {
-                    count: AtomicU64::new(0),
-                    first_emit_time: parking_lot::Mutex::new(None),
-                }
-            }
         }
 
         #[async_trait::async_trait]
-        impl crate::emit::Emitter for TimingEmitter {
+        impl crate::emit::Emitter for CountingEmitter {
             fn name(&self) -> &'static str {
-                "timing"
+                "counting"
             }
 
             async fn emit(&self, messages: &[Message]) -> Result<(), crate::error::PluginError> {
                 self.count
                     .fetch_add(messages.len() as u64, Ordering::SeqCst);
-                let mut first = self.first_emit_time.lock();
-                if first.is_none() {
-                    *first = Some(Instant::now());
-                }
                 Ok(())
             }
 
@@ -1032,19 +1014,18 @@ mod tests {
             }
         }
 
-        let emitter = Arc::new(TimingEmitter::new());
+        let emitter = Arc::new(CountingEmitter {
+            count: AtomicU64::new(0),
+        });
 
-        // Long flush interval (1 second) - inline flush should beat this
-        // Small batch size (10) - should trigger inline flush quickly
+        // Long flush interval (10 seconds) - inline flush must beat this
         let hub = Hub::new()
             .batch_size(10)
-            .flush_interval_ms(1000) // 1 second - way too slow if we wait for timer
+            .flush_interval_ms(10_000)
             .emitter_arc(emitter.clone());
 
         let (_, sender, runner) = hub.build();
-        let start = Instant::now();
 
-        // Spawn runner
         let runner_handle = tokio::spawn(async move { runner.run().await });
 
         // Send exactly batch_size messages
@@ -1053,31 +1034,21 @@ mod tests {
             sender.send(msg).await.expect("send should work");
         }
 
-        // Wait a bit for inline flush to trigger (should be < 100ms)
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        // Yield WITHOUT advancing time past flush_interval.
+        // If messages are emitted, it proves inline flush (not timer) triggered.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
 
-        // Check if messages were emitted
         let emitted = emitter.count.load(Ordering::SeqCst);
 
-        // Drop sender to shutdown
         drop(sender);
         let _ = runner_handle.await;
 
-        // With inline flush: messages should be emitted within ~100ms
-        // Without inline flush: would take 1000ms (the flush interval)
-        let first_emit = emitter.first_emit_time.lock();
-        let emit_latency = first_emit.map(|t| t.duration_since(start));
-
         assert!(
             emitted >= 10,
-            "Expected at least 10 messages emitted, got {}",
+            "Expected at least 10 messages emitted via inline flush, got {}",
             emitted
-        );
-
-        assert!(
-            emit_latency.map(|d| d.as_millis() < 500).unwrap_or(false),
-            "Expected emit within 500ms, but took {:?} (inline flush not working)",
-            emit_latency
         );
     }
 
@@ -1108,7 +1079,7 @@ mod tests {
         assert_eq!(runner.buffer.capacity(), 5000);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_tiered_buffer_handles_overflow() {
         use std::sync::atomic::AtomicU64;
 
@@ -1160,8 +1131,11 @@ mod tests {
             sender.send(msg).await.expect("send should work");
         }
 
-        // Wait for flush
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        // Advance past flush interval and yield for processing
+        tokio::time::advance(tokio::time::Duration::from_millis(5)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
 
         // Shutdown
         drop(sender);
@@ -1212,7 +1186,7 @@ mod tests {
         assert!(!raw_sender.has_ingestor("unknown"));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_raw_sender_json_ingestion() {
         use crate::ingest::JsonIngestor;
         use std::sync::atomic::AtomicU64;
@@ -1273,8 +1247,11 @@ mod tests {
 
         assert_eq!(count, 2, "Should ingest 2 events from JSON array");
 
-        // Wait for flush
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        // Advance past flush interval and yield for processing
+        tokio::time::advance(tokio::time::Duration::from_millis(5)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
 
         // Shutdown
         drop(raw_sender);
