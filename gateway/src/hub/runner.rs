@@ -673,7 +673,11 @@ mod tests {
 
         // Advance past the flush interval to let the loop iterate
         tokio::time::advance(tokio::time::Duration::from_millis(5100)).await;
-        tokio::task::yield_now().await;
+
+        // Multiple yields to let 3 batches (25 msgs / batch_size 10) drain
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
 
         handle.await.unwrap();
 
@@ -752,8 +756,12 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
         ));
 
-        tokio::time::advance(tokio::time::Duration::from_millis(60)).await;
+        // Let flush_loop reach select! before advancing time
         tokio::task::yield_now().await;
+        tokio::time::advance(tokio::time::Duration::from_millis(60)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
 
         // Checkpoint should NOT advance on failure
         assert_eq!(store.get("fail"), None);
@@ -896,9 +904,16 @@ mod tests {
 
         drop(tx);
 
+        // Let runner observe channel closure before advancing time
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
         // Advance time so the flush loop drains what's left
         tokio::time::advance(tokio::time::Duration::from_millis(5100)).await;
-        tokio::task::yield_now().await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
 
         handle.await.unwrap().unwrap();
 
@@ -930,7 +945,15 @@ mod tests {
         }
 
         drop(tx);
+
+        // Let runner observe channel closure
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
         tokio::time::advance(tokio::time::Duration::from_millis(60)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
 
         let result = handle.await.unwrap();
         assert!(
@@ -957,9 +980,14 @@ mod tests {
 
         tokio::task::yield_now().await;
         tokio::time::advance(tokio::time::Duration::from_millis(60)).await;
-        tokio::task::yield_now().await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
 
         drop(tx);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
         handle.await.unwrap().unwrap();
 
         assert_eq!(emitter_a.count(), 4, "Emitter A should get all 4 messages");
