@@ -488,7 +488,7 @@ mod tests {
     use crate::emit::StdoutEmitter;
     use crate::middleware::{Filter, Transform};
     use bytes::Bytes;
-    use runner::partition_by_destination_owned;
+    use runner::{PartitionResult, partition_by_destination_owned};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
@@ -716,7 +716,7 @@ mod tests {
             .map(|i| Message::with_id(format!("msg-{i}"), 0, "test", "test", Bytes::new()))
             .collect();
 
-        let batches = partition_by_destination_owned(messages, &emitters);
+        let PartitionResult { batches, .. } = partition_by_destination_owned(messages, &emitters);
 
         // Each emitter should get all 5 messages
         assert_eq!(batches.get("kafka").map(|v| v.len()), Some(5));
@@ -748,7 +748,7 @@ mod tests {
             // msg-3 has empty route_to = broadcast
         ];
 
-        let batches = partition_by_destination_owned(messages, &emitters);
+        let PartitionResult { batches, .. } = partition_by_destination_owned(messages, &emitters);
 
         // kafka: msg-0, msg-2, msg-3
         let kafka_batch = batches.get("kafka").unwrap();
@@ -781,10 +781,15 @@ mod tests {
                 .with_routes(vec!["nonexistent".to_string()]),
         ];
 
-        let batches = partition_by_destination_owned(messages, &emitters);
+        let PartitionResult {
+            batches,
+            unroutable,
+        } = partition_by_destination_owned(messages, &emitters);
 
         // kafka should get nothing (route_to doesn't match)
         assert_eq!(batches.get("kafka").map(|v| v.len()), Some(0));
+        // The message was unroutable
+        assert_eq!(unroutable, 1);
     }
 
     #[test]
@@ -814,7 +819,7 @@ mod tests {
             })
             .collect();
 
-        let batches = partition_by_destination_owned(messages, &emitters);
+        let PartitionResult { batches, .. } = partition_by_destination_owned(messages, &emitters);
 
         // kafka: msg-0, msg-2
         assert_eq!(batches.get("kafka").map(|v| v.len()), Some(2));
@@ -845,7 +850,7 @@ mod tests {
             Bytes::from(vec![42u8; 100]),
         )];
 
-        let batches = partition_by_destination_owned(messages, &emitters);
+        let PartitionResult { batches, .. } = partition_by_destination_owned(messages, &emitters);
 
         // Each emitter should have the message
         for name in ["kafka", "stdout", "webhook"] {

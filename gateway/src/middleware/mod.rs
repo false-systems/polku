@@ -319,6 +319,7 @@ where
 mod router;
 pub use router::Router;
 mod rate_limiter;
+mod token_bucket;
 pub use rate_limiter::RateLimiter;
 mod dedup;
 pub use dedup::Deduplicator;

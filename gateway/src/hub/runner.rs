@@ -189,7 +189,17 @@ async fn emit_to_destinations(
 
     let batch_start_seq = sequence.fetch_add(total_events as u64, Ordering::SeqCst);
 
-    let batches = partition_by_destination_owned(messages, emitters);
+    let PartitionResult {
+        batches,
+        unroutable,
+    } = partition_by_destination_owned(messages, emitters);
+
+    #[allow(clippy::collapsible_if)]
+    if unroutable > 0 {
+        if let Some(m) = Metrics::get() {
+            m.record_dropped("no_matching_emitter", unroutable);
+        }
+    }
 
     let mut forward_counts: std::collections::HashMap<(&str, &str), u64> =
         std::collections::HashMap::new();
@@ -282,6 +292,14 @@ fn update_pressure(metrics: &Metrics, emitters: &[Arc<dyn Emitter>]) {
     metrics.update_pipeline_pressure(buffer_fill, emit_failure_rate, 0.0);
 }
 
+/// Result of partitioning messages by destination
+pub(crate) struct PartitionResult<'a> {
+    /// Messages grouped by emitter name
+    pub batches: std::collections::HashMap<&'a str, Vec<Message>>,
+    /// Number of messages that matched no emitter (dropped)
+    pub unroutable: u64,
+}
+
 /// Partition messages by destination, returning ready-to-emit batches
 ///
 /// For messages that go to only ONE emitter, moves the message (no clone).
@@ -292,15 +310,18 @@ fn update_pressure(metrics: &Metrics, emitters: &[Arc<dyn Emitter>]) {
 /// - Single pass to count destinations per message: O(messages × emitters)
 /// - Second pass to distribute: O(messages × avg_destinations)
 /// - Multi-destination messages: N-1 clones instead of N (last destination gets moved value)
-pub(crate) fn partition_by_destination_owned(
+pub(crate) fn partition_by_destination_owned<'a>(
     messages: Vec<Message>,
-    emitters: &[Arc<dyn Emitter>],
-) -> std::collections::HashMap<&'static str, Vec<Message>> {
+    emitters: &'a [Arc<dyn Emitter>],
+) -> PartitionResult<'a> {
     if emitters.is_empty() || messages.is_empty() {
-        return std::collections::HashMap::new();
+        return PartitionResult {
+            batches: std::collections::HashMap::new(),
+            unroutable: 0,
+        };
     }
 
-    let mut batches: std::collections::HashMap<&'static str, Vec<Message>> =
+    let mut batches: std::collections::HashMap<&'a str, Vec<Message>> =
         std::collections::HashMap::new();
 
     // Pre-allocate for each emitter
@@ -313,7 +334,7 @@ pub(crate) fn partition_by_destination_owned(
 
     // First pass: count destinations for each message
     let mut dest_counts: Vec<usize> = vec![0; messages.len()];
-    let mut destinations: Vec<Vec<&'static str>> =
+    let mut destinations: Vec<Vec<&'a str>> =
         vec![Vec::with_capacity(emitters.len()); messages.len()];
 
     for (idx, msg) in messages.iter().enumerate() {
@@ -330,13 +351,19 @@ pub(crate) fn partition_by_destination_owned(
     // Second pass: distribute messages
     // - Single destination: move (no clone)
     // - Multiple destinations: clone N-1 times, move on final access
+    let mut unroutable = 0u64;
     for (idx, msg) in messages.into_iter().enumerate() {
         let count = dest_counts[idx];
         let dests = &destinations[idx];
 
         match count {
             0 => {
-                // Message has no matching emitters, drop it
+                tracing::debug!(
+                    id = %msg.id,
+                    route_to = ?msg.route_to,
+                    "message matched no emitters, dropping"
+                );
+                unroutable += 1;
             }
             1 => {
                 // Single destination: move without cloning
@@ -363,7 +390,10 @@ pub(crate) fn partition_by_destination_owned(
         }
     }
 
-    batches
+    PartitionResult {
+        batches,
+        unroutable,
+    }
 }
 
 /// Background flush loop - sends buffered messages to emitters
@@ -1031,13 +1061,14 @@ mod tests {
     #[test]
     fn partition_empty_messages_returns_empty() {
         let emitters: Vec<Arc<dyn Emitter>> = vec![Arc::new(TestEmitter::new("e"))];
-        let batches = partition_by_destination_owned(vec![], &emitters);
+        let PartitionResult { batches, .. } = partition_by_destination_owned(vec![], &emitters);
         assert!(batches.is_empty(), "Empty messages → empty result");
     }
 
     #[test]
     fn partition_empty_emitters_returns_empty() {
-        let batches = partition_by_destination_owned(vec![make_msg("t")], &[]);
+        let PartitionResult { batches, .. } =
+            partition_by_destination_owned(vec![make_msg("t")], &[]);
         assert!(batches.is_empty(), "No emitters → empty result");
     }
 }
