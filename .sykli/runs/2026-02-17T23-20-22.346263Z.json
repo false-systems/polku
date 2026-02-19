@@ -1,0 +1,60 @@
+{
+  "id": "66b08714d224a1e0",
+  "timestamp": "2026-02-17T23:20:22.346263Z",
+  "tasks": [
+    {
+      "error": "%Sykli.Error{code: \"task_failed\", type: :execution, message: \"task 'fmt' failed\", task: \"fmt\", step: :run, command: \"[rust:1.85] rustup component add rustfmt && cargo fmt --all --check\", output: \"Unable to find image 'rust:1.85' locally\\n1.85: Pulling from library/rust\\n68726bb4bd59: Pulling fs layer\\n4378a6c11dea: Pulling fs layer\\n1d9d474cce08: Pulling fs layer\\n140d15be2fea: Pulling fs layer\\n545aa82ec479: Pulling fs layer\\n4378a6c11dea: Download complete\\n545aa82ec479: Download complete\\n140d15be2fea: Download complete\\n545aa82ec479: Pull complete\\n4378a6c11dea: Pull complete\\n140d15be2fea: Pull complete\\n1d9d474cce08: Download complete\\n68726bb4bd59: Download complete\\n1d9d474cce08: Pull complete\\n68726bb4bd59: Pull complete\\nDigest: sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4\\nStatus: Downloaded newer image for rust:1.85\\ninfo: downloading component 'rustfmt'\\ninfo: installing component 'rustfmt'\\nDiff in /src/gateway/src/emit/ahti/mod.rs:102:\\n     pub async fn with_endpoints(endpoints: Vec<String>) -> Result<Self, PluginError> {\\n         let channels = endpoint::build_channels(&endpoints, false, \\\"AHTI\\\").await?;\\n         let states: Vec<_> = (0..channels.len()).map(|_| EndpointState::new()).collect();\\n-        let clients = channels\\n-            .into_iter()\\n-            .map(AhtiServiceClient::new)\\n-            .collect();\\n+        let clients = channels.into_iter().map(AhtiServiceClient::new).collect();\\n \\n         Ok(Self {\\n             clients,\\nDiff in /src/gateway/src/emit/ahti/mod.rs:118:\\n     pub async fn with_endpoints_lazy(endpoints: Vec<String>) -> Result<Self, PluginError> {\\n         let channels = endpoint::build_channels(&endpoints, true, \\\"AHTI\\\").await?;\\n         let states: Vec<_> = (0..channels.len()).map(|_| EndpointState::new()).collect();\\n-        let clients = channels\\n-            .into_iter()\\n-            .map(AhtiServiceClient::new)\\n-            .collect();\\n+        let clients = channels.into_iter().map(AhtiServiceClient::new).collect();\\n \\n         Ok(Self {\\n             clients,\\nDiff in /src/gateway/src/emit/endpoint.rs:104:\\n     label: &str,\\n ) -> Result<Vec<Channel>, PluginError> {\\n     if endpoints.is_empty() {\\n-        return Err(PluginError::Init(format!(\\\"No {} endpoints provided\\\", label)));\\n+        return Err(PluginError::Init(format!(\\n+            \\\"No {} endpoints provided\\\",\\n+            label\\n+        )));\\n     }\\n \\n     let mut channels = Vec::with_capacity(endpoints.len());\\n\", exit_code: 1, duration_ms: 96247, cause: nil, hints: [\"docker image not found - run: docker pull <image>\"], notes: [\"task ran for 1.6m before failing\"]}",
+      "name": "fmt",
+      "status": "failed",
+      "cached": false,
+      "duration_ms": 96566,
+      "streak": 0,
+      "inputs": [
+        "**/*.rs",
+        "Cargo.toml"
+      ]
+    },
+    {
+      "error": ":dependency_failed",
+      "name": "clippy",
+      "status": "skipped",
+      "cached": false,
+      "duration_ms": 0,
+      "streak": 0,
+      "inputs": [
+        "**/*.rs",
+        "Cargo.toml",
+        "Cargo.lock"
+      ]
+    },
+    {
+      "error": ":dependency_failed",
+      "name": "test",
+      "status": "skipped",
+      "cached": false,
+      "duration_ms": 0,
+      "streak": 0,
+      "inputs": [
+        "**/*.rs",
+        "**/*.toml",
+        "Cargo.lock"
+      ]
+    },
+    {
+      "error": ":dependency_failed",
+      "name": "build",
+      "status": "skipped",
+      "cached": false,
+      "duration_ms": 0,
+      "streak": 0,
+      "inputs": [
+        "**/*.rs",
+        "**/*.toml",
+        "Cargo.lock"
+      ]
+    }
+  ],
+  "overall": "failed",
+  "git_ref": "96c55f5",
+  "git_branch": "refactor/shared-endpoint-health"
+}

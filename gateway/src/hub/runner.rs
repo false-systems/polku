@@ -138,10 +138,8 @@ impl HubRunner {
     ///
     /// Called inline when buffer hits threshold, and by the timer loop.
     async fn flush_batch(&self) {
-        let flush_start = std::time::Instant::now();
         let messages = self.buffer.drain(self.batch_size);
 
-        // Update buffer size metric after drain
         if let Some(metrics) = Metrics::get() {
             metrics.set_buffer_size(self.buffer.len());
         }
@@ -150,103 +148,13 @@ impl HubRunner {
             return;
         }
 
-        let total_events = messages.len();
-
-        // Assign sequence numbers to this batch for checkpoint tracking.
-        // Each message gets a unique sequence number for precise tracking.
-        let batch_start_seq = self
-            .sequence
-            .fetch_add(messages.len() as u64, Ordering::SeqCst);
-
-        // Partition messages by destination with zero-copy optimization
-        let PartitionResult {
-            batches,
-            unroutable,
-        } = partition_by_destination_owned(messages, &self.emitters);
-
-        #[allow(clippy::collapsible_if)]
-        if unroutable > 0 {
-            if let Some(m) = Metrics::get() {
-                m.record_dropped("no_matching_emitter", unroutable);
-            }
-        }
-
-        // Pre-aggregate metrics to reduce Prometheus HashMap lookups.
-        // Key: (emitter_name, event_type), Value: count
-        // This reduces O(events) lookups to O(unique label combos).
-        let mut forward_counts: std::collections::HashMap<(&str, &str), u64> =
-            std::collections::HashMap::new();
-
-        // Send pre-partitioned batches to each emitter.
-        // Each emitter's checkpoint advances by the number of events IT processed,
-        // not the total batch size (which may differ due to routing).
-        for emitter in &self.emitters {
-            let routed_events = match batches.get(emitter.name()) {
-                Some(events) if !events.is_empty() => events,
-                _ => continue,
-            };
-
-            let emitter_start = std::time::Instant::now();
-            let emit_result = emitter.emit(routed_events).await;
-            let emitter_duration = emitter_start.elapsed();
-
-            // Record per-emitter metrics
-            if let Some(metrics) = Metrics::get() {
-                metrics.record_emitter_flush(
-                    emitter.name(),
-                    routed_events.len(),
-                    emitter_duration,
-                    emit_result.is_ok(),
-                );
-            }
-
-            if let Err(e) = emit_result {
-                error!(
-                    emitter = emitter.name(),
-                    error = %e,
-                    count = routed_events.len(),
-                    "Failed to emit"
-                );
-                if let Some(metrics) = Metrics::get() {
-                    metrics.record_dropped(emitter.name(), routed_events.len() as u64);
-                }
-                // Note: checkpoint NOT updated on failure - emitter is behind
-            } else {
-                debug!(
-                    emitter = emitter.name(),
-                    count = routed_events.len(),
-                    "Emitted (inline)"
-                );
-                // Aggregate counts locally instead of per-event Prometheus updates
-                for msg in routed_events {
-                    *forward_counts
-                        .entry((emitter.name(), &msg.message_type))
-                        .or_default() += 1;
-                }
-                // Update checkpoint: advance by number of messages this emitter processed.
-                // Uses batch_start_seq + emitter's message count - 1 as the checkpoint.
-                // This ensures each emitter tracks its own progress independently.
-                if let Some(ref store) = self.checkpoint_store {
-                    let emitter_end_seq = batch_start_seq + routed_events.len() as u64 - 1;
-                    store.set(emitter.name(), emitter_end_seq);
-                }
-            }
-        }
-
-        // Batch update to Prometheus - single HashMap lookup per unique label combo
-        if let Some(metrics) = Metrics::get() {
-            metrics.record_forwarded_batch(&forward_counts);
-            metrics.inc_flush();
-
-            // Calculate and record throughput
-            let flush_duration = flush_start.elapsed();
-            if flush_duration.as_secs_f64() > 0.0 {
-                let events_per_sec = total_events as f64 / flush_duration.as_secs_f64();
-                metrics.set_events_per_second(events_per_sec);
-            }
-
-            update_pressure(metrics, &self.emitters);
-        }
+        emit_to_destinations(
+            messages,
+            &self.emitters,
+            &self.sequence,
+            &self.checkpoint_store,
+        )
+        .await;
     }
 
     /// Get a reference to the buffer for monitoring
@@ -262,6 +170,98 @@ impl HubRunner {
     /// Get a shareable reference to the manifest
     pub fn manifest_arc(&self) -> Arc<PipelineManifest> {
         Arc::clone(&self.manifest)
+    }
+}
+
+/// Emit a batch of messages to their destination emitters
+///
+/// Partitions messages by destination, dispatches to each emitter,
+/// records metrics (per-emitter timing, forwarded counts, throughput),
+/// and updates checkpoints.
+async fn emit_to_destinations(
+    messages: Vec<Message>,
+    emitters: &[Arc<dyn Emitter>],
+    sequence: &AtomicU64,
+    checkpoint_store: &Option<Arc<dyn CheckpointStore>>,
+) {
+    let flush_start = std::time::Instant::now();
+    let total_events = messages.len();
+
+    let batch_start_seq = sequence.fetch_add(total_events as u64, Ordering::SeqCst);
+
+    let PartitionResult {
+        batches,
+        unroutable,
+    } = partition_by_destination_owned(messages, emitters);
+
+    #[allow(clippy::collapsible_if)]
+    if unroutable > 0 {
+        if let Some(m) = Metrics::get() {
+            m.record_dropped("no_matching_emitter", unroutable);
+        }
+    }
+
+    let mut forward_counts: std::collections::HashMap<(&str, &str), u64> =
+        std::collections::HashMap::new();
+
+    for emitter in emitters {
+        let routed_events = match batches.get(emitter.name()) {
+            Some(events) if !events.is_empty() => events,
+            _ => continue,
+        };
+
+        let emitter_start = std::time::Instant::now();
+        let emit_result = emitter.emit(routed_events).await;
+        let emitter_duration = emitter_start.elapsed();
+
+        if let Some(metrics) = Metrics::get() {
+            metrics.record_emitter_flush(
+                emitter.name(),
+                routed_events.len(),
+                emitter_duration,
+                emit_result.is_ok(),
+            );
+        }
+
+        if let Err(e) = emit_result {
+            error!(
+                emitter = emitter.name(),
+                error = %e,
+                count = routed_events.len(),
+                "Failed to emit"
+            );
+            if let Some(metrics) = Metrics::get() {
+                metrics.record_dropped(emitter.name(), routed_events.len() as u64);
+            }
+        } else {
+            debug!(
+                emitter = emitter.name(),
+                count = routed_events.len(),
+                "Emitted"
+            );
+            for msg in routed_events {
+                *forward_counts
+                    .entry((emitter.name(), &msg.message_type))
+                    .or_default() += 1;
+            }
+            if let Some(store) = checkpoint_store {
+                let emitter_end_seq = batch_start_seq + routed_events.len() as u64 - 1;
+                store.set(emitter.name(), emitter_end_seq);
+            }
+        }
+    }
+
+    if let Some(metrics) = Metrics::get() {
+        metrics.record_forwarded_batch(&forward_counts);
+        metrics.inc_flush();
+
+        let flush_duration = flush_start.elapsed();
+        if flush_duration.as_secs_f64() > 0.0 {
+            let events_per_sec = total_events as f64 / flush_duration.as_secs_f64();
+            metrics.set_events_per_second(events_per_sec);
+        }
+
+        update_pressure(metrics, emitters);
     }
 }
 
@@ -424,10 +424,8 @@ pub(crate) async fn flush_loop(
             }
         }
 
-        let flush_start = std::time::Instant::now();
         let messages = buffer.drain(batch_size);
 
-        // Update buffer size metric after drain
         if let Some(metrics) = Metrics::get() {
             metrics.set_buffer_size(buffer.len());
         }
@@ -436,103 +434,641 @@ pub(crate) async fn flush_loop(
             continue;
         }
 
-        let total_events = messages.len();
+        emit_to_destinations(messages, &emitters, &sequence, &checkpoint_store).await;
+    }
+}
 
-        // Assign sequence numbers to this batch for checkpoint tracking.
-        // Each message gets a unique sequence number for precise tracking.
-        let batch_start_seq = sequence.fetch_add(messages.len() as u64, Ordering::SeqCst);
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::buffer_lockfree::LockFreeBuffer;
+    use crate::checkpoint::MemoryCheckpointStore;
+    use crate::manifest::{BufferDesc, PipelineManifest, TuningDesc};
+    use bytes::Bytes;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-        // Partition messages by destination with zero-copy optimization
-        // - Single-destination messages: moved, not cloned
-        // - Multi-destination messages: N-1 clones (last one moved)
-        let PartitionResult {
-            batches,
-            unroutable,
-        } = partition_by_destination_owned(messages, &emitters);
+    // ========================================================================
+    // Test helpers
+    // ========================================================================
 
-        #[allow(clippy::collapsible_if)]
-        if unroutable > 0 {
-            if let Some(m) = Metrics::get() {
-                m.record_dropped("no_matching_emitter", unroutable);
+    /// Simple emitter that counts messages and optionally fails
+    struct TestEmitter {
+        name: &'static str,
+        count: AtomicU64,
+        should_fail: AtomicBool,
+    }
+
+    impl TestEmitter {
+        fn new(name: &'static str) -> Self {
+            Self {
+                name,
+                count: AtomicU64::new(0),
+                should_fail: AtomicBool::new(false),
             }
         }
 
-        // Pre-aggregate metrics to reduce Prometheus HashMap lookups.
-        // Key: (emitter_name, event_type), Value: count
-        // This reduces O(events) lookups to O(unique label combos).
-        let mut forward_counts: std::collections::HashMap<(&str, &str), u64> =
-            std::collections::HashMap::new();
+        fn count(&self) -> u64 {
+            self.count.load(Ordering::SeqCst)
+        }
+    }
 
-        // Send pre-partitioned batches to each emitter.
-        // Each emitter's checkpoint advances by the number of events IT processed,
-        // not the total batch size (which may differ due to routing).
-        for emitter in &emitters {
-            let routed_events = match batches.get(emitter.name()) {
-                Some(events) if !events.is_empty() => events,
-                _ => continue,
-            };
-
-            let emitter_start = std::time::Instant::now();
-            let emit_result = emitter.emit(routed_events).await;
-            let emitter_duration = emitter_start.elapsed();
-
-            // Record per-emitter metrics
-            if let Some(metrics) = Metrics::get() {
-                metrics.record_emitter_flush(
-                    emitter.name(),
-                    routed_events.len(),
-                    emitter_duration,
-                    emit_result.is_ok(),
-                );
+    #[async_trait::async_trait]
+    impl Emitter for TestEmitter {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        async fn emit(&self, messages: &[Message]) -> Result<(), PluginError> {
+            if self.should_fail.load(Ordering::SeqCst) {
+                return Err(PluginError::Send("intentional failure".into()));
             }
+            self.count
+                .fetch_add(messages.len() as u64, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn health(&self) -> bool {
+            !self.should_fail.load(Ordering::SeqCst)
+        }
+    }
 
-            if let Err(e) = emit_result {
-                error!(
-                    emitter = emitter.name(),
-                    error = %e,
-                    count = routed_events.len(),
-                    "Failed to emit"
-                );
-                // Record emit failures
-                if let Some(metrics) = Metrics::get() {
-                    metrics.record_dropped(emitter.name(), routed_events.len() as u64);
-                }
-                // Note: checkpoint NOT updated on failure - emitter is behind
-            } else {
-                debug!(
-                    emitter = emitter.name(),
-                    count = routed_events.len(),
-                    "Emitted"
-                );
-                // Aggregate counts locally instead of per-event Prometheus updates
-                for msg in routed_events {
-                    *forward_counts
-                        .entry((emitter.name(), &msg.message_type))
-                        .or_default() += 1;
-                }
-                // Update checkpoint: advance by number of messages this emitter processed.
-                // Uses batch_start_seq + emitter's message count - 1 as the checkpoint.
-                // This ensures each emitter tracks its own progress independently.
-                if let Some(ref store) = checkpoint_store {
-                    let emitter_end_seq = batch_start_seq + routed_events.len() as u64 - 1;
-                    store.set(emitter.name(), emitter_end_seq);
-                }
-            }
+    fn make_msg(msg_type: &str) -> Message {
+        Message::new("test-src", msg_type, Bytes::from("payload"))
+    }
+
+    fn make_manifest() -> Arc<PipelineManifest> {
+        Arc::new(PipelineManifest {
+            version: "1".to_string(),
+            middleware: vec![],
+            emitters: vec![],
+            buffer: BufferDesc {
+                strategy: "standard".to_string(),
+                capacity: 1000,
+            },
+            tuning: TuningDesc {
+                batch_size: 10,
+                flush_interval_ms: 100,
+                channel_capacity: 64,
+            },
+        })
+    }
+
+    fn make_runner(
+        rx: mpsc::Receiver<Message>,
+        buffer: Arc<dyn HubBuffer>,
+        emitters: Vec<Arc<dyn Emitter>>,
+        batch_size: usize,
+        flush_interval_ms: u64,
+    ) -> HubRunner {
+        HubRunner {
+            rx,
+            buffer,
+            batch_size,
+            flush_interval_ms,
+            middleware: MiddlewareChain::new(),
+            emitters,
+            checkpoint_store: None,
+            sequence: Arc::new(AtomicU64::new(0)),
+            manifest: make_manifest(),
+        }
+    }
+
+    // ========================================================================
+    // flush_loop tests (DST: time is paused, no real sleeps)
+    // ========================================================================
+
+    #[tokio::test(start_paused = true)]
+    async fn flush_loop_drains_on_timer() {
+        let buffer: Arc<dyn HubBuffer> = Arc::new(LockFreeBuffer::new(100));
+        let emitter = Arc::new(TestEmitter::new("test"));
+
+        // Pre-fill buffer with 3 messages (below batch_size)
+        for i in 0..3 {
+            buffer.push(make_msg(&format!("evt-{i}")));
+        }
+        assert_eq!(buffer.len(), 3);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let buf_clone = Arc::clone(&buffer);
+        let emitters = vec![emitter.clone() as Arc<dyn Emitter>];
+
+        let handle = tokio::spawn(flush_loop(
+            buf_clone,
+            emitters,
+            shutdown_rx,
+            10, // batch_size
+            50, // flush_interval_ms
+            None,
+            Arc::new(AtomicU64::new(0)),
+        ));
+
+        // Yield first so the spawned task reaches the select! with sleep
+        tokio::task::yield_now().await;
+
+        // Now advance time past the flush interval
+        tokio::time::advance(tokio::time::Duration::from_millis(60)).await;
+
+        // Yield multiple times to let flush processing complete
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
         }
 
-        // Batch update to Prometheus - single HashMap lookup per unique label combo
-        if let Some(metrics) = Metrics::get() {
-            metrics.record_forwarded_batch(&forward_counts);
-            metrics.inc_flush();
+        assert_eq!(
+            emitter.count(),
+            3,
+            "Timer should have flushed all 3 messages"
+        );
+        assert_eq!(buffer.len(), 0);
 
-            // Calculate and record throughput
-            let flush_duration = flush_start.elapsed();
-            if flush_duration.as_secs_f64() > 0.0 {
-                let events_per_sec = total_events as f64 / flush_duration.as_secs_f64();
-                metrics.set_events_per_second(events_per_sec);
-            }
+        // Shutdown
+        let _ = shutdown_tx.send(true);
+        handle.await.unwrap();
+    }
 
-            update_pressure(metrics, &emitters);
+    #[tokio::test(start_paused = true)]
+    async fn flush_loop_drains_all_on_shutdown() {
+        let buffer: Arc<dyn HubBuffer> = Arc::new(LockFreeBuffer::new(100));
+        let emitter = Arc::new(TestEmitter::new("drain"));
+
+        // Fill buffer with 25 messages, batch_size=10
+        // Shutdown should drain all of them (multiple batches)
+        for i in 0..25 {
+            buffer.push(make_msg(&format!("evt-{i}")));
         }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let buf_clone = Arc::clone(&buffer);
+        let emitters = vec![emitter.clone() as Arc<dyn Emitter>];
+
+        let handle = tokio::spawn(flush_loop(
+            buf_clone,
+            emitters,
+            shutdown_rx,
+            10,   // batch_size
+            5000, // long interval - we don't want timer flushes
+            None,
+            Arc::new(AtomicU64::new(0)),
+        ));
+
+        // Signal shutdown immediately
+        let _ = shutdown_tx.send(true);
+
+        // Advance past the flush interval to let the loop iterate
+        tokio::time::advance(tokio::time::Duration::from_millis(5100)).await;
+
+        // Multiple yields to let 3 batches (25 msgs / batch_size 10) drain
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        handle.await.unwrap();
+
+        assert_eq!(
+            emitter.count(),
+            25,
+            "Shutdown should drain all buffered messages"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn flush_loop_checkpoint_advances() {
+        let buffer: Arc<dyn HubBuffer> = Arc::new(LockFreeBuffer::new(100));
+        let emitter = Arc::new(TestEmitter::new("ckpt"));
+        let store = Arc::new(MemoryCheckpointStore::new());
+
+        for i in 0..5 {
+            buffer.push(make_msg(&format!("evt-{i}")));
+        }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let buf_clone = Arc::clone(&buffer);
+        let emitters = vec![emitter.clone() as Arc<dyn Emitter>];
+        let seq = Arc::new(AtomicU64::new(0));
+
+        let handle = tokio::spawn(flush_loop(
+            buf_clone,
+            emitters,
+            shutdown_rx,
+            10,
+            50,
+            Some(store.clone()),
+            seq,
+        ));
+
+        // Yield so the task reaches the select! with sleep
+        tokio::task::yield_now().await;
+
+        // Advance past flush interval
+        tokio::time::advance(tokio::time::Duration::from_millis(60)).await;
+
+        // Yield enough for flush processing to complete
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Checkpoint should be seq 0..4 → checkpoint = 4
+        assert_eq!(store.get("ckpt"), Some(4));
+
+        let _ = shutdown_tx.send(true);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn flush_loop_no_checkpoint_on_failure() {
+        let buffer: Arc<dyn HubBuffer> = Arc::new(LockFreeBuffer::new(100));
+        let emitter = Arc::new(TestEmitter::new("fail"));
+        emitter.should_fail.store(true, Ordering::SeqCst);
+        let store = Arc::new(MemoryCheckpointStore::new());
+
+        for i in 0..5 {
+            buffer.push(make_msg(&format!("evt-{i}")));
+        }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let buf_clone = Arc::clone(&buffer);
+        let emitters = vec![emitter.clone() as Arc<dyn Emitter>];
+
+        let handle = tokio::spawn(flush_loop(
+            buf_clone,
+            emitters,
+            shutdown_rx,
+            10,
+            50,
+            Some(store.clone()),
+            Arc::new(AtomicU64::new(0)),
+        ));
+
+        // Let flush_loop reach select! before advancing time
+        tokio::task::yield_now().await;
+        tokio::time::advance(tokio::time::Duration::from_millis(60)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Checkpoint should NOT advance on failure
+        assert_eq!(store.get("fail"), None);
+
+        let _ = shutdown_tx.send(true);
+        handle.await.unwrap();
+    }
+
+    // ========================================================================
+    // HubRunner::run tests (DST)
+    // ========================================================================
+
+    #[tokio::test(start_paused = true)]
+    async fn run_processes_messages_end_to_end() {
+        let (tx, rx) = mpsc::channel(64);
+        let buffer: Arc<dyn HubBuffer> = Arc::new(LockFreeBuffer::new(100));
+        let emitter = Arc::new(TestEmitter::new("e2e"));
+        let emitters = vec![emitter.clone() as Arc<dyn Emitter>];
+
+        let runner = make_runner(rx, buffer, emitters, 5, 50);
+
+        let handle = tokio::spawn(runner.run());
+
+        // Send 5 messages (= batch_size, triggers inline flush)
+        for i in 0..5 {
+            tx.send(make_msg(&format!("evt-{i}"))).await.unwrap();
+        }
+
+        // Yield to let the runner process + inline flush
+        tokio::task::yield_now().await;
+        tokio::time::advance(tokio::time::Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            emitter.count(),
+            5,
+            "Inline flush should emit batch_size messages"
+        );
+
+        // Drop sender to trigger graceful shutdown
+        drop(tx);
+        let result = handle.await.unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_partial_batch_flushed_by_timer() {
+        let (tx, rx) = mpsc::channel(64);
+        let buffer: Arc<dyn HubBuffer> = Arc::new(LockFreeBuffer::new(100));
+        let emitter = Arc::new(TestEmitter::new("timer"));
+        let emitters = vec![emitter.clone() as Arc<dyn Emitter>];
+
+        let runner = make_runner(rx, buffer, emitters, 100, 50); // batch_size=100
+
+        let handle = tokio::spawn(runner.run());
+
+        // Send only 3 messages (well below batch_size of 100)
+        for i in 0..3 {
+            tx.send(make_msg(&format!("evt-{i}"))).await.unwrap();
+        }
+
+        // Yield so runner receives messages
+        tokio::task::yield_now().await;
+
+        // Advance past flush interval to trigger timer-based flush
+        tokio::time::advance(tokio::time::Duration::from_millis(60)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(emitter.count(), 3, "Timer flush should emit partial batch");
+
+        drop(tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_middleware_filters_messages() {
+        use crate::middleware::Filter;
+
+        let (tx, rx) = mpsc::channel(64);
+        let buffer: Arc<dyn HubBuffer> = Arc::new(LockFreeBuffer::new(100));
+        let emitter = Arc::new(TestEmitter::new("filtered"));
+        let emitters = vec![emitter.clone() as Arc<dyn Emitter>];
+
+        let mut middleware = MiddlewareChain::new();
+        middleware.add(Filter::new(|msg: &Message| msg.message_type == "keep"));
+
+        let runner = HubRunner {
+            rx,
+            buffer,
+            batch_size: 10,
+            flush_interval_ms: 50,
+            middleware,
+            emitters,
+            checkpoint_store: None,
+            sequence: Arc::new(AtomicU64::new(0)),
+            manifest: make_manifest(),
+        };
+
+        let handle = tokio::spawn(runner.run());
+
+        // Send 2 "keep" and 1 "drop"
+        tx.send(make_msg("keep")).await.unwrap();
+        tx.send(make_msg("drop")).await.unwrap();
+        tx.send(make_msg("keep")).await.unwrap();
+
+        // Let the runner process
+        tokio::task::yield_now().await;
+        tokio::time::advance(tokio::time::Duration::from_millis(60)).await;
+        tokio::task::yield_now().await;
+
+        drop(tx);
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(emitter.count(), 2, "Only 'keep' messages should be emitted");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_buffer_overflow_drops_messages() {
+        let (tx, rx) = mpsc::channel(64);
+        // Tiny buffer: capacity 3
+        let buffer: Arc<dyn HubBuffer> = Arc::new(LockFreeBuffer::new(3));
+        let emitter = Arc::new(TestEmitter::new("overflow"));
+        let emitters = vec![emitter.clone() as Arc<dyn Emitter>];
+
+        // Large batch_size so inline flush doesn't trigger
+        let runner = make_runner(rx, buffer, emitters, 1000, 5000);
+
+        let handle = tokio::spawn(runner.run());
+
+        // Send 10 messages into buffer of capacity 3
+        // Some will be dropped due to overflow
+        for i in 0..10 {
+            tx.send(make_msg(&format!("evt-{i}"))).await.unwrap();
+        }
+
+        // Let the runner process all 10
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        drop(tx);
+
+        // Let runner observe channel closure before advancing time
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Advance time so the flush loop drains what's left
+        tokio::time::advance(tokio::time::Duration::from_millis(5100)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        handle.await.unwrap().unwrap();
+
+        // Only 3 messages should survive (buffer capacity)
+        assert!(
+            emitter.count() <= 3,
+            "Buffer overflow should drop messages, got {}",
+            emitter.count()
+        );
+        assert!(
+            emitter.count() >= 1,
+            "At least some messages should get through"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_no_emitters_completes_gracefully() {
+        let (tx, rx) = mpsc::channel(64);
+        let buffer: Arc<dyn HubBuffer> = Arc::new(LockFreeBuffer::new(100));
+
+        // No emitters
+        let runner = make_runner(rx, buffer, vec![], 10, 50);
+
+        let handle = tokio::spawn(runner.run());
+
+        // Send messages
+        for i in 0..5 {
+            tx.send(make_msg(&format!("evt-{i}"))).await.unwrap();
+        }
+
+        drop(tx);
+
+        // Let runner observe channel closure
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(tokio::time::Duration::from_millis(60)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        let result = handle.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "Should complete without error even with no emitters"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_multiple_emitters_fan_out() {
+        let (tx, rx) = mpsc::channel(64);
+        let buffer: Arc<dyn HubBuffer> = Arc::new(LockFreeBuffer::new(100));
+        let emitter_a = Arc::new(TestEmitter::new("alpha"));
+        let emitter_b = Arc::new(TestEmitter::new("beta"));
+        let emitters: Vec<Arc<dyn Emitter>> = vec![emitter_a.clone(), emitter_b.clone()];
+
+        let runner = make_runner(rx, buffer, emitters, 10, 50);
+        let handle = tokio::spawn(runner.run());
+
+        // Broadcast messages (empty route_to → all emitters)
+        for i in 0..4 {
+            tx.send(make_msg(&format!("evt-{i}"))).await.unwrap();
+        }
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(tokio::time::Duration::from_millis(60)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        drop(tx);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(emitter_a.count(), 4, "Emitter A should get all 4 messages");
+        assert_eq!(emitter_b.count(), 4, "Emitter B should get all 4 messages");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_routed_messages_reach_correct_emitter() {
+        let (tx, rx) = mpsc::channel(64);
+        let buffer: Arc<dyn HubBuffer> = Arc::new(LockFreeBuffer::new(100));
+        let emitter_a = Arc::new(TestEmitter::new("alpha"));
+        let emitter_b = Arc::new(TestEmitter::new("beta"));
+        let emitters: Vec<Arc<dyn Emitter>> = vec![emitter_a.clone(), emitter_b.clone()];
+
+        let runner = make_runner(rx, buffer, emitters, 10, 50);
+        let handle = tokio::spawn(runner.run());
+
+        // Route 2 messages to "alpha", 1 to "beta"
+        let mut msg1 = make_msg("to-alpha");
+        msg1.route_to = vec!["alpha".to_string()].into();
+        tx.send(msg1).await.unwrap();
+
+        let mut msg2 = make_msg("to-alpha");
+        msg2.route_to = vec!["alpha".to_string()].into();
+        tx.send(msg2).await.unwrap();
+
+        let mut msg3 = make_msg("to-beta");
+        msg3.route_to = vec!["beta".to_string()].into();
+        tx.send(msg3).await.unwrap();
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(tokio::time::Duration::from_millis(60)).await;
+        tokio::task::yield_now().await;
+
+        drop(tx);
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(emitter_a.count(), 2);
+        assert_eq!(emitter_b.count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_emitter_failure_does_not_crash() {
+        let (tx, rx) = mpsc::channel(64);
+        let buffer: Arc<dyn HubBuffer> = Arc::new(LockFreeBuffer::new(100));
+        let emitter = Arc::new(TestEmitter::new("broken"));
+        emitter.should_fail.store(true, Ordering::SeqCst);
+        let emitters = vec![emitter.clone() as Arc<dyn Emitter>];
+
+        let runner = make_runner(rx, buffer, emitters, 5, 50);
+        let handle = tokio::spawn(runner.run());
+
+        for i in 0..5 {
+            tx.send(make_msg(&format!("evt-{i}"))).await.unwrap();
+        }
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(tokio::time::Duration::from_millis(60)).await;
+        tokio::task::yield_now().await;
+
+        drop(tx);
+        let result = handle.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "Emitter failure should not crash the runner"
+        );
+        assert_eq!(
+            emitter.count(),
+            0,
+            "Failing emitter should receive 0 messages"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_checkpoint_tracks_per_emitter() {
+        let (tx, rx) = mpsc::channel(64);
+        let buffer: Arc<dyn HubBuffer> = Arc::new(LockFreeBuffer::new(100));
+        let store = Arc::new(MemoryCheckpointStore::new());
+
+        let emitter_ok = Arc::new(TestEmitter::new("ok-emitter"));
+        let emitter_fail = Arc::new(TestEmitter::new("fail-emitter"));
+        emitter_fail.should_fail.store(true, Ordering::SeqCst);
+
+        let emitters: Vec<Arc<dyn Emitter>> = vec![emitter_ok.clone(), emitter_fail.clone()];
+
+        let runner = HubRunner {
+            rx,
+            buffer,
+            batch_size: 10,
+            flush_interval_ms: 50,
+            middleware: MiddlewareChain::new(),
+            emitters,
+            checkpoint_store: Some(store.clone()),
+            sequence: Arc::new(AtomicU64::new(0)),
+            manifest: make_manifest(),
+        };
+
+        let handle = tokio::spawn(runner.run());
+
+        // Send 5 broadcast messages
+        for i in 0..5 {
+            tx.send(make_msg(&format!("evt-{i}"))).await.unwrap();
+        }
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(tokio::time::Duration::from_millis(60)).await;
+        tokio::task::yield_now().await;
+
+        drop(tx);
+        handle.await.unwrap().unwrap();
+
+        // ok-emitter should have a checkpoint
+        assert!(
+            store.get("ok-emitter").is_some(),
+            "Successful emitter should have checkpoint"
+        );
+
+        // fail-emitter should NOT have a checkpoint
+        assert_eq!(
+            store.get("fail-emitter"),
+            None,
+            "Failed emitter should not have checkpoint"
+        );
+    }
+
+    // ========================================================================
+    // partition_by_destination_owned edge cases
+    // ========================================================================
+
+    #[test]
+    fn partition_empty_messages_returns_empty() {
+        let emitters: Vec<Arc<dyn Emitter>> = vec![Arc::new(TestEmitter::new("e"))];
+        let PartitionResult { batches, .. } = partition_by_destination_owned(vec![], &emitters);
+        assert!(batches.is_empty(), "Empty messages → empty result");
+    }
+
+    #[test]
+    fn partition_empty_emitters_returns_empty() {
+        let PartitionResult { batches, .. } =
+            partition_by_destination_owned(vec![make_msg("t")], &[]);
+        assert!(batches.is_empty(), "No emitters → empty result");
     }
 }

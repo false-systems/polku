@@ -1,0 +1,195 @@
+{
+  "ci_data": {
+    "git": {
+      "branch": "refactor/shared-endpoint-health",
+      "changed_files": [
+        "gateway/src/emit/ahti/mod.rs",
+        "gateway/src/emit/endpoint.rs",
+        "gateway/src/emit/grpc.rs",
+        "gateway/src/emit/mod.rs"
+      ],
+      "recent_commits": [
+        {
+          "author": "Yair Etziony",
+          "message": "chore: Phase 5 cleanup — demote Event, update docs (#47)",
+          "sha": "96c55f5"
+        },
+        {
+          "author": "Yair Etziony",
+          "message": "feat: Message-first pipeline with AI-native introspection (#46)",
+          "sha": "3ed145b"
+        },
+        {
+          "author": "Yair Etziony",
+          "message": "feat(e2e): Add bidirectional streaming for high-throughput testing (#31)",
+          "sha": "84ffb16"
+        },
+        {
+          "author": "Yair Etziony",
+          "message": "fix(message): Preserve original event IDs through pipeline (#30)",
+          "sha": "3dbf030"
+        },
+        {
+          "author": "Yair Etziony",
+          "message": "fix: resolve all clippy warnings for CI (#45)",
+          "sha": "3b80093"
+        }
+      ],
+      "sha": "96c55f5"
+    },
+    "summary": {
+      "cached": 0,
+      "failed": 1,
+      "passed": 0,
+      "skipped": 3
+    },
+    "tasks": [
+      {
+        "blocks": [
+          "clippy"
+        ],
+        "cached": false,
+        "command": "rustup component add rustfmt && cargo fmt --all --check",
+        "duration_ms": 96566,
+        "error": {
+          "code": "task_failed",
+          "exit_code": 1,
+          "hints": [
+            "docker image not found - run: docker pull <image>"
+          ],
+          "message": "task 'fmt' failed",
+          "notes": [
+            "task ran for 1.6m before failing"
+          ],
+          "output": "Unable to find image 'rust:1.85' locally\n1.85: Pulling from library/rust\n68726bb4bd59: Pulling fs layer\n4378a6c11dea: Pulling fs layer\n1d9d474cce08: Pulling fs layer\n140d15be2fea: Pulling fs layer\n545aa82ec479: Pulling fs layer\n4378a6c11dea: Download complete\n545aa82ec479: Download complete\n140d15be2fea: Download complete\n545aa82ec479: Pull complete\n4378a6c11dea: Pull complete\n140d15be2fea: Pull complete\n1d9d474cce08: Download complete\n68726bb4bd59: Download complete\n1d9d474cce08: Pull complete\n68726bb4bd59: Pull complete\nDigest: sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4\nStatus: Downloaded newer image for rust:1.85\ninfo: downloading component 'rustfmt'\ninfo: installing component 'rustfmt'\nDiff in /src/gateway/src/emit/ahti/mod.rs:102:\n     pub async fn with_endpoints(endpoints: Vec<String>) -> Result<Self, PluginError> {\n         let channels = endpoint::build_channels(&endpoints, false, \"AHTI\").await?;\n         let states: Vec<_> = (0..channels.len()).map(|_| EndpointState::new()).collect();\n-        let clients = channels\n-            .into_iter()\n-            .map(AhtiServiceClient::new)\n-            .collect();\n+        let clients = channels.into_iter().map(AhtiServiceClient::new).collect();\n \n         Ok(Self {\n             clients,\nDiff in /src/gateway/src/emit/ahti/mod.rs:118:\n     pub async fn with_endpoints_lazy(endpoints: Vec<String>) -> Result<Self, PluginError> {\n         let channels = endpoint::build_channels(&endpoints, true, \"AHTI\").await?;\n         let states: Vec<_> = (0..channels.len()).map(|_| EndpointState::new()).collect();\n-        let clients = channels\n-            .into_iter()\n-            .map(AhtiServiceClient::new)\n-            .collect();\n+        let clients = channels.into_iter().map(AhtiServiceClient::new).collect();\n \n         Ok(Self {\n             clients,\nDiff in /src/gateway/src/emit/endpoint.rs:104:\n     label: &str,\n ) -> Result<Vec<Channel>, PluginError> {\n     if endpoints.is_empty() {\n-        return Err(PluginError::Init(format!(\"No {} endpoints provided\", label)));\n+        return Err(PluginError::Init(format!(\n+            \"No {} endpoints provided\",\n+            label\n+        )));\n     }\n \n     let mut channels = Vec::with_capacity(endpoints.len());\n"
+        },
+        "inputs": [
+          "**/*.rs",
+          "Cargo.toml"
+        ],
+        "name": "fmt",
+        "status": "failed"
+      },
+      {
+        "blocks": [
+          "test"
+        ],
+        "cached": false,
+        "command": "apt-get update && apt-get install -y protobuf-compiler && rustup component add clippy && cargo clippy --all-targets -- -D warnings",
+        "depends_on": [
+          "fmt"
+        ],
+        "duration_ms": 0,
+        "error": {
+          "code": "dependency_failed",
+          "message": "blocked by failed dependency"
+        },
+        "inputs": [
+          "**/*.rs",
+          "Cargo.toml",
+          "Cargo.lock"
+        ],
+        "name": "clippy",
+        "status": "blocked"
+      },
+      {
+        "blocks": [
+          "build"
+        ],
+        "cached": false,
+        "command": "apt-get update && apt-get install -y protobuf-compiler && cargo test --all",
+        "depends_on": [
+          "clippy"
+        ],
+        "duration_ms": 0,
+        "error": {
+          "code": "dependency_failed",
+          "message": "blocked by failed dependency"
+        },
+        "inputs": [
+          "**/*.rs",
+          "**/*.toml",
+          "Cargo.lock"
+        ],
+        "name": "test",
+        "status": "blocked"
+      },
+      {
+        "cached": false,
+        "command": "apt-get update && apt-get install -y protobuf-compiler && cargo build --release",
+        "depends_on": [
+          "test"
+        ],
+        "duration_ms": 0,
+        "error": {
+          "code": "dependency_failed",
+          "message": "blocked by failed dependency"
+        },
+        "inputs": [
+          "**/*.rs",
+          "**/*.toml",
+          "Cargo.lock"
+        ],
+        "name": "build",
+        "status": "blocked"
+      }
+    ]
+  },
+  "error": {
+    "code": "task_failed",
+    "exit_code": 1,
+    "output": "Unable to find image 'rust:1.85' locally\n1.85: Pulling from library/rust\n68726bb4bd59: Pulling fs layer\n4378a6c11dea: Pulling fs layer\n1d9d474cce08: Pulling fs layer\n140d15be2fea: Pulling fs layer\n545aa82ec479: Pulling fs layer\n4378a6c11dea: Download complete\n545aa82ec479: Download complete\n140d15be2fea: Download complete\n545aa82ec479: Pull complete\n4378a6c11dea: Pull complete\n140d15be2fea: Pull complete\n1d9d474cce08: Download complete\n68726bb4bd59: Download complete\n1d9d474cce08: Pull complete\n68726bb4bd59: Pull complete\nDigest: sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4\nStatus: Downloaded newer image for rust:1.85\ninfo: downloading component 'rustfmt'\ninfo: installing component 'rustfmt'\nDiff in /src/gateway/src/emit/ahti/mod.rs:102:\n     pub async fn with_endpoints(endpoints: Vec<String>) -> Result<Self, PluginError> {\n         let channels = endpoint::build_channels(&endpoints, false, \"AHTI\").await?;\n         let states: Vec<_> = (0..channels.len()).map(|_| EndpointState::new()).collect();\n-        let clients = channels\n-            .into_iter()\n-            .map(AhtiServiceClient::new)\n-            .collect();\n+        let clients = channels.into_iter().map(AhtiServiceClient::new).collect();\n \n         Ok(Self {\n             clients,\nDiff in /src/gateway/src/emit/ahti/mod.rs:118:\n     pub async fn with_endpoints_lazy(endpoints: Vec<String>) -> Result<Self, PluginError> {\n         let channels = endpoint::build_channels(&endpoints, true, \"AHTI\").await?;\n         let states: Vec<_> = (0..channels.len()).map(|_| EndpointState::new()).collect();\n-        let clients = channels\n-            .into_iter()\n-            .map(AhtiServiceClient::new)\n-            .collect();\n+        let clients = channels.into_iter().map(AhtiServiceClient::new).collect();\n \n         Ok(Self {\n             clients,\nDiff in /src/gateway/src/emit/endpoint.rs:104:\n     label: &str,\n ) -> Result<Vec<Channel>, PluginError> {\n     if endpoints.is_empty() {\n-        return Err(PluginError::Init(format!(\"No {} endpoints provided\", label)));\n+        return Err(PluginError::Init(format!(\n+            \"No {} endpoints provided\",\n+            label\n+        )));\n     }\n \n     let mut channels = Vec::with_capacity(endpoints.len());\n",
+    "possible_causes": [
+      "docker image not found - run: docker pull <image>"
+    ],
+    "suggested_fix": "docker image not found - run: docker pull <image>",
+    "what_failed": "task 'fmt' command: rustup component add rustfmt && cargo fmt --all --check",
+    "why_it_matters": "blocks clippy"
+  },
+  "history": {
+    "duration_ms": 96566,
+    "steps": [
+      {
+        "description": "fmt",
+        "duration_ms": 96566,
+        "error": "task 'fmt' failed",
+        "status": "failed"
+      },
+      {
+        "description": "clippy",
+        "duration_ms": 0,
+        "error": "blocked by failed dependency",
+        "status": "blocked"
+      },
+      {
+        "description": "test",
+        "duration_ms": 0,
+        "error": "blocked by failed dependency",
+        "status": "blocked"
+      },
+      {
+        "description": "build",
+        "duration_ms": 0,
+        "error": "blocked by failed dependency",
+        "status": "blocked"
+      }
+    ]
+  },
+  "id": "66b08714d224a1e0",
+  "outcome": "failed",
+  "reasoning": {
+    "confidence": 0.2,
+    "summary": "fmt failed — cause unclear, may be environmental",
+    "tasks": {
+      "fmt": {
+        "changed_files": [],
+        "explanation": "no direct file correlation"
+      }
+    }
+  },
+  "severity": "error",
+  "source": "sykli",
+  "timestamp": "2026-02-17T23:20:22.346263Z",
+  "type": "ci.run.failed",
+  "version": "1.0"
+}

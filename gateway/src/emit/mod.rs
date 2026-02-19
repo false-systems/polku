@@ -5,6 +5,7 @@
 
 #[cfg(feature = "ahti")]
 pub mod ahti;
+pub(crate) mod endpoint;
 pub mod external;
 pub mod grpc;
 pub mod registry;

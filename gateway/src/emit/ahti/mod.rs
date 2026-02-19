@@ -22,34 +22,29 @@
 
 mod ahti_proto;
 
+use super::endpoint::{self, HealthTracker};
 use super::{Emitter, PluginError};
 use crate::message::Message;
 use ahti_proto::ahti::v1::{
     self as ahti_types, AhtiEvent, AhtiEventBatch, AhtiHealthRequest, Entity, EntityReference,
-    EntityType, EventType, Relationship, RelationshipState, RelationshipType,
+    EntityState, EntityType, EventType, Relationship, RelationshipState, RelationshipType,
     ahti_service_client::AhtiServiceClient,
 };
 use polku_core::Event;
-// Import polku_core types for the Event.data oneof
 use polku_core::proto::event::Data as PolkuEventData;
 use polku_core::{Outcome as PolkuOutcome, Severity as PolkuSeverity};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
-use tonic::transport::{Channel, Endpoint};
+use std::time::Instant;
+use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 
-const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
-const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
-const FAILURE_THRESHOLD: u32 = 3;
+const FAILURE_THRESHOLD: u64 = 3;
 const UNHEALTHY_DURATION_MS: u64 = 30_000;
 
 /// Tracks health and performance of a single AHTI endpoint.
-///
-/// Uses `Ordering::SeqCst` for failure tracking to ensure proper visibility
-/// across threads during endpoint selection and failure recording.
 struct EndpointState {
-    unhealthy_until: AtomicU64,
-    consecutive_failures: AtomicU64,
+    /// Health window tracking (shared algorithm)
+    health: HealthTracker,
     /// Cumulative latency in microseconds for calculating averages
     total_latency_us: AtomicU64,
     /// Number of successful emits for latency averaging
@@ -59,43 +54,25 @@ struct EndpointState {
 impl EndpointState {
     fn new() -> Self {
         Self {
-            unhealthy_until: AtomicU64::new(0),
-            consecutive_failures: AtomicU64::new(0),
+            health: HealthTracker::new(FAILURE_THRESHOLD, UNHEALTHY_DURATION_MS),
             total_latency_us: AtomicU64::new(0),
             emit_count: AtomicU64::new(0),
         }
     }
 
     fn record_success(&self, latency_us: u64) {
-        self.consecutive_failures.store(0, Ordering::SeqCst);
-        self.unhealthy_until.store(0, Ordering::SeqCst);
+        self.health.record_success();
         self.total_latency_us
             .fetch_add(latency_us, Ordering::Relaxed);
         self.emit_count.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_failure(&self) {
-        let failures = self.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
-        if failures >= FAILURE_THRESHOLD as u64 {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            self.unhealthy_until
-                .store(now + UNHEALTHY_DURATION_MS, Ordering::SeqCst);
-        }
+        self.health.record_failure();
     }
 
     fn is_healthy(&self) -> bool {
-        let unhealthy_until = self.unhealthy_until.load(Ordering::SeqCst);
-        if unhealthy_until == 0 {
-            return true;
-        }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        now >= unhealthy_until
+        self.health.is_healthy()
     }
 
     /// Average latency in microseconds, or 0 if no data yet
@@ -123,32 +100,9 @@ impl AhtiEmitter {
 
     /// Create an AhtiEmitter connected to multiple AHTI endpoints
     pub async fn with_endpoints(endpoints: Vec<String>) -> Result<Self, PluginError> {
-        if endpoints.is_empty() {
-            return Err(PluginError::Init("No AHTI endpoints provided".to_string()));
-        }
-
-        let mut clients = Vec::with_capacity(endpoints.len());
-        let mut states = Vec::with_capacity(endpoints.len());
-
-        for endpoint_str in &endpoints {
-            let channel = Endpoint::from_shared(endpoint_str.clone())
-                .map_err(|e| PluginError::Init(format!("Invalid AHTI endpoint URL: {}", e)))?
-                .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
-                .timeout(Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS))
-                .connect()
-                .await
-                .map_err(|e| {
-                    PluginError::Connection(format!(
-                        "Failed to connect to AHTI at {}: {}",
-                        endpoint_str, e
-                    ))
-                })?;
-
-            clients.push(AhtiServiceClient::new(channel));
-            states.push(EndpointState::new());
-        }
-
-        debug!(endpoints = ?endpoints, "AHTI emitter connected to {} endpoint(s)", endpoints.len());
+        let channels = endpoint::build_channels(&endpoints, false, "AHTI").await?;
+        let states: Vec<_> = (0..channels.len()).map(|_| EndpointState::new()).collect();
+        let clients = channels.into_iter().map(AhtiServiceClient::new).collect();
 
         Ok(Self {
             clients,
@@ -159,25 +113,9 @@ impl AhtiEmitter {
 
     /// Create an AhtiEmitter with lazy connections
     pub async fn with_endpoints_lazy(endpoints: Vec<String>) -> Result<Self, PluginError> {
-        if endpoints.is_empty() {
-            return Err(PluginError::Init("No AHTI endpoints provided".to_string()));
-        }
-
-        let mut clients = Vec::with_capacity(endpoints.len());
-        let mut states = Vec::with_capacity(endpoints.len());
-
-        for endpoint_str in &endpoints {
-            let channel = Endpoint::from_shared(endpoint_str.clone())
-                .map_err(|e| PluginError::Init(format!("Invalid AHTI endpoint URL: {}", e)))?
-                .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
-                .timeout(Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS))
-                .connect_lazy();
-
-            clients.push(AhtiServiceClient::new(channel));
-            states.push(EndpointState::new());
-        }
-
-        debug!(endpoints = ?endpoints, "AHTI emitter configured with {} lazy endpoint(s)", endpoints.len());
+        let channels = endpoint::build_channels(&endpoints, true, "AHTI").await?;
+        let states: Vec<_> = (0..channels.len()).map(|_| EndpointState::new()).collect();
+        let clients = channels.into_iter().map(AhtiServiceClient::new).collect();
 
         Ok(Self {
             clients,
@@ -216,12 +154,7 @@ impl AhtiEmitter {
     }
 
     fn select_any_untried(&self, exclude: &[bool]) -> Option<usize> {
-        for (idx, excluded) in exclude.iter().enumerate() {
-            if !excluded {
-                return Some(idx);
-            }
-        }
-        None
+        endpoint::select_any_untried(exclude)
     }
 
     async fn try_emit_to(&self, idx: usize, events: &[Event]) -> Result<u64, PluginError> {
@@ -311,8 +244,8 @@ impl AhtiEmitter {
         let relationships = Self::extract_relationships(event);
 
         let timestamp = Some(prost_types::Timestamp {
-            seconds: event.timestamp_unix_ns / 1_000_000_000,
-            nanos: (event.timestamp_unix_ns % 1_000_000_000) as i32,
+            seconds: event.timestamp_unix_ns.div_euclid(1_000_000_000),
+            nanos: event.timestamp_unix_ns.rem_euclid(1_000_000_000) as i32,
         });
 
         // Map severity from polku to ahti
@@ -374,6 +307,7 @@ impl AhtiEmitter {
 
         // Fall back to typed data latency (network events have latency_ms)
         if let Some(PolkuEventData::Network(n)) = &event.data
+            && n.latency_ms.is_finite()
             && n.latency_ms > 0.0
         {
             return (n.latency_ms * 1000.0) as u64;
@@ -610,7 +544,7 @@ impl AhtiEmitter {
         let parts: Vec<&str> = event_type.split('.').collect();
 
         match parts.as_slice() {
-            ["k8s", resource, action] => {
+            ["k8s", resource, rest @ ..] if !rest.is_empty() => {
                 let ahti_type = match *resource {
                     "deployment" | "replicaset" | "statefulset" | "daemonset" => {
                         EventType::Deployment
@@ -623,7 +557,7 @@ impl AhtiEmitter {
                     "event" => EventType::Health,
                     _ => EventType::Unspecified,
                 };
-                (ahti_type, format!("{}.{}", resource, action))
+                (ahti_type, format!("{}.{}", resource, rest.join(".")))
             }
             ["network", subtype] => (EventType::Network, (*subtype).to_string()),
             ["kernel", subtype] => (EventType::Kernel, (*subtype).to_string()),
@@ -671,6 +605,12 @@ impl AhtiEmitter {
                 _ => EntityType::Unspecified,
             };
 
+            let entity_state = if event.event_type.ends_with(".deleted") {
+                EntityState::Deleted as i32
+            } else {
+                EntityState::Active as i32
+            };
+
             entities.push(Entity {
                 r#type: entity_type as i32,
                 id: event.metadata.get("uid").cloned().unwrap_or_default(),
@@ -678,13 +618,14 @@ impl AhtiEmitter {
                 cluster_id: event
                     .metadata
                     .get("cluster_id")
+                    .or_else(|| event.metadata.get("cluster"))
                     .cloned()
                     .unwrap_or_default(),
                 namespace: event.metadata.get("namespace").cloned().unwrap_or_default(),
                 labels: Default::default(),
                 attributes: Default::default(),
                 generation: 0,
-                state: 1,
+                state: entity_state,
                 deleted_at: None,
                 delete_reason: String::new(),
             });
@@ -766,6 +707,12 @@ impl Emitter for AhtiEmitter {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::inconsistent_digit_grouping
+)]
 mod tests {
     use super::*;
     use polku_core::proto::event::Data as PolkuEventData;
@@ -1638,41 +1585,20 @@ mod tests {
     }
 
     // ==========================================================================
-    // BUG-FINDING TESTS - These expose actual issues in the code
+    // BUG FIX TESTS - These verify behavior for previously identified issues
     // ==========================================================================
 
-    /// BUG: parse_event_type doesn't handle k8s events with >3 parts
-    ///
-    /// EXPECTED: "k8s.pod.container.started" should map to EventType::Pod
-    /// since it's clearly a k8s pod-related event.
-    ///
-    /// BUG: Pattern ["k8s", resource, action] only matches exactly 3 parts.
-    /// Events with 4+ parts fall through to the generic handler which
-    /// doesn't recognize "k8s" as a category.
+    /// k8s event types with 4+ dot-separated parts should still map correctly
     #[test]
-    fn test_bug_parse_event_type_k8s_four_parts() {
-        let (event_type, _subtype) = AhtiEmitter::parse_event_type("k8s.pod.container.started");
-
-        // EXPECTED: Should be EventType::Pod (it's a k8s pod event)
-        // BUG: Returns EventType::Unspecified
-        assert_eq!(
-            event_type,
-            EventType::Pod,
-            "BUG: k8s.pod.container.started should return EventType::Pod, \
-             but returns Unspecified because pattern only matches exactly 3 parts"
-        );
+    fn test_parse_event_type_k8s_four_parts() {
+        let (event_type, subtype) = AhtiEmitter::parse_event_type("k8s.pod.container.started");
+        assert_eq!(event_type, EventType::Pod);
+        assert_eq!(subtype, "pod.container.started");
     }
 
-    /// BUG: extract_entities doesn't use cluster fallback like event_to_ahti_event does
-    ///
-    /// EXPECTED: Entity.cluster_id should use the same fallback logic as AhtiEvent.cluster.
-    /// Both should check "cluster_id" first, then fall back to "cluster".
-    ///
-    /// BUG: extract_entities only checks "cluster_id", causing inconsistency
-    /// where AhtiEvent.cluster has a value but Entity.cluster_id is empty.
+    /// Entity.cluster_id uses same "cluster_id" / "cluster" fallback as AhtiEvent.cluster
     #[test]
-    fn test_bug_extract_entities_cluster_fallback_inconsistency() {
-        // Use "cluster" instead of "cluster_id"
+    fn test_extract_entities_cluster_fallback_consistent() {
         let mut metadata = HashMap::new();
         metadata.insert("name".to_string(), "my-pod".to_string());
         metadata.insert("resource".to_string(), "pod".to_string());
@@ -1680,22 +1606,12 @@ mod tests {
 
         let event = make_event_with_metadata(metadata);
 
-        // event_to_ahti_event correctly falls back to "cluster" key
         let ahti_event = AhtiEmitter::event_to_ahti_event(&event);
-        assert_eq!(
-            ahti_event.cluster, "prod-cluster",
-            "event_to_ahti_event uses fallback"
-        );
+        assert_eq!(ahti_event.cluster, "prod-cluster");
 
-        // EXPECTED: Entity should also have cluster_id = "prod-cluster"
-        // BUG: extract_entities does NOT use the fallback
         let entities = AhtiEmitter::extract_entities(&event);
         assert_eq!(entities.len(), 1);
-        assert_eq!(
-            entities[0].cluster_id, "prod-cluster",
-            "BUG: Entity.cluster_id should use cluster fallback like AhtiEvent.cluster does. \
-             Currently returns empty string, causing inconsistency in same event."
-        );
+        assert_eq!(entities[0].cluster_id, "prod-cluster");
     }
 
     /// BUG #7: Negative timestamp produces negative seconds
@@ -1714,36 +1630,19 @@ mod tests {
         assert_eq!(ts.nanos, 0, "Nanos are 0 for exact negative seconds");
     }
 
-    /// BUG: Negative fractional timestamp produces invalid protobuf Timestamp
-    ///
-    /// EXPECTED: For -0.5 seconds (-500_000_000 ns), the protobuf Timestamp should
-    /// normalize to seconds=-1, nanos=500_000_000 (per protobuf spec).
-    ///
-    /// BUG: Rust's % operator keeps the sign, so nanos becomes -500_000_000,
-    /// which violates the protobuf Timestamp spec (nanos must be 0-999_999_999).
+    /// Negative fractional timestamps produce valid protobuf Timestamp (nanos >= 0)
     #[test]
-    fn test_bug_negative_fractional_timestamp() {
+    fn test_negative_fractional_timestamp_valid() {
         let mut event = make_event();
         event.timestamp_unix_ns = -500_000_000; // -0.5 seconds
 
         let ahti_event = AhtiEmitter::event_to_ahti_event(&event);
         let ts = ahti_event.timestamp.unwrap();
 
-        // EXPECTED per protobuf Timestamp spec:
-        // -0.5 seconds should normalize to: seconds = -1, nanos = 500_000_000
-        // (nanos must always be 0-999_999_999)
-        //
-        // BUG: Rust division truncates toward zero:
-        // -500_000_000 / 1_000_000_000 = 0
-        // -500_000_000 % 1_000_000_000 = -500_000_000
-        // Result: seconds = 0, nanos = -500_000_000 (INVALID!)
-
-        assert!(
-            ts.nanos >= 0 && ts.nanos < 1_000_000_000,
-            "BUG: Timestamp nanos must be 0-999_999_999 per protobuf spec. \
-             Got nanos = {}, which is invalid and may cause parse errors in receivers.",
-            ts.nanos
-        );
+        // Per protobuf spec: nanos must be 0-999_999_999
+        // -0.5s normalizes to: seconds = -1, nanos = 500_000_000
+        assert_eq!(ts.seconds, -1);
+        assert_eq!(ts.nanos, 500_000_000);
     }
 
     /// BUG #7: NaN latency produces garbage duration
@@ -1761,9 +1660,9 @@ mod tests {
         assert_eq!(duration, 0, "NaN latency safely returns 0");
     }
 
-    /// BUG #7: Infinity latency overflows
+    /// Infinity latency should be treated as 0 (no duration data)
     #[test]
-    fn test_infinity_latency_bug() {
+    fn test_infinity_latency_returns_zero() {
         let mut event = make_event();
         event.data = Some(PolkuEventData::Network(PolkuNetworkEventData {
             latency_ms: f64::INFINITY,
@@ -1771,76 +1670,55 @@ mod tests {
         }));
 
         let duration = AhtiEmitter::extract_duration_us(&event);
-        // f64::INFINITY > 0.0 is true
-        // (f64::INFINITY * 1000.0) as u64 = some large value or overflow
-        // On most platforms, casting infinity to u64 gives u64::MAX or 0
-        assert!(
-            duration == 0 || duration == u64::MAX,
-            "BUG: Infinity latency produces unpredictable result: {}",
-            duration
-        );
+        assert_eq!(duration, 0, "Infinity latency should be treated as no data");
     }
 
-    /// BUG: Entity state is hardcoded to 1, ignoring event context
-    ///
-    /// EXPECTED: Entity state should reflect the event context.
-    /// Delete events should set state to indicate the entity is deleted.
-    ///
-    /// BUG: Line 655 hardcodes `state: 1` regardless of event type.
+    /// Entity state reflects event type: delete events produce Deleted state
     #[test]
-    fn test_bug_entity_state_hardcoded() {
+    fn test_entity_state_reflects_event_type() {
         let mut metadata = HashMap::new();
         metadata.insert("name".to_string(), "deleted-pod".to_string());
         metadata.insert("resource".to_string(), "pod".to_string());
 
-        // Create an event that represents a deletion
         let mut event = make_event_with_metadata(metadata);
         event.event_type = "k8s.pod.deleted".to_string();
 
         let entities = AhtiEmitter::extract_entities(&event);
-
-        // EXPECTED: Delete event should produce entity with deleted/inactive state
-        // BUG: State is hardcoded to 1 (active) regardless of event type
-        let state_reflects_event_type = entities[0].state != 1; // Should NOT be 1 for delete
-
-        assert!(
-            state_reflects_event_type,
-            "BUG: Entity state is hardcoded to 1 regardless of event type. \
-             For event_type='k8s.pod.deleted', entity state should indicate deletion, \
-             but got state={} (always 1). This causes inconsistency where AHTI sees \
-             pod.deleted event but entity appears 'active'.",
-            entities[0].state
-        );
+        assert_eq!(entities[0].state, EntityState::Deleted as i32);
     }
 
-    /// Test that cluster fallback works in relationships but not entities
+    /// Non-delete events produce Active state
     #[test]
-    fn test_relationship_cluster_fallback_also_missing_bug() {
+    fn test_entity_state_active_for_non_delete() {
+        let mut metadata = HashMap::new();
+        metadata.insert("name".to_string(), "my-pod".to_string());
+        metadata.insert("resource".to_string(), "pod".to_string());
+
+        let event = make_event_with_metadata(metadata);
+        let entities = AhtiEmitter::extract_entities(&event);
+        assert_eq!(entities[0].state, EntityState::Active as i32);
+    }
+
+    /// Both entities and relationships use the "cluster" fallback consistently
+    #[test]
+    fn test_cluster_fallback_consistent_across_entities_and_relationships() {
         let mut metadata = HashMap::new();
         metadata.insert("name".to_string(), "my-pod".to_string());
         metadata.insert("pod_name".to_string(), "my-pod".to_string());
         metadata.insert("resource".to_string(), "pod".to_string());
         metadata.insert("node_name".to_string(), "worker-1".to_string());
         metadata.insert("uid".to_string(), "pod-uid".to_string());
-        metadata.insert("cluster".to_string(), "prod-cluster".to_string()); // "cluster" not "cluster_id"
+        metadata.insert("cluster".to_string(), "prod-cluster".to_string());
 
         let event = make_event_with_metadata(metadata);
-        let relationships = AhtiEmitter::extract_relationships(&event);
 
-        // extract_relationships DOES use the cluster fallback (see line 369-374)
+        let relationships = AhtiEmitter::extract_relationships(&event);
         assert_eq!(relationships.len(), 1);
         let source = relationships[0].source.as_ref().unwrap();
-        assert_eq!(
-            source.cluster_id, "prod-cluster",
-            "Relationships DO use cluster fallback correctly"
-        );
+        assert_eq!(source.cluster_id, "prod-cluster");
 
-        // But entities don't - inconsistent!
         let entities = AhtiEmitter::extract_entities(&event);
-        assert_eq!(
-            entities[0].cluster_id, "",
-            "Entities do NOT use cluster fallback"
-        );
+        assert_eq!(entities[0].cluster_id, "prod-cluster");
     }
 
     // ==========================================================================
