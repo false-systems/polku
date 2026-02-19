@@ -1652,7 +1652,7 @@ mod tests {
     }
 
     // ==========================================================================
-    // BUG-FINDING TESTS - These expose actual issues in the code
+    // BUG FIX TESTS - These verify behavior for previously identified issues
     // ==========================================================================
 
     /// k8s event types with 4+ dot-separated parts should still map correctly
