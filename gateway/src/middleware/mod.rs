@@ -31,6 +31,7 @@
 //! ```
 
 use crate::message::Message;
+use crate::metrics::Metrics;
 use async_trait::async_trait;
 use std::fmt::Write;
 
@@ -107,59 +108,76 @@ impl MiddlewareChain {
             .metadata()
             .get(polku_core::metadata_keys::TRACE_ENABLED)
             .is_some_and(|v| v == "true");
+        let metrics = Metrics::get();
 
-        if !tracing_enabled {
-            // Hot path: no tracing overhead
+        if !tracing_enabled && metrics.is_none() {
+            // Fast path: no tracing, no metrics — zero overhead
             for mw in &self.middlewares {
                 msg = mw.process(msg).await?;
             }
             return Some(msg);
         }
 
-        // Traced path: record each middleware step
-        let mut trace = String::from("[");
+        // Instrumented path: record per-middleware timing
+        let mut trace = if tracing_enabled {
+            Some(String::from("["))
+        } else {
+            None
+        };
+
         for (i, mw) in self.middlewares.iter().enumerate() {
             let start = std::time::Instant::now();
             match mw.process(msg).await {
                 Some(m) => {
-                    let us = start.elapsed().as_micros();
-                    if i > 0 {
-                        trace.push(',');
+                    let elapsed = start.elapsed();
+                    if let Some(metrics) = metrics {
+                        metrics.record_middleware(mw.name(), elapsed, "passed");
                     }
-                    let _ = write!(
-                        trace,
-                        r#"{{"mw":"{}","action":"passed","us":{}}}"#,
-                        mw.name(),
-                        us
-                    );
+                    if let Some(ref mut trace) = trace {
+                        if i > 0 {
+                            trace.push(',');
+                        }
+                        let _ = write!(
+                            trace,
+                            r#"{{"mw":"{}","action":"passed","us":{}}}"#,
+                            mw.name(),
+                            elapsed.as_micros()
+                        );
+                    }
                     msg = m;
                 }
                 None => {
-                    let us = start.elapsed().as_micros();
-                    if i > 0 {
-                        trace.push(',');
+                    let elapsed = start.elapsed();
+                    if let Some(metrics) = metrics {
+                        metrics.record_middleware(mw.name(), elapsed, "filtered");
                     }
-                    let _ = write!(
-                        trace,
-                        r#"{{"mw":"{}","action":"filtered","us":{}}}"#,
-                        mw.name(),
-                        us
-                    );
-                    trace.push(']');
-                    // Message was filtered — we can't attach trace to it.
-                    // Log for observability instead.
-                    tracing::debug!(
-                        trace = %trace,
-                        middleware = mw.name(),
-                        "Message filtered (trace attached to log)"
-                    );
+                    if let Some(ref mut trace) = trace {
+                        if i > 0 {
+                            trace.push(',');
+                        }
+                        let _ = write!(
+                            trace,
+                            r#"{{"mw":"{}","action":"filtered","us":{}}}"#,
+                            mw.name(),
+                            elapsed.as_micros()
+                        );
+                        trace.push(']');
+                        tracing::debug!(
+                            trace = %trace,
+                            middleware = mw.name(),
+                            "Message filtered (trace attached to log)"
+                        );
+                    }
                     return None;
                 }
             }
         }
-        trace.push(']');
-        msg.metadata_mut()
-            .insert(polku_core::metadata_keys::TRACE_LOG.to_string(), trace);
+
+        if let Some(mut trace) = trace {
+            trace.push(']');
+            msg.metadata_mut()
+                .insert(polku_core::metadata_keys::TRACE_LOG.to_string(), trace);
+        }
         Some(msg)
     }
 

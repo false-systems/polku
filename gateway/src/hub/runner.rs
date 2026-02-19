@@ -138,10 +138,8 @@ impl HubRunner {
     ///
     /// Called inline when buffer hits threshold, and by the timer loop.
     async fn flush_batch(&self) {
-        let flush_start = std::time::Instant::now();
         let messages = self.buffer.drain(self.batch_size);
 
-        // Update buffer size metric after drain
         if let Some(metrics) = Metrics::get() {
             metrics.set_buffer_size(self.buffer.len());
         }
@@ -150,93 +148,13 @@ impl HubRunner {
             return;
         }
 
-        let total_events = messages.len();
-
-        // Assign sequence numbers to this batch for checkpoint tracking.
-        // Each message gets a unique sequence number for precise tracking.
-        let batch_start_seq = self
-            .sequence
-            .fetch_add(messages.len() as u64, Ordering::SeqCst);
-
-        // Partition messages by destination with zero-copy optimization
-        let batches = partition_by_destination_owned(messages, &self.emitters);
-
-        // Pre-aggregate metrics to reduce Prometheus HashMap lookups.
-        // Key: (emitter_name, event_type), Value: count
-        // This reduces O(events) lookups to O(unique label combos).
-        let mut forward_counts: std::collections::HashMap<(&str, &str), u64> =
-            std::collections::HashMap::new();
-
-        // Send pre-partitioned batches to each emitter.
-        // Each emitter's checkpoint advances by the number of events IT processed,
-        // not the total batch size (which may differ due to routing).
-        for emitter in &self.emitters {
-            let routed_events = match batches.get(emitter.name()) {
-                Some(events) if !events.is_empty() => events,
-                _ => continue,
-            };
-
-            let emitter_start = std::time::Instant::now();
-            let emit_result = emitter.emit(routed_events).await;
-            let emitter_duration = emitter_start.elapsed();
-
-            // Record per-emitter metrics
-            if let Some(metrics) = Metrics::get() {
-                metrics.record_emitter_flush(
-                    emitter.name(),
-                    routed_events.len(),
-                    emitter_duration,
-                    emit_result.is_ok(),
-                );
-            }
-
-            if let Err(e) = emit_result {
-                error!(
-                    emitter = emitter.name(),
-                    error = %e,
-                    count = routed_events.len(),
-                    "Failed to emit"
-                );
-                if let Some(metrics) = Metrics::get() {
-                    metrics.record_dropped(emitter.name(), routed_events.len() as u64);
-                }
-                // Note: checkpoint NOT updated on failure - emitter is behind
-            } else {
-                debug!(
-                    emitter = emitter.name(),
-                    count = routed_events.len(),
-                    "Emitted (inline)"
-                );
-                // Aggregate counts locally instead of per-event Prometheus updates
-                for msg in routed_events {
-                    *forward_counts
-                        .entry((emitter.name(), &msg.message_type))
-                        .or_default() += 1;
-                }
-                // Update checkpoint: advance by number of messages this emitter processed.
-                // Uses batch_start_seq + emitter's message count - 1 as the checkpoint.
-                // This ensures each emitter tracks its own progress independently.
-                if let Some(ref store) = self.checkpoint_store {
-                    let emitter_end_seq = batch_start_seq + routed_events.len() as u64 - 1;
-                    store.set(emitter.name(), emitter_end_seq);
-                }
-            }
-        }
-
-        // Batch update to Prometheus - single HashMap lookup per unique label combo
-        if let Some(metrics) = Metrics::get() {
-            metrics.record_forwarded_batch(&forward_counts);
-            metrics.inc_flush();
-
-            // Calculate and record throughput
-            let flush_duration = flush_start.elapsed();
-            if flush_duration.as_secs_f64() > 0.0 {
-                let events_per_sec = total_events as f64 / flush_duration.as_secs_f64();
-                metrics.set_events_per_second(events_per_sec);
-            }
-
-            update_pressure(metrics, &self.emitters);
-        }
+        emit_to_destinations(
+            messages,
+            &self.emitters,
+            &self.sequence,
+            &self.checkpoint_store,
+        )
+        .await;
     }
 
     /// Get a reference to the buffer for monitoring
@@ -252,6 +170,88 @@ impl HubRunner {
     /// Get a shareable reference to the manifest
     pub fn manifest_arc(&self) -> Arc<PipelineManifest> {
         Arc::clone(&self.manifest)
+    }
+}
+
+/// Emit a batch of messages to their destination emitters
+///
+/// Partitions messages by destination, dispatches to each emitter,
+/// records metrics (per-emitter timing, forwarded counts, throughput),
+/// and updates checkpoints.
+async fn emit_to_destinations(
+    messages: Vec<Message>,
+    emitters: &[Arc<dyn Emitter>],
+    sequence: &AtomicU64,
+    checkpoint_store: &Option<Arc<dyn CheckpointStore>>,
+) {
+    let flush_start = std::time::Instant::now();
+    let total_events = messages.len();
+
+    let batch_start_seq = sequence.fetch_add(total_events as u64, Ordering::SeqCst);
+
+    let batches = partition_by_destination_owned(messages, emitters);
+
+    let mut forward_counts: std::collections::HashMap<(&str, &str), u64> =
+        std::collections::HashMap::new();
+
+    for emitter in emitters {
+        let routed_events = match batches.get(emitter.name()) {
+            Some(events) if !events.is_empty() => events,
+            _ => continue,
+        };
+
+        let emitter_start = std::time::Instant::now();
+        let emit_result = emitter.emit(routed_events).await;
+        let emitter_duration = emitter_start.elapsed();
+
+        if let Some(metrics) = Metrics::get() {
+            metrics.record_emitter_flush(
+                emitter.name(),
+                routed_events.len(),
+                emitter_duration,
+                emit_result.is_ok(),
+            );
+        }
+
+        if let Err(e) = emit_result {
+            error!(
+                emitter = emitter.name(),
+                error = %e,
+                count = routed_events.len(),
+                "Failed to emit"
+            );
+            if let Some(metrics) = Metrics::get() {
+                metrics.record_dropped(emitter.name(), routed_events.len() as u64);
+            }
+        } else {
+            debug!(
+                emitter = emitter.name(),
+                count = routed_events.len(),
+                "Emitted"
+            );
+            for msg in routed_events {
+                *forward_counts
+                    .entry((emitter.name(), &msg.message_type))
+                    .or_default() += 1;
+            }
+            if let Some(store) = checkpoint_store {
+                let emitter_end_seq = batch_start_seq + routed_events.len() as u64 - 1;
+                store.set(emitter.name(), emitter_end_seq);
+            }
+        }
+    }
+
+    if let Some(metrics) = Metrics::get() {
+        metrics.record_forwarded_batch(&forward_counts);
+        metrics.inc_flush();
+
+        let flush_duration = flush_start.elapsed();
+        if flush_duration.as_secs_f64() > 0.0 {
+            let events_per_sec = total_events as f64 / flush_duration.as_secs_f64();
+            metrics.set_events_per_second(events_per_sec);
+        }
+
+        update_pressure(metrics, emitters);
     }
 }
 
@@ -394,10 +394,8 @@ pub(crate) async fn flush_loop(
             }
         }
 
-        let flush_start = std::time::Instant::now();
         let messages = buffer.drain(batch_size);
 
-        // Update buffer size metric after drain
         if let Some(metrics) = Metrics::get() {
             metrics.set_buffer_size(buffer.len());
         }
@@ -406,94 +404,7 @@ pub(crate) async fn flush_loop(
             continue;
         }
 
-        let total_events = messages.len();
-
-        // Assign sequence numbers to this batch for checkpoint tracking.
-        // Each message gets a unique sequence number for precise tracking.
-        let batch_start_seq = sequence.fetch_add(messages.len() as u64, Ordering::SeqCst);
-
-        // Partition messages by destination with zero-copy optimization
-        // - Single-destination messages: moved, not cloned
-        // - Multi-destination messages: N-1 clones (last one moved)
-        let batches = partition_by_destination_owned(messages, &emitters);
-
-        // Pre-aggregate metrics to reduce Prometheus HashMap lookups.
-        // Key: (emitter_name, event_type), Value: count
-        // This reduces O(events) lookups to O(unique label combos).
-        let mut forward_counts: std::collections::HashMap<(&str, &str), u64> =
-            std::collections::HashMap::new();
-
-        // Send pre-partitioned batches to each emitter.
-        // Each emitter's checkpoint advances by the number of events IT processed,
-        // not the total batch size (which may differ due to routing).
-        for emitter in &emitters {
-            let routed_events = match batches.get(emitter.name()) {
-                Some(events) if !events.is_empty() => events,
-                _ => continue,
-            };
-
-            let emitter_start = std::time::Instant::now();
-            let emit_result = emitter.emit(routed_events).await;
-            let emitter_duration = emitter_start.elapsed();
-
-            // Record per-emitter metrics
-            if let Some(metrics) = Metrics::get() {
-                metrics.record_emitter_flush(
-                    emitter.name(),
-                    routed_events.len(),
-                    emitter_duration,
-                    emit_result.is_ok(),
-                );
-            }
-
-            if let Err(e) = emit_result {
-                error!(
-                    emitter = emitter.name(),
-                    error = %e,
-                    count = routed_events.len(),
-                    "Failed to emit"
-                );
-                // Record emit failures
-                if let Some(metrics) = Metrics::get() {
-                    metrics.record_dropped(emitter.name(), routed_events.len() as u64);
-                }
-                // Note: checkpoint NOT updated on failure - emitter is behind
-            } else {
-                debug!(
-                    emitter = emitter.name(),
-                    count = routed_events.len(),
-                    "Emitted"
-                );
-                // Aggregate counts locally instead of per-event Prometheus updates
-                for msg in routed_events {
-                    *forward_counts
-                        .entry((emitter.name(), &msg.message_type))
-                        .or_default() += 1;
-                }
-                // Update checkpoint: advance by number of messages this emitter processed.
-                // Uses batch_start_seq + emitter's message count - 1 as the checkpoint.
-                // This ensures each emitter tracks its own progress independently.
-                if let Some(ref store) = checkpoint_store {
-                    let emitter_end_seq = batch_start_seq + routed_events.len() as u64 - 1;
-                    store.set(emitter.name(), emitter_end_seq);
-                }
-            }
-        }
-
-        // Batch update to Prometheus - single HashMap lookup per unique label combo
-        if let Some(metrics) = Metrics::get() {
-            metrics.record_forwarded_batch(&forward_counts);
-            metrics.inc_flush();
-
-            // Calculate and record throughput
-            let flush_duration = flush_start.elapsed();
-            if flush_duration.as_secs_f64() > 0.0 {
-                let events_per_sec = total_events as f64 / flush_duration.as_secs_f64();
-                metrics.set_events_per_second(events_per_sec);
-            }
-
-            update_pressure(metrics, &emitters);
-        }
+        emit_to_destinations(messages, &emitters, &sequence, &checkpoint_store).await;
     }
 }
 
