@@ -25,6 +25,7 @@
 //! ]).await?;
 //! ```
 
+use super::endpoint::{self, HealthTracker};
 use crate::emit::Emitter;
 use crate::error::PluginError;
 use crate::message::Message;
@@ -33,40 +34,30 @@ use crate::proto::gateway_client::GatewayClient;
 use crate::proto::{EventPayload, HealthRequest, IngestBatch, ingest_batch};
 use async_trait::async_trait;
 use polku_core::Event;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::Duration;
-use tonic::transport::{Channel, Endpoint};
+use std::sync::atomic::{AtomicU32, Ordering};
+use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
-
-/// Default connect timeout (10 seconds)
-const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
-
-/// Default request timeout (30 seconds)
-const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 
 /// How long to mark an endpoint unhealthy after consecutive failures (5 seconds)
 const UNHEALTHY_DURATION_MS: u64 = 5000;
 
 /// Number of consecutive failures before marking endpoint unhealthy
-const FAILURE_THRESHOLD: u32 = 3;
+const FAILURE_THRESHOLD: u64 = 3;
 
 /// Per-endpoint state for smart load balancing
 struct EndpointState {
+    /// Health window tracking (shared algorithm)
+    health: HealthTracker,
     /// Buffer fill ratio (0-1000, scaled to avoid floats in atomics)
     /// 0 = empty, 1000 = full
     fill_ratio: AtomicU32,
-    /// Timestamp when endpoint became unhealthy (0 = healthy)
-    unhealthy_until: AtomicU64,
-    /// Consecutive failure count
-    consecutive_failures: AtomicU32,
 }
 
 impl EndpointState {
     fn new() -> Self {
         Self {
+            health: HealthTracker::new(FAILURE_THRESHOLD, UNHEALTHY_DURATION_MS),
             fill_ratio: AtomicU32::new(500), // Start at 50% (unknown)
-            unhealthy_until: AtomicU64::new(0),
-            consecutive_failures: AtomicU32::new(0),
         }
     }
 
@@ -76,16 +67,12 @@ impl EndpointState {
             let ratio = ((buffer_size as f64 / buffer_capacity as f64) * 1000.0) as u32;
             self.fill_ratio.store(ratio.min(1000), Ordering::Relaxed);
 
-            // Report to Prometheus
             if let Some(m) = Metrics::get() {
                 m.set_grpc_endpoint_fill_ratio(endpoint, ratio as f64 / 1000.0);
             }
         }
-        // Success - reset failures
-        self.consecutive_failures.store(0, Ordering::Relaxed);
-        self.unhealthy_until.store(0, Ordering::Relaxed);
+        self.health.record_success();
 
-        // Report health restored
         if let Some(m) = Metrics::get() {
             m.set_grpc_endpoint_health(endpoint, true);
             m.set_grpc_endpoint_failures(endpoint, 0);
@@ -94,38 +81,23 @@ impl EndpointState {
 
     /// Record a failure, possibly marking endpoint unhealthy
     fn record_failure(&self, endpoint: &str) {
-        let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
-        if failures >= FAILURE_THRESHOLD {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            self.unhealthy_until
-                .store(now + UNHEALTHY_DURATION_MS, Ordering::Relaxed);
+        let failures = self.health.record_failure();
 
-            // Report unhealthy to Prometheus
+        #[allow(clippy::collapsible_if)]
+        if !self.health.is_healthy() {
             if let Some(m) = Metrics::get() {
                 m.set_grpc_endpoint_health(endpoint, false);
             }
         }
 
-        // Report failure count
         if let Some(m) = Metrics::get() {
-            m.set_grpc_endpoint_failures(endpoint, failures);
+            m.set_grpc_endpoint_failures(endpoint, failures as u32);
         }
     }
 
     /// Check if endpoint is currently healthy
     fn is_healthy(&self) -> bool {
-        let unhealthy_until = self.unhealthy_until.load(Ordering::Relaxed);
-        if unhealthy_until == 0 {
-            return true;
-        }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        now >= unhealthy_until
+        self.health.is_healthy()
     }
 
     /// Get fill ratio as float (0.0 - 1.0)
@@ -175,28 +147,9 @@ impl GrpcEmitter {
     /// # Arguments
     /// * `endpoints` - List of gRPC endpoint URLs
     pub async fn with_endpoints(endpoints: Vec<String>) -> Result<Self, PluginError> {
-        if endpoints.is_empty() {
-            return Err(PluginError::Init("No endpoints provided".to_string()));
-        }
-
-        let mut clients = Vec::with_capacity(endpoints.len());
-        let mut states = Vec::with_capacity(endpoints.len());
-
-        for endpoint_str in &endpoints {
-            let channel = Endpoint::from_shared(endpoint_str.clone())
-                .map_err(|e| PluginError::Init(format!("Invalid endpoint URL: {}", e)))?
-                .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
-                .timeout(Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS))
-                .connect()
-                .await
-                .map_err(|e| {
-                    PluginError::Connection(format!("Failed to connect to {}: {}", endpoint_str, e))
-                })?;
-
-            clients.push(GatewayClient::new(channel));
-            states.push(EndpointState::new());
-            debug!(endpoint = %endpoint_str, "gRPC emitter connected");
-        }
+        let channels = endpoint::build_channels(&endpoints, false, "gRPC").await?;
+        let states: Vec<_> = (0..channels.len()).map(|_| EndpointState::new()).collect();
+        let clients = channels.into_iter().map(GatewayClient::new).collect();
 
         Ok(Self {
             clients,
@@ -215,24 +168,9 @@ impl GrpcEmitter {
     /// # Arguments
     /// * `endpoints` - List of gRPC endpoint URLs
     pub async fn with_endpoints_lazy(endpoints: Vec<String>) -> Result<Self, PluginError> {
-        if endpoints.is_empty() {
-            return Err(PluginError::Init("No endpoints provided".to_string()));
-        }
-
-        let mut clients = Vec::with_capacity(endpoints.len());
-        let mut states = Vec::with_capacity(endpoints.len());
-
-        for endpoint_str in &endpoints {
-            let channel = Endpoint::from_shared(endpoint_str.clone())
-                .map_err(|e| PluginError::Init(format!("Invalid endpoint URL: {}", e)))?
-                .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
-                .timeout(Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS))
-                .connect_lazy();
-
-            clients.push(GatewayClient::new(channel));
-            states.push(EndpointState::new());
-            debug!(endpoint = %endpoint_str, "gRPC emitter configured (lazy)");
-        }
+        let channels = endpoint::build_channels(&endpoints, true, "gRPC").await?;
+        let states: Vec<_> = (0..channels.len()).map(|_| EndpointState::new()).collect();
+        let clients = channels.into_iter().map(GatewayClient::new).collect();
 
         Ok(Self {
             clients,
@@ -294,12 +232,7 @@ impl GrpcEmitter {
 
     /// Select any untried endpoint (fallback when all healthy endpoints failed)
     fn select_any_untried(&self, exclude: &[bool]) -> Option<usize> {
-        for (idx, excluded) in exclude.iter().enumerate() {
-            if !excluded {
-                return Some(idx);
-            }
-        }
-        None
+        endpoint::select_any_untried(exclude)
     }
 
     /// Try to emit to a specific endpoint
@@ -739,18 +672,10 @@ mod tests {
         .await
         .unwrap();
 
-        // Manually mark first endpoint as unhealthy (simulating failures)
-        emitter.states[0]
-            .consecutive_failures
-            .store(10, Ordering::Relaxed);
-        emitter.states[0].unhealthy_until.store(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64
-                + 60000, // Unhealthy for 60s
-            Ordering::Relaxed,
-        );
+        // Simulate enough failures to mark first endpoint unhealthy
+        for _ in 0..10 {
+            emitter.states[0].health.record_failure();
+        }
 
         // Emit should failover to second endpoint
         let messages = vec![make_message("failover-1", "test.failover")];

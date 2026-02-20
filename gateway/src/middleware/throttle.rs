@@ -10,6 +10,7 @@
 //! a time) to amortize the O(n) scan cost. Configure `max_sources` based on
 //! your expected source cardinality.
 
+use super::token_bucket::TokenBucket;
 use crate::message::Message;
 use crate::middleware::Middleware;
 use async_trait::async_trait;
@@ -46,112 +47,6 @@ struct TrackedBucket {
     bucket: TokenBucket,
     last_access_nanos: AtomicU64,
     created: Instant,
-}
-
-/// Individual token bucket (similar to RateLimiter internals)
-struct TokenBucket {
-    capacity: u64,
-    refill_amount: u64,
-    refill_nanos: u64,
-    tokens: AtomicU64,
-    last_refill: AtomicU64,
-    start: Instant,
-}
-
-impl TokenBucket {
-    fn new(rate: u64, burst: u64) -> Self {
-        let refill_nanos = if rate == 0 {
-            u64::MAX
-        } else {
-            1_000_000_000 / rate
-        };
-
-        let scaled_burst = burst.saturating_mul(1000);
-
-        Self {
-            capacity: scaled_burst,
-            refill_amount: 1000,
-            refill_nanos,
-            tokens: AtomicU64::new(scaled_burst),
-            last_refill: AtomicU64::new(0),
-            start: Instant::now(),
-        }
-    }
-
-    fn try_acquire(&self) -> bool {
-        self.refill();
-
-        loop {
-            let current = self.tokens.load(Ordering::Acquire);
-            if current < 1000 {
-                return false;
-            }
-
-            if self
-                .tokens
-                .compare_exchange_weak(current, current - 1000, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return true;
-            }
-        }
-    }
-
-    fn refill(&self) {
-        let now_nanos = self.start.elapsed().as_nanos() as u64;
-
-        loop {
-            let last = self.last_refill.load(Ordering::Acquire);
-            let elapsed = now_nanos.saturating_sub(last);
-
-            if elapsed < self.refill_nanos {
-                return;
-            }
-
-            let intervals = elapsed / self.refill_nanos;
-            if intervals == 0 {
-                return;
-            }
-
-            let new_last = last + intervals * self.refill_nanos;
-
-            match self.last_refill.compare_exchange_weak(
-                last,
-                new_last,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    let tokens_to_add = intervals * self.refill_amount;
-                    if tokens_to_add == 0 {
-                        return;
-                    }
-
-                    loop {
-                        let current = self.tokens.load(Ordering::Acquire);
-                        let new_tokens = (current.saturating_add(tokens_to_add)).min(self.capacity);
-                        if current == new_tokens {
-                            break;
-                        }
-                        if self
-                            .tokens
-                            .compare_exchange_weak(
-                                current,
-                                new_tokens,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            )
-                            .is_ok()
-                        {
-                            break;
-                        }
-                    }
-                    return;
-                }
-                Err(_) => continue,
-            }
-        }
-    }
 }
 
 impl TrackedBucket {

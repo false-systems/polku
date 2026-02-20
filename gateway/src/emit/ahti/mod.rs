@@ -22,6 +22,7 @@
 
 mod ahti_proto;
 
+use super::endpoint::{self, HealthTracker};
 use super::{Emitter, PluginError};
 use crate::message::Message;
 use ahti_proto::ahti::v1::{
@@ -30,26 +31,20 @@ use ahti_proto::ahti::v1::{
     ahti_service_client::AhtiServiceClient,
 };
 use polku_core::Event;
-// Import polku_core types for the Event.data oneof
 use polku_core::proto::event::Data as PolkuEventData;
 use polku_core::{Outcome as PolkuOutcome, Severity as PolkuSeverity};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
-use tonic::transport::{Channel, Endpoint};
+use std::time::Instant;
+use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 
-const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
-const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
-const FAILURE_THRESHOLD: u32 = 3;
+const FAILURE_THRESHOLD: u64 = 3;
 const UNHEALTHY_DURATION_MS: u64 = 30_000;
 
 /// Tracks health and performance of a single AHTI endpoint.
-///
-/// Uses `Ordering::SeqCst` for failure tracking to ensure proper visibility
-/// across threads during endpoint selection and failure recording.
 struct EndpointState {
-    unhealthy_until: AtomicU64,
-    consecutive_failures: AtomicU64,
+    /// Health window tracking (shared algorithm)
+    health: HealthTracker,
     /// Cumulative latency in microseconds for calculating averages
     total_latency_us: AtomicU64,
     /// Number of successful emits for latency averaging
@@ -59,43 +54,25 @@ struct EndpointState {
 impl EndpointState {
     fn new() -> Self {
         Self {
-            unhealthy_until: AtomicU64::new(0),
-            consecutive_failures: AtomicU64::new(0),
+            health: HealthTracker::new(FAILURE_THRESHOLD, UNHEALTHY_DURATION_MS),
             total_latency_us: AtomicU64::new(0),
             emit_count: AtomicU64::new(0),
         }
     }
 
     fn record_success(&self, latency_us: u64) {
-        self.consecutive_failures.store(0, Ordering::SeqCst);
-        self.unhealthy_until.store(0, Ordering::SeqCst);
+        self.health.record_success();
         self.total_latency_us
             .fetch_add(latency_us, Ordering::Relaxed);
         self.emit_count.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_failure(&self) {
-        let failures = self.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
-        if failures >= FAILURE_THRESHOLD as u64 {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            self.unhealthy_until
-                .store(now + UNHEALTHY_DURATION_MS, Ordering::SeqCst);
-        }
+        self.health.record_failure();
     }
 
     fn is_healthy(&self) -> bool {
-        let unhealthy_until = self.unhealthy_until.load(Ordering::SeqCst);
-        if unhealthy_until == 0 {
-            return true;
-        }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        now >= unhealthy_until
+        self.health.is_healthy()
     }
 
     /// Average latency in microseconds, or 0 if no data yet
@@ -123,32 +100,9 @@ impl AhtiEmitter {
 
     /// Create an AhtiEmitter connected to multiple AHTI endpoints
     pub async fn with_endpoints(endpoints: Vec<String>) -> Result<Self, PluginError> {
-        if endpoints.is_empty() {
-            return Err(PluginError::Init("No AHTI endpoints provided".to_string()));
-        }
-
-        let mut clients = Vec::with_capacity(endpoints.len());
-        let mut states = Vec::with_capacity(endpoints.len());
-
-        for endpoint_str in &endpoints {
-            let channel = Endpoint::from_shared(endpoint_str.clone())
-                .map_err(|e| PluginError::Init(format!("Invalid AHTI endpoint URL: {}", e)))?
-                .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
-                .timeout(Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS))
-                .connect()
-                .await
-                .map_err(|e| {
-                    PluginError::Connection(format!(
-                        "Failed to connect to AHTI at {}: {}",
-                        endpoint_str, e
-                    ))
-                })?;
-
-            clients.push(AhtiServiceClient::new(channel));
-            states.push(EndpointState::new());
-        }
-
-        debug!(endpoints = ?endpoints, "AHTI emitter connected to {} endpoint(s)", endpoints.len());
+        let channels = endpoint::build_channels(&endpoints, false, "AHTI").await?;
+        let states: Vec<_> = (0..channels.len()).map(|_| EndpointState::new()).collect();
+        let clients = channels.into_iter().map(AhtiServiceClient::new).collect();
 
         Ok(Self {
             clients,
@@ -159,25 +113,9 @@ impl AhtiEmitter {
 
     /// Create an AhtiEmitter with lazy connections
     pub async fn with_endpoints_lazy(endpoints: Vec<String>) -> Result<Self, PluginError> {
-        if endpoints.is_empty() {
-            return Err(PluginError::Init("No AHTI endpoints provided".to_string()));
-        }
-
-        let mut clients = Vec::with_capacity(endpoints.len());
-        let mut states = Vec::with_capacity(endpoints.len());
-
-        for endpoint_str in &endpoints {
-            let channel = Endpoint::from_shared(endpoint_str.clone())
-                .map_err(|e| PluginError::Init(format!("Invalid AHTI endpoint URL: {}", e)))?
-                .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
-                .timeout(Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS))
-                .connect_lazy();
-
-            clients.push(AhtiServiceClient::new(channel));
-            states.push(EndpointState::new());
-        }
-
-        debug!(endpoints = ?endpoints, "AHTI emitter configured with {} lazy endpoint(s)", endpoints.len());
+        let channels = endpoint::build_channels(&endpoints, true, "AHTI").await?;
+        let states: Vec<_> = (0..channels.len()).map(|_| EndpointState::new()).collect();
+        let clients = channels.into_iter().map(AhtiServiceClient::new).collect();
 
         Ok(Self {
             clients,
@@ -216,12 +154,7 @@ impl AhtiEmitter {
     }
 
     fn select_any_untried(&self, exclude: &[bool]) -> Option<usize> {
-        for (idx, excluded) in exclude.iter().enumerate() {
-            if !excluded {
-                return Some(idx);
-            }
-        }
-        None
+        endpoint::select_any_untried(exclude)
     }
 
     async fn try_emit_to(&self, idx: usize, events: &[Event]) -> Result<u64, PluginError> {
