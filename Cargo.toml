@@ -6,6 +6,7 @@ members = ["core", "gateway", "ci", "test-plugins/receiver"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 authors = ["Yair Etziony <yair.etziony@false-systems.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/falsesystems/polku"

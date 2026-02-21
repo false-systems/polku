@@ -14,7 +14,7 @@ categories = ["network-programming"]
 async-trait = "0.1"
 
 # Error handling
-thiserror = "1.0"
+thiserror = "2"
 
 # Proto/gRPC (only what we need for Event type)
 prost = "0.13"
