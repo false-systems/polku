@@ -637,7 +637,7 @@ impl AhtiEmitter {
 
 #[async_trait::async_trait]
 impl Emitter for AhtiEmitter {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "ahti"
     }
 

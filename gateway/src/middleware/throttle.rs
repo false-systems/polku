@@ -173,7 +173,7 @@ impl Throttle {
 
 #[async_trait]
 impl Middleware for Throttle {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "throttle"
     }
 

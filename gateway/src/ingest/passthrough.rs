@@ -41,11 +41,11 @@ impl Default for PassthroughIngestor {
 }
 
 impl Ingestor for PassthroughIngestor {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "passthrough"
     }
 
-    fn sources(&self) -> &'static [&'static str] {
+    fn sources(&self) -> &[&str] {
         &["passthrough", "polku"]
     }
 

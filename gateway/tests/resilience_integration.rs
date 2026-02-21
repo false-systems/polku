@@ -45,7 +45,7 @@ impl FailNTimesEmitter {
 
 #[async_trait]
 impl Emitter for FailNTimesEmitter {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "fail_n_times"
     }
 
@@ -84,7 +84,7 @@ impl AlwaysFailEmitter {
 
 #[async_trait]
 impl Emitter for AlwaysFailEmitter {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "always_fail"
     }
 
@@ -117,7 +117,7 @@ impl TrackingEmitter {
 
 #[async_trait]
 impl Emitter for TrackingEmitter {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "tracking"
     }
 
@@ -578,7 +578,7 @@ async fn test_high_load_with_intermittent_failures() {
 
     #[async_trait]
     impl Emitter for IntermittentEmitter {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "intermittent"
         }
 

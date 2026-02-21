@@ -48,7 +48,7 @@ impl Default for StdoutEmitter {
 
 #[async_trait]
 impl Emitter for StdoutEmitter {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "stdout"
     }
 

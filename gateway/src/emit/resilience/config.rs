@@ -148,7 +148,7 @@ mod tests {
 
     #[async_trait]
     impl Emitter for RecoverableEmitter {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "recoverable"
         }
         async fn emit(&self, _: &[Message]) -> Result<(), PluginError> {
@@ -169,7 +169,7 @@ mod tests {
 
     #[async_trait]
     impl Emitter for AlwaysFailingEmitter {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "always_failing"
         }
         async fn emit(&self, _: &[Message]) -> Result<(), PluginError> {

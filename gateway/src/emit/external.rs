@@ -33,8 +33,8 @@ pub struct ExternalEmitter {
     emitter_name: String,
     /// gRPC address of the plugin
     address: String,
-    /// Leaked static string for name() return type
-    name_static: &'static str,
+    /// Name for trait identification
+    name: String,
     /// Cached gRPC client (lazy initialized)
     client: Arc<Mutex<Option<EmitterPluginClient<Channel>>>>,
 }
@@ -49,14 +49,12 @@ impl ExternalEmitter {
         let emitter_name = emitter_name.into();
         let address = address.into();
 
-        // Leak string to create static reference for name()
         let name = format!("external:{}", emitter_name);
-        let name_static: &'static str = Box::leak(name.into_boxed_str());
 
         Self {
             emitter_name,
             address,
-            name_static,
+            name,
             client: Arc::new(Mutex::new(None)),
         }
     }
@@ -112,8 +110,8 @@ impl ExternalEmitter {
 
 #[async_trait]
 impl Emitter for ExternalEmitter {
-    fn name(&self) -> &'static str {
-        self.name_static
+    fn name(&self) -> &str {
+        &self.name
     }
 
     async fn emit(&self, messages: &[Message]) -> Result<(), PluginError> {

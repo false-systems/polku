@@ -62,7 +62,7 @@ impl Enricher {
 
 #[async_trait]
 impl Middleware for Enricher {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "enricher"
     }
 

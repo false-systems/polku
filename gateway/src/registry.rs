@@ -286,11 +286,11 @@ mod tests {
     }
 
     impl Ingestor for MockIngestor {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             self.name
         }
 
-        fn sources(&self) -> &'static [&'static str] {
+        fn sources(&self) -> &[&str] {
             self.sources
         }
 
@@ -311,7 +311,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Emitter for MockEmitter {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             self.name
         }
 
