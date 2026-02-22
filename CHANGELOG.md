@@ -10,7 +10,7 @@ Initial pre-release of POLKU as an open-source programmable protocol hub.
 
 ### Added
 
-- **Message-first pipeline**: `Message` is the sole type flowing through the pipeline. No more `Event<->Message` conversions on the hot path (#46)
+- **Message-first pipeline**: `Message` is the sole type flowing through the pipeline. No `Event<->Message` conversions on the hot path (#46)
 - **AI-native introspection**: Pipeline manifest (`/pipeline`), per-message processing trace (`polku.trace`), structured error context with `ErrorContext` + `PipelineStage` (#46)
 - **Pipeline health endpoint**: `/health` returns structured JSON with pipeline pressure metric (0.0-1.0), K8s liveness/readiness compatible (#46)
 - **Middleware suite**: Router, RateLimiter, Deduplicator, Sampler, Throttle, Enricher, Validator, Aggregator
@@ -27,7 +27,6 @@ Initial pre-release of POLKU as an open-source programmable protocol hub.
 
 ### Fixed
 
-- AHTI emitter: 5 conversion bugs (timestamp nanos, severity mapping, entity extraction, duration precedence, empty-field handling) (#49)
 - Preserve original event IDs through pipeline instead of generating new ULIDs (#30)
 - Extracted shared `emit_to_destinations` to eliminate ~90 lines of duplicated flush logic (#53)
 - Shared `TokenBucket` implementation replacing 3 independent copies (#51)

@@ -109,7 +109,7 @@ pub struct MiddlewareStats {
     /// Total events received (before any middleware)
     #[prost(int64, tag = "6")]
     pub total_received: i64,
-    /// Total events forwarded to Ahti (after all middleware)
+    /// Total events forwarded (after all middleware)
     #[prost(int64, tag = "7")]
     pub total_forwarded: i64,
 }

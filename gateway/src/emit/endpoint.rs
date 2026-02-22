@@ -1,8 +1,8 @@
 //! Shared endpoint health tracking and channel construction
 //!
-//! Extracted from duplicated patterns in `grpc.rs` and `ahti/mod.rs`.
-//! Both emitters use the same health-window algorithm (unhealthy_until + consecutive
-//! failures) and the same gRPC channel construction chain.
+//! Extracted from shared patterns in gRPC emitters.
+//! Uses a health-window algorithm (unhealthy_until + consecutive failures)
+//! and shared gRPC channel construction chain.
 
 use crate::error::PluginError;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -97,7 +97,7 @@ pub(crate) fn select_any_untried(exclude: &[bool]) -> Option<usize> {
 /// # Arguments
 /// * `endpoints` - endpoint URLs (e.g. "http://host:50051")
 /// * `lazy` - if true, uses `connect_lazy()` instead of `connect().await`
-/// * `label` - short label for error messages (e.g. "AHTI", "gRPC")
+/// * `label` - short label for error messages (e.g. "gRPC")
 pub(crate) async fn build_channels(
     endpoints: &[String],
     lazy: bool,

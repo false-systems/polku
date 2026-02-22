@@ -8,8 +8,8 @@
 
 | Metric | Count |
 |--------|-------|
-| Test files audited | 25+ |
-| Total tests examined | ~250+ |
+| Test files audited | 20+ |
+| Total tests examined | ~150+ |
 | Fake tests removed | 11 |
 | Remaining fake tests | 0 |
 
@@ -26,7 +26,7 @@ The following tests were identified as fake (just `assert!(true)` or similar) an
 
 ## Test Quality by Module
 
-### Middleware Tests ✅
+### Middleware Tests
 
 All middleware tests are real with proper setup, execution, and assertions.
 
@@ -41,7 +41,7 @@ All middleware tests are real with proper setup, execution, and assertions.
 | `dedup.rs` | 4 | Bloom filter dedup, TTL expiry |
 | `aggregator.rs` | 4 | Time windows, count triggers, field aggregation |
 
-### Core Tests ✅
+### Core Tests
 
 | File | Tests | Quality |
 |------|-------|---------|
@@ -51,7 +51,7 @@ All middleware tests are real with proper setup, execution, and assertions.
 | `buffer_tiered.rs` | 11 | Tiered overflow, compression, promotion (2 bug-documenting) |
 | `shared_message.rs` | 6 | Zero-copy clone, COW, Arc semantics |
 
-### Infrastructure Tests ✅
+### Infrastructure Tests
 
 | File | Tests | Quality |
 |------|-------|---------|
@@ -64,25 +64,24 @@ All middleware tests are real with proper setup, execution, and assertions.
 | `metrics.rs` | 6 | Prometheus metrics, throughput tracking |
 | `metrics_server.rs` | 2 | HTTP endpoint handlers |
 
-### Emit Tests ✅
+### Emit Tests
 
 | File | Tests | Quality |
 |------|-------|---------|
 | `stdout.rs` | 2 | JSON/text formatting |
 | `webhook.rs` | 9 | Full mock HTTP server (axum), retries, errors |
 | `grpc.rs` | 14 | Real gRPC server (tonic), load balancing, failover |
-| `ahti/mod.rs` | ~100+ | Comprehensive proto mapping, OCSF conversion |
 
-### Resilience Tests ✅
+### Resilience Tests
 
 | File | Tests | Quality |
 |------|-------|---------|
 | `resilience/config.rs` | 6 | Builder pattern, layer composition |
 | `resilience/failure_buffer.rs` | 12 | Capacity limits, drain/peek, sample mode |
 | `resilience/retry.rs` | 11 | Exponential backoff, jitter, xorshift PRNG |
-| `resilience/circuit_breaker.rs` | 10 | State machine (closed→open→half-open→closed) |
+| `resilience/circuit_breaker.rs` | 10 | State machine (closed->open->half-open->closed) |
 
-### Hub Tests ✅
+### Hub Tests
 
 | File | Tests | Quality |
 |------|-------|---------|
@@ -116,4 +115,4 @@ Some tests are marked with `BUG:` comments. These are **legitimate** - they docu
 
 1. **Run coverage** - `cargo llvm-cov` to find untested paths
 2. **Property tests** - Consider `proptest` for buffer/routing logic
-3. **Fuzz testing** - AHTI proto conversion is complex, good fuzz target
+3. **Fuzz testing** - Proto conversion and ingestor parsing are good fuzz targets

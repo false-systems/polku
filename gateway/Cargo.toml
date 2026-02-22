@@ -75,8 +75,6 @@ prost-build = "0.13"
 sykli = []
 # Enable dhat heap profiling
 dhat-heap = ["dhat"]
-# Enable AHTI emitter (inlined to avoid cyclic dep with false-systems-plugins)
-ahti = []
 
 [dev-dependencies]
 tokio-test = "0.4"

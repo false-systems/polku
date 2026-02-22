@@ -193,7 +193,6 @@ mod tests {
             route_to: vec![],
             severity: 0,
             outcome: 0,
-            data: None,
         };
         let data = prost::Message::encode_to_vec(&event);
 
@@ -225,7 +224,6 @@ mod tests {
             route_to: vec![],
             severity: 4, // ERROR
             outcome: 2,  // FAILURE
-            data: None,
         };
         let data = prost::Message::encode_to_vec(&event);
 

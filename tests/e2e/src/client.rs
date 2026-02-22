@@ -3,8 +3,7 @@
 use crate::proto::gateway_client::GatewayClient;
 use crate::proto::ingest_batch;
 use crate::proto::{Ack, EventPayload, IngestBatch, IngestEvent};
-use polku_core::proto::event::Data;
-use polku_core::{Event, KernelEventData, NetworkEventData, Outcome, Severity};
+use polku_core::{Event, Outcome, Severity};
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
 
@@ -181,7 +180,7 @@ impl PolkuClient {
     // REAL PROTOBUF EVENTS - typed eBPF/kernel events
     // ========================================================================
 
-    /// Create a real eBPF kernel syscall event with typed protobuf data
+    /// Create a kernel syscall event with payload data
     pub fn make_kernel_syscall_event(syscall: &str, pid: u32, retval: i64) -> Event {
         Event {
             id: uuid::Uuid::new_v4().to_string(),
@@ -199,27 +198,15 @@ impl PolkuClient {
             } else {
                 Outcome::Failure as i32
             },
-            data: Some(Data::Kernel(KernelEventData {
-                event_type: "syscall".to_string(),
-                pid,
-                command: format!("test-proc-{}", pid),
-                syscall_id: match syscall {
-                    "read" => 0,
-                    "write" => 1,
-                    "open" => 2,
-                    "close" => 3,
-                    "execve" => 59,
-                    _ => 999,
-                },
-                syscall_name: syscall.to_string(),
-                syscall_retval: retval,
-                ..Default::default()
-            })),
+            payload: format!(
+                r#"{{"syscall":"{}","pid":{},"retval":{}}}"#,
+                syscall, pid, retval
+            ).into_bytes(),
             ..Default::default()
         }
     }
 
-    /// Create a real network event with typed protobuf data
+    /// Create a network event with payload data
     pub fn make_network_event(protocol: &str, src_ip: &str, dst_ip: &str, dst_port: u32) -> Event {
         Event {
             id: uuid::Uuid::new_v4().to_string(),
@@ -233,18 +220,10 @@ impl PolkuClient {
                 .unwrap_or(i64::MAX),
             severity: Severity::Info as i32,
             outcome: Outcome::Success as i32,
-            data: Some(Data::Network(NetworkEventData {
-                protocol: protocol.to_string(),
-                src_ip: src_ip.to_string(),
-                dst_ip: dst_ip.to_string(),
-                src_port: 54321,
-                dst_port,
-                direction: "outbound".to_string(),
-                latency_ms: 1.5,
-                bytes_sent: 1024,
-                bytes_received: 2048,
-                ..Default::default()
-            })),
+            payload: format!(
+                r#"{{"protocol":"{}","src":"{}","dst":"{}","port":{}}}"#,
+                protocol, src_ip, dst_ip, dst_port
+            ).into_bytes(),
             ..Default::default()
         }
     }

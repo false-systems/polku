@@ -64,7 +64,7 @@ pub trait Emitter: Send + Sync {
     /// Returns the emitter's name for identification and logging
     ///
     /// This should be a short, descriptive name that uniquely identifies
-    /// the emitter type. Examples: "stdout", "kafka", "ahti", "s3".
+    /// the emitter type. Examples: "stdout", "kafka", "s3".
     fn name(&self) -> &str;
 
     /// Emit a batch of messages to the destination

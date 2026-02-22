@@ -269,7 +269,6 @@ mod tests {
                     route_to: vec![],
                     severity: 0,
                     outcome: 0,
-                    data: None,
                 })
                 .collect();
 
