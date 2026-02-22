@@ -122,7 +122,7 @@ impl WebhookEmitter {
 
 #[async_trait]
 impl Emitter for WebhookEmitter {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "webhook"
     }
 

@@ -321,15 +321,15 @@ pub(crate) fn partition_by_destination_owned<'a>(
         };
     }
 
+    // Cache emitter names to avoid repeated dyn-dispatch on the hot path
+    let emitter_names: Vec<&'a str> = emitters.iter().map(|e| e.name()).collect();
+
     let mut batches: std::collections::HashMap<&'a str, Vec<Message>> =
         std::collections::HashMap::new();
 
     // Pre-allocate for each emitter
-    for emitter in emitters {
-        batches.insert(
-            emitter.name(),
-            Vec::with_capacity(messages.len() / emitters.len()),
-        );
+    for &name in &emitter_names {
+        batches.insert(name, Vec::with_capacity(messages.len() / emitters.len()));
     }
 
     // First pass: count destinations for each message
@@ -340,10 +340,10 @@ pub(crate) fn partition_by_destination_owned<'a>(
     for (idx, msg) in messages.iter().enumerate() {
         let broadcast = msg.route_to.is_empty();
 
-        for emitter in emitters {
-            if broadcast || msg.route_to.iter().any(|r| r == emitter.name()) {
+        for &name in &emitter_names {
+            if broadcast || msg.route_to.iter().any(|r| r == name) {
                 dest_counts[idx] += 1;
-                destinations[idx].push(emitter.name());
+                destinations[idx].push(name);
             }
         }
     }

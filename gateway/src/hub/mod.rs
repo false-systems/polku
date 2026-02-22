@@ -534,7 +534,7 @@ mod tests {
 
         #[async_trait::async_trait]
         impl Middleware for CountingMiddleware {
-            fn name(&self) -> &'static str {
+            fn name(&self) -> &str {
                 "counter"
             }
 
@@ -571,7 +571,7 @@ mod tests {
 
         #[async_trait::async_trait]
         impl crate::emit::Emitter for CountingEmitter {
-            fn name(&self) -> &'static str {
+            fn name(&self) -> &str {
                 "counter"
             }
             async fn emit(&self, messages: &[Message]) -> Result<(), crate::error::PluginError> {
@@ -638,7 +638,7 @@ mod tests {
 
         #[async_trait::async_trait]
         impl crate::emit::Emitter for CountingEmitter {
-            fn name(&self) -> &'static str {
+            fn name(&self) -> &str {
                 "counter"
             }
 
@@ -691,7 +691,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::emit::Emitter for NamedEmitter {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             self.name
         }
         async fn emit(&self, _: &[Message]) -> Result<(), crate::error::PluginError> {
@@ -876,7 +876,7 @@ mod tests {
 
         #[async_trait::async_trait]
         impl crate::emit::Emitter for CountingEmitter {
-            fn name(&self) -> &'static str {
+            fn name(&self) -> &str {
                 "counter"
             }
             async fn emit(&self, messages: &[Message]) -> Result<(), PluginError> {
@@ -948,7 +948,7 @@ mod tests {
 
         #[async_trait::async_trait]
         impl crate::emit::Emitter for FailingEmitter {
-            fn name(&self) -> &'static str {
+            fn name(&self) -> &str {
                 "failing"
             }
             async fn emit(&self, _messages: &[Message]) -> Result<(), PluginError> {
@@ -1004,7 +1004,7 @@ mod tests {
 
         #[async_trait::async_trait]
         impl crate::emit::Emitter for CountingEmitter {
-            fn name(&self) -> &'static str {
+            fn name(&self) -> &str {
                 "counting"
             }
 
@@ -1102,7 +1102,7 @@ mod tests {
 
         #[async_trait::async_trait]
         impl crate::emit::Emitter for CountingEmitter {
-            fn name(&self) -> &'static str {
+            fn name(&self) -> &str {
                 "counter"
             }
 
@@ -1203,7 +1203,7 @@ mod tests {
 
         #[async_trait::async_trait]
         impl crate::emit::Emitter for CaptureEmitter {
-            fn name(&self) -> &'static str {
+            fn name(&self) -> &str {
                 "capture"
             }
             async fn emit(&self, messages: &[Message]) -> Result<(), crate::error::PluginError> {

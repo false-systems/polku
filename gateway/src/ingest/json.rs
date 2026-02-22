@@ -145,11 +145,11 @@ impl JsonEvent {
 }
 
 impl Ingestor for JsonIngestor {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "json"
     }
 
-    fn sources(&self) -> &'static [&'static str] {
+    fn sources(&self) -> &[&str] {
         &["json", "json-lines", "ndjson"]
     }
 

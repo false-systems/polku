@@ -33,15 +33,17 @@ use tonic::transport::Channel;
 ///     .build();
 /// ```
 pub struct ExternalIngestor {
-    /// Source identifier this ingestor handles
-    source: String,
+    /// Source identifier (leaked for `sources()` return type — one-time startup cost)
+    source: &'static str,
     /// gRPC address of the plugin
     address: String,
-    /// Leaked static string for sources() return type
-    /// (Required because trait returns &'static [&'static str])
+    /// Name for trait identification
+    name: String,
+    /// Leaked sources slice for `sources()` return type.
+    /// The trait returns `&[&str]` which cannot reference owned Strings
+    /// without self-referential storage. This is a one-time startup cost
+    /// bounded by the number of external plugins (~50 bytes each).
     sources_static: &'static [&'static str],
-    /// Leaked static string for name
-    name_static: &'static str,
     /// Cached gRPC client (lazy initialized)
     client: Mutex<Option<IngestorPluginClient<Channel>>>,
 }
@@ -53,23 +55,21 @@ impl ExternalIngestor {
     /// * `source` - Source identifier to handle
     /// * `address` - gRPC address (e.g., "localhost:9001")
     pub fn new(source: impl Into<String>, address: impl Into<String>) -> Self {
-        let source = source.into();
+        let source: String = source.into();
         let address = address.into();
+        let name = format!("external:{source}");
 
-        // Leak strings to create static references
-        // This is fine because ingestors are long-lived (created once at startup)
-        let source_leaked: &'static str = Box::leak(source.clone().into_boxed_str());
-        let sources_vec: Vec<&'static str> = vec![source_leaked];
-        let sources_static: &'static [&'static str] = Box::leak(sources_vec.into_boxed_slice());
-
-        let name = format!("external:{}", source);
-        let name_static: &'static str = Box::leak(name.into_boxed_str());
+        // Leak source string for sources() return type.
+        // The trait returns &[&str] which cannot be constructed from owned Strings.
+        // This is a one-time startup cost (~50 bytes per ExternalIngestor).
+        let source: &'static str = Box::leak(source.into_boxed_str());
+        let sources_static: &'static [&'static str] = Box::leak(vec![source].into_boxed_slice());
 
         Self {
             source,
             address,
+            name,
             sources_static,
-            name_static,
             client: Mutex::new(None),
         }
     }
@@ -81,7 +81,7 @@ impl ExternalIngestor {
 
     /// Get the source identifier
     pub fn source(&self) -> &str {
-        &self.source
+        self.source
     }
 
     /// Get or create the gRPC client (async)
@@ -153,11 +153,11 @@ impl ExternalIngestor {
 }
 
 impl Ingestor for ExternalIngestor {
-    fn name(&self) -> &'static str {
-        self.name_static
+    fn name(&self) -> &str {
+        &self.name
     }
 
-    fn sources(&self) -> &'static [&'static str] {
+    fn sources(&self) -> &[&str] {
         self.sources_static
     }
 

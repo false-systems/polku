@@ -29,7 +29,7 @@ impl NullEmitter {
 
 #[async_trait::async_trait]
 impl Emitter for NullEmitter {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "null"
     }
 

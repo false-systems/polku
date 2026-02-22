@@ -203,7 +203,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Emitter for TestEmitter {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             self.name
         }
 
@@ -294,7 +294,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Emitter for FailingEmitter {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "failing"
         }
 
@@ -329,7 +329,7 @@ mod tests {
 
         #[async_trait::async_trait]
         impl Emitter for MinimalEmitter {
-            fn name(&self) -> &'static str {
+            fn name(&self) -> &str {
                 "minimal"
             }
             async fn emit(&self, _messages: &[Message]) -> Result<(), PluginError> {

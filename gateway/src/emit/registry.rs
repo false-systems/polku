@@ -247,7 +247,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Emitter for MockEmitter {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             self.name
         }
 

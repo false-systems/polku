@@ -60,11 +60,11 @@ pub struct IngestContext<'a> {
 /// struct MyIngestor;
 ///
 /// impl Ingestor for MyIngestor {
-///     fn name(&self) -> &'static str {
+///     fn name(&self) -> &str {
 ///         "my-ingestor"
 ///     }
 ///
-///     fn sources(&self) -> &'static [&'static str] {
+///     fn sources(&self) -> &[&str] {
 ///         &["my-source", "my-source-v2"]
 ///     }
 ///
@@ -76,13 +76,13 @@ pub struct IngestContext<'a> {
 /// ```
 pub trait Ingestor: Send + Sync {
     /// Unique name for this ingestor (for logging and metrics)
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
 
     /// Source identifiers this ingestor handles
     ///
     /// When raw data arrives with a matching source, this ingestor is called.
     /// Multiple sources can map to the same ingestor (e.g., version aliases).
-    fn sources(&self) -> &'static [&'static str];
+    fn sources(&self) -> &[&str];
 
     /// Transform raw bytes into Messages
     ///
@@ -112,11 +112,11 @@ mod tests {
     struct TestIngestor;
 
     impl Ingestor for TestIngestor {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "test-ingestor"
         }
 
-        fn sources(&self) -> &'static [&'static str] {
+        fn sources(&self) -> &[&str] {
             &["test-source", "test-alias"]
         }
 

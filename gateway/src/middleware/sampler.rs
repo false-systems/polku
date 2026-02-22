@@ -134,7 +134,7 @@ impl Sampler {
 
 #[async_trait]
 impl Middleware for Sampler {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "sampler"
     }
 

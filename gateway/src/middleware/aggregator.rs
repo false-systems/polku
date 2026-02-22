@@ -222,7 +222,7 @@ impl Drop for Aggregator {
 
 #[async_trait]
 impl Middleware for Aggregator {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "aggregator"
     }
 
