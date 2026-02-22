@@ -12,14 +12,14 @@ Build custom Ingestors and Emitters to connect POLKU to any protocol.
 │                                                                         │
 │   YOUR SOURCES              POLKU CORE              YOUR DESTINATIONS   │
 │  ┌───────────┐           ┌────────────┐           ┌───────────────┐    │
-│  │ Tapio     │──►Adapter │            │           │ AhtiEmitter   │    │
-│  │ Portti    │──►Adapter │ Middleware │──►Buffer──│ KafkaEmitter  │    │
-│  │ CustomSrc │──►Adapter │   Chain    │           │ S3Emitter     │    │
+│  │ Agent A   │──►Adapter │            │           │ GrpcEmitter   │    │
+│  │ Agent B   │──►Adapter │ Middleware │──►Buffer──│ WebhookEmitter│    │
+│  │ CustomSrc │──►Adapter │   Chain    │           │ StdoutEmitter │    │
 │  └───────────┘           └────────────┘           └───────────────┘    │
 │       │                        │                         │              │
 │       │                        │                         │              │
 │   trait Ingestor          trait Middleware          trait Emitter       │
-│   (decode bytes)          (transform/filter)        (send events)       │
+│   (decode bytes)          (transform/filter)        (send messages)    │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -29,18 +29,18 @@ POLKU uses a **Triadic Plugin Architecture**:
 |-----------|---------|---------------|
 | **Ingestor** | Decode raw bytes from your protocol | `trait Ingestor` |
 | **Middleware** | Transform, filter, route messages | `trait Middleware` |
-| **Emitter** | Send events to destination | `trait Emitter` |
+| **Emitter** | Send messages to destination | `trait Emitter` |
 
 ---
 
 ## Creating an Emitter
 
-Emitters send events to destinations. This is the most common plugin type.
+Emitters send messages to destinations. This is the most common plugin type.
 
 ### The Emitter Trait
 
 ```rust
-use polku_gateway::{Emitter, Event, PluginError};
+use polku_core::{Emitter, Message, PluginError};
 use async_trait::async_trait;
 
 #[async_trait]
@@ -48,8 +48,8 @@ pub trait Emitter: Send + Sync {
     /// Unique name for logging and routing
     fn name(&self) -> &'static str;
 
-    /// Send a batch of events to the destination
-    async fn emit(&self, events: &[Event]) -> Result<(), PluginError>;
+    /// Send a batch of messages to the destination
+    async fn emit(&self, messages: &[Message]) -> Result<(), PluginError>;
 
     /// Health check - is the destination reachable?
     async fn health(&self) -> bool;
@@ -61,19 +61,19 @@ pub trait Emitter: Send + Sync {
 }
 ```
 
-### Example: Ahti Emitter (gRPC Client)
+### Example: gRPC Emitter
 
 ```rust
-use polku_gateway::{Emitter, Event, PluginError};
+use polku_core::{Emitter, Message, PluginError};
 use async_trait::async_trait;
 use tonic::transport::Channel;
 
-pub struct AhtiEmitter {
-    client: AhtiClient<Channel>,
+pub struct MyGrpcEmitter {
+    client: MyServiceClient<Channel>,
     endpoint: String,
 }
 
-impl AhtiEmitter {
+impl MyGrpcEmitter {
     pub async fn connect(endpoint: &str) -> Result<Self, PluginError> {
         let channel = Channel::from_shared(endpoint.to_string())
             .map_err(|e| PluginError::Config(e.to_string()))?
@@ -82,33 +82,32 @@ impl AhtiEmitter {
             .map_err(|e| PluginError::Connection(e.to_string()))?;
 
         Ok(Self {
-            client: AhtiClient::new(channel),
+            client: MyServiceClient::new(channel),
             endpoint: endpoint.to_string(),
         })
     }
 }
 
 #[async_trait]
-impl Emitter for AhtiEmitter {
+impl Emitter for MyGrpcEmitter {
     fn name(&self) -> &'static str {
-        "ahti"
+        "my-grpc"
     }
 
-    async fn emit(&self, events: &[Event]) -> Result<(), PluginError> {
-        // Convert POLKU Events to Ahti's format
-        let ahti_events: Vec<AhtiEvent> = events
+    async fn emit(&self, messages: &[Message]) -> Result<(), PluginError> {
+        // Convert POLKU Messages to your service's format
+        let requests: Vec<MyRequest> = messages
             .iter()
-            .map(|e| AhtiEvent {
-                id: e.id.clone(),
-                payload: e.payload.clone(),
+            .map(|m| MyRequest {
+                id: m.id.to_string(),
+                payload: m.payload.to_vec(),
                 // ... map other fields
             })
             .collect();
 
-        // Send to Ahti
         self.client
             .clone()
-            .send_events(ahti_events)
+            .send_batch(requests)
             .await
             .map_err(|e| PluginError::Send(e.to_string()))?;
 
@@ -120,7 +119,7 @@ impl Emitter for AhtiEmitter {
     }
 
     async fn shutdown(&self) -> Result<(), PluginError> {
-        tracing::info!(endpoint = %self.endpoint, "AhtiEmitter shutting down");
+        tracing::info!(endpoint = %self.endpoint, "MyGrpcEmitter shutting down");
         Ok(())
     }
 }
@@ -129,7 +128,7 @@ impl Emitter for AhtiEmitter {
 ### Example: Simple HTTP Webhook Emitter
 
 ```rust
-use polku_gateway::{Emitter, Event, PluginError};
+use polku_core::{Emitter, Message, PluginError};
 use async_trait::async_trait;
 
 pub struct WebhookEmitter {
@@ -152,13 +151,13 @@ impl Emitter for WebhookEmitter {
         "webhook"
     }
 
-    async fn emit(&self, events: &[Event]) -> Result<(), PluginError> {
-        for event in events {
+    async fn emit(&self, messages: &[Message]) -> Result<(), PluginError> {
+        for msg in messages {
             self.client
                 .post(&self.url)
-                .header("X-Event-ID", &event.id)
-                .header("X-Event-Type", &event.event_type)
-                .body(event.payload.clone())
+                .header("X-Event-ID", msg.id.to_string())
+                .header("X-Event-Type", msg.message_type.as_str())
+                .body(msg.payload.clone())
                 .send()
                 .await
                 .map_err(|e| PluginError::Send(e.to_string()))?;
@@ -176,113 +175,63 @@ impl Emitter for WebhookEmitter {
 
 ## Creating an Ingestor
 
-Ingestors decode raw bytes from source protocols into POLKU Events.
+Ingestors decode raw bytes from source protocols into POLKU Messages.
 
 ### The Ingestor Trait
 
 ```rust
-use polku_gateway::{Ingestor, IngestContext, Event, PluginError};
+use polku_gateway::{Ingestor, IngestContext, Message, PluginError};
 
 pub trait Ingestor: Send + Sync {
     /// Unique name for identification
     fn name(&self) -> &'static str;
 
-    /// Decode raw bytes into Events
-    fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Event>, PluginError>;
+    /// Which source identifiers this ingestor handles
+    fn sources(&self) -> &'static [&'static str];
+
+    /// Decode raw bytes into Messages
+    fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Message>, PluginError>;
 }
 ```
 
-### The IngestContext
+### Example: JSON Adapter
 
 ```rust
-pub struct IngestContext<'a> {
-    /// Source identifier (e.g., "my-agent", "otel-collector")
-    pub source: &'a str,
-    /// Cluster/environment identifier
-    pub cluster: &'a str,
-    /// Format hint (e.g., "protobuf", "json", "msgpack")
-    pub format: &'a str,
-}
-```
-
-### Example: Tapio Adapter (JSON to Event)
-
-```rust
-use polku_gateway::{Ingestor, IngestContext, Event, PluginError};
+use polku_gateway::{Ingestor, IngestContext, Message, PluginError};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
-struct TapioMessage {
+struct SourceMessage {
     id: String,
     message_type: String,
     data: serde_json::Value,
     timestamp_ms: i64,
 }
 
-pub struct TapioAdapter;
+pub struct JsonAdapter;
 
-impl Ingestor for TapioAdapter {
+impl Ingestor for JsonAdapter {
     fn name(&self) -> &'static str {
-        "tapio"
+        "json-adapter"
     }
 
-    fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Event>, PluginError> {
-        // Parse Tapio's JSON format
-        let messages: Vec<TapioMessage> = serde_json::from_slice(data)
+    fn sources(&self) -> &'static [&'static str] {
+        &["my-source"]
+    }
+
+    fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Message>, PluginError> {
+        let items: Vec<SourceMessage> = serde_json::from_slice(data)
             .map_err(|e| PluginError::Decode(e.to_string()))?;
 
-        // Convert to POLKU Events
-        let events = messages
+        let messages = items
             .into_iter()
-            .map(|msg| Event {
-                id: msg.id,
-                timestamp_unix_ns: msg.timestamp_ms * 1_000_000, // ms → ns
-                source: ctx.source.to_string(),
-                event_type: msg.message_type,
-                metadata: std::collections::HashMap::new(),
-                payload: serde_json::to_vec(&msg.data).unwrap_or_default(),
-                route_to: vec![],
+            .map(|item| {
+                let payload = serde_json::to_vec(&item.data).unwrap_or_default();
+                Message::new(ctx.source, &item.message_type, payload.into())
             })
             .collect();
 
-        Ok(events)
-    }
-}
-```
-
-### Example: Protobuf Ingestor
-
-```rust
-use polku_gateway::{Ingestor, IngestContext, Event, PluginError};
-use prost::Message;
-
-// Your proto-generated type
-// message PorttiEvent { string id = 1; bytes payload = 2; ... }
-
-pub struct PorttiAdapter;
-
-impl Ingestor for PorttiAdapter {
-    fn name(&self) -> &'static str {
-        "portti"
-    }
-
-    fn ingest(&self, ctx: &IngestContext, data: &[u8]) -> Result<Vec<Event>, PluginError> {
-        // Decode protobuf
-        let portti_event = PorttiEvent::decode(data)
-            .map_err(|e| PluginError::Decode(e.to_string()))?;
-
-        // Convert to POLKU Event
-        let event = Event {
-            id: portti_event.id,
-            timestamp_unix_ns: portti_event.timestamp_ns,
-            source: ctx.source.to_string(),
-            event_type: portti_event.event_type,
-            metadata: portti_event.headers,
-            payload: portti_event.payload,
-            route_to: vec![],
-        };
-
-        Ok(vec![event])
+        Ok(messages)
     }
 }
 ```
@@ -327,80 +276,6 @@ POLKU provides 10 middleware out of the box:
 | `Validator` | Schema validation with drop/tag modes |
 | `Aggregator` | Batch N messages into 1 combined message |
 
-```rust
-use polku_gateway::{
-    Filter, Transform, Router, RateLimiter, Throttle,
-    Deduplicator, Sampler, Enricher, Validator, Aggregator,
-    AggregateStrategy, ValidationResult, InvalidAction,
-};
-use std::time::Duration;
-use std::collections::HashMap;
-
-// Filter: drop messages that don't match
-let filter = Filter::new(|msg| msg.message_type.starts_with("important."));
-
-// Transform: modify messages
-let transform = Transform::new(|mut msg| {
-    msg.metadata.insert("processed".into(), "true".into());
-    msg
-});
-
-// Router: set route_to based on content
-let router = Router::new()
-    .rule(|msg| msg.message_type.contains("critical"), vec!["pagerduty".into(), "slack".into()])
-    .rule(|msg| msg.source == "payments", vec!["audit".into()])
-    .default_route(vec!["logs".into()]);
-
-// RateLimiter: global rate limit (100/sec, burst 50)
-let rate_limiter = RateLimiter::new(100, 50);
-
-// Throttle: per-source rate limit (each source gets own bucket)
-let throttle = Throttle::new(100, 10); // 100/sec, burst 10 per source
-
-// Deduplicator: drop duplicates within 5 minutes
-let dedup = Deduplicator::new(Duration::from_secs(300));
-
-// Sampler: pass only 10% of messages
-let sampler = Sampler::new(0.1);
-
-// Enricher: add metadata (sync or async)
-let enricher = Enricher::new(|msg| {
-    let source = msg.source.clone();
-    async move {
-        let mut meta = HashMap::new();
-        meta.insert("region".to_string(), lookup_region(&source).await);
-        meta
-    }
-});
-
-// Enricher with static metadata
-let static_enricher = Enricher::with_static({
-    let mut m = HashMap::new();
-    m.insert("env".to_string(), "production".to_string());
-    m
-});
-
-// Validator: JSON schema validation
-let json_validator = Validator::json(); // drops invalid JSON
-
-// Validator: size limit with tagging (don't drop, just mark)
-let size_validator = Validator::max_size(1_000_000)
-    .on_invalid(InvalidAction::Tag); // adds _validation_error metadata
-
-// Validator: custom logic
-let custom_validator = Validator::new(|msg| {
-    if msg.metadata.contains_key("api_key") {
-        ValidationResult::Valid
-    } else {
-        ValidationResult::Invalid("missing api_key".to_string())
-    }
-});
-
-// Aggregator: batch 100 messages into 1
-let aggregator = Aggregator::new(100)
-    .strategy(AggregateStrategy::JsonArray); // or Concat, First, Last
-```
-
 ### Example: Custom Enrichment Middleware
 
 ```rust
@@ -428,7 +303,7 @@ impl Middleware for EnrichWithHostname {
     }
 
     async fn process(&self, mut msg: Message) -> Option<Message> {
-        msg.metadata.insert("host".into(), self.hostname.clone());
+        msg.metadata_mut().insert("host".into(), self.hostname.clone());
         Some(msg)
     }
 }
@@ -444,7 +319,7 @@ use polku_gateway::{Hub, Filter, Transform};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create your plugins
-    let ahti = AhtiEmitter::connect("http://ahti:50051").await?;
+    let grpc = MyGrpcEmitter::connect("http://my-service:50051").await?;
     let webhook = WebhookEmitter::new("https://api.example.com/events");
 
     // Build the hub
@@ -454,11 +329,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .middleware(Filter::new(|msg| !msg.message_type.starts_with("debug.")))
         .middleware(EnrichWithHostname::new())
         .middleware(Transform::new(|mut msg| {
-            msg.metadata.insert("version".into(), "1.0".into());
+            msg.metadata_mut().insert("version".into(), "1.0".into());
             msg
         }))
         // Emitters (fan-out to all)
-        .emitter(ahti)
+        .emitter(grpc)
         .emitter(webhook)
         .build();
 
@@ -483,13 +358,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 // Your base emitter
-let ahti = Arc::new(AhtiEmitter::connect("http://ahti:50051").await?);
+let grpc = Arc::new(MyGrpcEmitter::connect("http://my-service:50051").await?);
 
 // Failure buffer for debugging (in-memory, NOT persistent)
 let failure_buffer = Arc::new(FailureBuffer::new(1000));
 
-// Wrap with resilience (innermost → outermost)
-let resilient = ResilientEmitter::wrap_arc(ahti)
+// Wrap with resilience (innermost -> outermost)
+let resilient = ResilientEmitter::wrap_arc(grpc)
     .with_retry(BackoffConfig {
         max_attempts: 3,
         initial_delay: Duration::from_millis(100),
@@ -516,78 +391,27 @@ let hub = Hub::new()
 
 ```
 emit() call
-    │
-    ▼
-┌─────────────────────┐
-│ FailureCaptureEmitter│ ← Captures failures for debugging
-└─────────┬───────────┘
-          │
-          ▼
-┌─────────────────────┐
-│ CircuitBreakerEmitter│ ← Fail-fast when unhealthy
-└─────────┬───────────┘
-          │
-          ▼
-┌─────────────────────┐
-│    RetryEmitter     │ ← Retry with exponential backoff
-└─────────┬───────────┘
-          │
-          ▼
-┌─────────────────────┐
-│   Your Emitter      │ ← Actual destination
-└─────────────────────┘
+    |
+    v
++---------------------+
+| FailureCaptureEmitter| <- Captures failures for debugging
++---------+-----------+
+          |
+          v
++---------------------+
+| CircuitBreakerEmitter| <- Fail-fast when unhealthy
++---------+-----------+
+          |
+          v
++---------------------+
+|    RetryEmitter     | <- Retry with exponential backoff
++---------+-----------+
+          |
+          v
++---------------------+
+|   Your Emitter      | <- Actual destination
++---------------------+
 ```
-
----
-
-## The Event Type
-
-This is what flows through the pipeline:
-
-```rust
-pub struct Event {
-    /// Unique identifier (ULID recommended)
-    pub id: String,
-
-    /// Unix timestamp in nanoseconds
-    pub timestamp_unix_ns: i64,
-
-    /// Origin identifier
-    pub source: String,
-
-    /// User-defined event type (e.g., "user.created")
-    pub event_type: String,
-
-    /// Headers and context
-    pub metadata: HashMap<String, String>,
-
-    /// Opaque payload bytes
-    pub payload: Vec<u8>,
-
-    /// Routing hints (empty = broadcast to all emitters)
-    pub route_to: Vec<String>,
-}
-```
-
----
-
-## The Message Type (Internal)
-
-For middleware processing, POLKU uses a zero-copy `Message` type internally:
-
-```rust
-pub struct Message {
-    pub id: String,
-    pub timestamp: i64,
-    pub source: String,
-    pub message_type: String,
-    pub metadata: HashMap<String, String>,
-    pub payload: Bytes,        // Zero-copy! Arc-based reference counting
-    pub route_to: Vec<String>,
-}
-```
-
-The `Bytes` type means cloning a `Message` doesn't copy the payload - it just increments a reference count. This is critical for high-throughput scenarios.
 
 ---
 
@@ -596,7 +420,7 @@ The `Bytes` type means cloning a `Message` doesn't copy the payload - it just in
 Use `PluginError` for all plugin errors:
 
 ```rust
-use polku_gateway::PluginError;
+use polku_core::PluginError;
 
 // Available error variants:
 PluginError::Config(String)      // Configuration error
@@ -620,31 +444,22 @@ PluginError::Other(String)       // Generic error
 mod tests {
     use super::*;
 
-    fn make_test_event(id: &str) -> Event {
-        Event {
-            id: id.to_string(),
-            timestamp_unix_ns: 0,
-            source: "test".to_string(),
-            event_type: "test.event".to_string(),
-            metadata: HashMap::new(),
-            payload: vec![1, 2, 3],
-            route_to: vec![],
-        }
+    fn make_test_message(id: &str) -> Message {
+        Message::new("test", "test.event", Bytes::from(vec![1, 2, 3]))
     }
 
     #[tokio::test]
     async fn test_emitter_health() {
         let emitter = MyEmitter::new("http://localhost:8080");
-        // Health check should work even if destination is down
         let _ = emitter.health().await;
     }
 
     #[tokio::test]
     async fn test_emitter_emit() {
         let emitter = MyEmitter::new("http://localhost:8080");
-        let events = vec![make_test_event("e1"), make_test_event("e2")];
+        let messages = vec![make_test_message("e1"), make_test_message("e2")];
 
-        let result = emitter.emit(&events).await;
+        let result = emitter.emit(&messages).await;
         // Assert based on your emitter's behavior
     }
 }
@@ -664,8 +479,8 @@ async fn test_full_pipeline() {
     #[async_trait]
     impl Emitter for CountingEmitter {
         fn name(&self) -> &'static str { "counter" }
-        async fn emit(&self, events: &[Event]) -> Result<(), PluginError> {
-            self.0.fetch_add(events.len(), Ordering::Relaxed);
+        async fn emit(&self, messages: &[Message]) -> Result<(), PluginError> {
+            self.0.fetch_add(messages.len(), Ordering::Relaxed);
             Ok(())
         }
         async fn health(&self) -> bool { true }
@@ -705,30 +520,11 @@ async fn test_full_pipeline() {
 
 ---
 
-## File Structure
-
-When adding plugins to POLKU:
-
-```
-gateway/src/
-├── emit/
-│   ├── mod.rs           # Add: pub mod my_emitter;
-│   ├── my_emitter.rs    # Your emitter implementation
-│   └── ...
-├── ingest/
-│   ├── mod.rs           # Add: pub mod my_adapter;
-│   ├── my_adapter.rs    # Your ingestor implementation
-│   └── ...
-└── lib.rs               # Re-export: pub use emit::MyEmitter;
-```
-
----
-
 ## Summary
 
 | I want to... | Implement | Key method |
 |--------------|-----------|------------|
-| Send events to a new destination | `trait Emitter` | `emit(&[Event])` |
-| Decode a new source format | `trait Ingestor` | `ingest(&[u8]) → Vec<Event>` |
-| Transform/filter messages | `trait Middleware` | `process(Message) → Option<Message>` |
+| Send messages to a new destination | `trait Emitter` | `emit(&[Message])` |
+| Decode a new source format | `trait Ingestor` | `ingest(&[u8]) -> Vec<Message>` |
+| Transform/filter messages | `trait Middleware` | `process(Message) -> Option<Message>` |
 | Add retry/circuit breaker | `ResilientEmitter` builder | `.with_retry()`, `.with_circuit_breaker()` |

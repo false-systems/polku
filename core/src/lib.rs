@@ -12,20 +12,15 @@
 //!
 //! # Why this crate exists
 //!
-//! External emitter plugins (like `ahti-emitter`) need to implement the `Emitter`
-//! trait and use the `Message` type. Without `polku-core`, they would depend on
-//! `polku-gateway`, but `polku-gateway` might also want to optionally depend on
-//! those emitters, creating a cyclic dependency.
-//!
-//! By extracting core types here, we break the cycle:
+//! External emitter plugins need to implement the `Emitter` trait and use the
+//! `Message` type. Without `polku-core`, they would depend on `polku-gateway`,
+//! creating a cyclic dependency. By extracting core types here, we break the cycle:
 //!
 //! ```text
 //! polku-core ◄── polku-gateway
 //!     ▲
-//!     └────────── ahti-emitter (in false-systems-plugins)
+//!     └────────── external plugins
 //! ```
-//!
-//! Now `polku-gateway` can optionally depend on `ahti-emitter` without cycles.
 
 #![deny(unsafe_code)]
 #![warn(clippy::unwrap_used)]
@@ -59,11 +54,8 @@ pub use intern::InternedStr;
 pub use message::{Message, MessageId, Metadata, Routes};
 pub use proto::Event;
 
-// Re-export typed event data types for convenience
-pub use proto::{
-    ContainerEventData, K8sEventData, KernelEventData, NetworkEventData, Outcome, ProcessEventData,
-    ResourceEventData, Severity,
-};
+// Re-export classification enums for convenience
+pub use proto::{Outcome, Severity};
 
 #[cfg(test)]
 #[allow(

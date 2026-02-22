@@ -133,7 +133,6 @@ fn make_event(id: &str, source: &str, event_type: &str, payload: &str) -> Event 
         route_to: vec![],
         severity: 0,
         outcome: 0,
-        data: None,
     }
 }
 

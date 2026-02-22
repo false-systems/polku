@@ -3,8 +3,6 @@
 //! Emitters send Messages to various destinations (gRPC backends, Kafka, stdout, etc.)
 //! All registered emitters receive messages in a fan-out pattern.
 
-#[cfg(feature = "ahti")]
-pub mod ahti;
 pub(crate) mod endpoint;
 pub mod external;
 pub mod grpc;
@@ -20,8 +18,6 @@ pub use polku_core::Event;
 pub use polku_core::PluginError;
 pub use registry::EmitterRegistry;
 
-#[cfg(feature = "ahti")]
-pub use ahti::AhtiEmitter;
 pub use external::ExternalEmitter;
 pub use grpc::GrpcEmitter;
 pub use stdout::StdoutEmitter;

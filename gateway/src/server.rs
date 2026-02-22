@@ -351,7 +351,6 @@ mod tests {
             route_to: vec![],
             severity: 0,
             outcome: 0,
-            data: None,
         };
 
         let ingest = IngestEvent {
@@ -396,7 +395,6 @@ mod tests {
                 route_to: vec![],
                 severity: 0,
                 outcome: 0,
-                data: None,
             },
             Event {
                 id: "e2".into(),
@@ -408,7 +406,6 @@ mod tests {
                 route_to: vec![],
                 severity: 0,
                 outcome: 0,
-                data: None,
             },
         ];
 

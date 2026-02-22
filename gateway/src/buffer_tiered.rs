@@ -2702,8 +2702,13 @@ mod tests {
                 .with_metadata("kernel", "6.1.0")
         }
 
-        /// Create an Ahti-style processed event
-        fn make_ahti_event(id: usize, event_type: &str, severity: &str, valid: bool) -> Message {
+        /// Create a processed event from a secondary pipeline
+        fn make_processed_event(
+            id: usize,
+            event_type: &str,
+            severity: &str,
+            valid: bool,
+        ) -> Message {
             let payload = if valid {
                 format!(
                     r#"{{"event_id":"evt-{}","type":"{}","severity":"{}","data":{{"key":"value{}"}}}}"#,
@@ -2719,8 +2724,8 @@ mod tests {
             };
 
             Message::new(
-                "ahti.processor",
-                format!("ahti.{}", event_type),
+                "secondary.processor",
+                format!("processed.{}", event_type),
                 Bytes::from(payload),
             )
             .with_metadata("pipeline", "security")
@@ -2820,20 +2825,20 @@ mod tests {
             assert!(broken_checked > 0 || dropped > 0, "No broken events found");
         }
 
-        /// Mixed Ahti + eBPF events, different routes
+        /// Mixed processed + eBPF events, different routes
         #[test]
         fn test_real_flow_mixed_sources() {
             let buffer = TieredBuffer::new(500, 200, 25);
 
             let mut ebpf_count = 0usize;
-            let mut ahti_count = 0usize;
+            let mut processed_count = 0usize;
 
             eprintln!("Pushing mixed events...");
 
             for i in 0..10_000 {
                 let msg = if i % 3 == 0 {
-                    ahti_count += 1;
-                    make_ahti_event(i, "detection", "high", i % 50 != 0)
+                    processed_count += 1;
+                    make_processed_event(i, "detection", "high", i % 50 != 0)
                         .with_routes(vec!["kafka".into(), "siem".into()])
                 } else {
                     ebpf_count += 1;
@@ -2847,7 +2852,7 @@ mod tests {
 
             // Drain and categorize
             let mut drained_ebpf = 0usize;
-            let mut drained_ahti = 0usize;
+            let mut drained_processed = 0usize;
             let mut route_counts: HashMap<String, usize> = HashMap::new();
 
             loop {
@@ -2859,8 +2864,8 @@ mod tests {
                 for msg in batch {
                     if msg.source.starts_with("ebpf") {
                         drained_ebpf += 1;
-                    } else if msg.source.starts_with("ahti") {
-                        drained_ahti += 1;
+                    } else if msg.source.starts_with("secondary") {
+                        drained_processed += 1;
                     }
 
                     for route in &msg.route_to {
@@ -2872,23 +2877,23 @@ mod tests {
             let dropped = buffer.total_dropped() as usize;
 
             eprintln!(
-                "Mixed flow: pushed ebpf={} ahti={}, drained ebpf={} ahti={}, dropped={}",
-                ebpf_count, ahti_count, drained_ebpf, drained_ahti, dropped
+                "Mixed flow: pushed ebpf={} processed={}, drained ebpf={} processed={}, dropped={}",
+                ebpf_count, processed_count, drained_ebpf, drained_processed, dropped
             );
             eprintln!("Routes: {:?}", route_counts);
 
             // Verify totals
             assert_eq!(
-                drained_ebpf + drained_ahti + dropped,
+                drained_ebpf + drained_processed + dropped,
                 10_000,
                 "Count mismatch"
             );
 
             // Verify routes preserved
-            if drained_ahti > 0 {
+            if drained_processed > 0 {
                 assert!(
                     route_counts.get("kafka").unwrap_or(&0) > &0,
-                    "Ahti events should have kafka route"
+                    "Processed events should have kafka route"
                 );
             }
             if drained_ebpf > 0 {
