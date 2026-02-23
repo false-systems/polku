@@ -51,14 +51,12 @@ POLKU is a **programmable protocol hub**. Messages come in, get transformed, and
 
 ### From Source
 
-POLKU uses Rust edition 2024 which requires nightly:
-
 ```bash
-git clone https://github.com/yairfalse/polku
+git clone https://github.com/false-systems/polku
 cd polku
 
 # Build the gateway binary
-cargo +nightly build --release
+cargo build --release
 
 # Binary at ./target/release/polku-gateway
 ```
@@ -76,8 +74,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-polku-gateway = { git = "https://github.com/yairfalse/polku" }
-polku-core = { git = "https://github.com/yairfalse/polku" }
+polku-runtime = { git = "https://github.com/false-systems/polku" }
 ```
 
 ---
@@ -121,7 +118,53 @@ grpcurl -plaintext -d '{
 
 ### As a Rust Library
 
-Build your own pipeline programmatically. You own `main()`:
+Define your pipeline in your own crate — POLKU handles tracing, metrics, gRPC, and shutdown:
+
+```rust
+use polku_runtime::prelude::*;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    polku_runtime::run(|hub| async move {
+        Ok(hub
+            .ingestor(JsonIngestor::new())
+            .middleware(Filter::new(|msg: &Message| {
+                msg.message_type.starts_with("user.")
+            }))
+            .middleware(Validator::json())
+            .emitter(StdoutEmitter::pretty()))
+    }).await
+}
+```
+
+Your closure receives a `Hub` pre-configured from environment variables (buffer capacity, batch size, flush interval). You add your ingestors, middleware, and emitters — the runtime does the rest.
+
+For more control over ports or to disable gRPC:
+
+```rust
+use polku_runtime::prelude::*;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    RuntimeBuilder::new()
+        .grpc_addr("0.0.0.0:50052".parse()?)
+        .metrics_port(9091)
+        .configure(|hub| async move {
+            let grpc = GrpcEmitter::with_endpoints(vec![
+                "downstream:50051".into(),
+            ]).await?;
+
+            Ok(hub
+                .ingestor(JsonIngestor::new())
+                .emitter(grpc))
+        }).await
+}
+```
+
+<details>
+<summary>Advanced: direct Hub wiring without the runtime</summary>
+
+If you need full control and want to manage tracing, metrics, and the gRPC server yourself:
 
 ```rust
 use polku_gateway::*;
@@ -133,16 +176,13 @@ async fn main() -> anyhow::Result<()> {
         .buffer_capacity(50_000)
         .batch_size(500)
         .flush_interval_ms(50)
-        .middleware(Filter::new(|msg| msg.message_type.starts_with("user.")))
+        .middleware(Filter::new(|msg: &Message| msg.message_type.starts_with("user.")))
         .middleware(Validator::json())
         .emitter(StdoutEmitter::pretty())
         .build();
 
-    // Run pipeline in background
     tokio::spawn(runner.run());
 
-    // Use hub_sender to push messages into the pipeline
-    // Or start the gRPC server to accept external messages:
     let buffer = Arc::new(polku_gateway::buffer::RingBuffer::new(10_000));
     let registry = Arc::new(PluginRegistry::new());
     let service = polku_gateway::server::GatewayService::with_hub(
@@ -157,6 +197,8 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 ```
+
+</details>
 
 ### Kubernetes
 
@@ -438,9 +480,9 @@ polku/
 │       ├── error.rs         # PluginError
 │       └── intern.rs        # InternedStr
 │
-├── gateway/                 # Main gateway binary
+├── gateway/                 # Gateway library + binary
 │   └── src/
-│       ├── main.rs          # Entry point
+│       ├── main.rs          # Standalone entry point
 │       ├── config.rs        # Env var configuration
 │       ├── server.rs        # gRPC server (polku.v1.Gateway)
 │       ├── hub/             # Hub builder + runner
@@ -453,6 +495,11 @@ polku/
 │       ├── buffer_tiered.rs # TieredBuffer (zstd compression)
 │       └── manifest.rs      # Pipeline self-description
 │
+├── runtime/                 # Injectable pipeline interface
+│   └── src/
+│       ├── lib.rs           # run(), RuntimeBuilder
+│       └── prelude.rs       # Re-exports for pipeline authors
+│
 ├── ci/                      # CI utilities
 ├── test-plugins/            # Test plugin implementations
 │   └── receiver/            # gRPC receiver for testing
@@ -460,7 +507,7 @@ polku/
 └── docs/                    # Documentation
 ```
 
-Proto definitions live in a [separate repository](https://github.com/yairfalse/proto) at `proto/polku/v1/`:
+Proto definitions live in a [separate repository](https://github.com/false-systems/proto) at `proto/polku/v1/`:
 - `gateway.proto` - Client-facing gRPC service (`SendEvent`, `StreamEvents`, `Health`)
 - `plugin.proto` - Plugin gRPC interface (Ingestor/Emitter plugins)
 - `event.proto` - Wire-format Event type (gRPC boundaries only)

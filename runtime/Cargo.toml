@@ -1,0 +1,32 @@
+[package]
+name = "polku-runtime"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Injectable pipeline runtime for POLKU — configure your pipeline with a closure, POLKU handles the rest"
+
+[lints]
+workspace = true
+
+[dependencies]
+# POLKU crates
+polku-core = { path = "../core" }
+polku-gateway = { path = "../gateway" }
+
+# Async
+tokio = { version = "1", features = ["full", "signal"] }
+
+# gRPC
+tonic = "0.12"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Zero-copy buffers (re-exported in prelude)
+bytes = "1"
+
+# Error handling
+anyhow = "1"

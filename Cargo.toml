@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "gateway", "ci", "test-plugins/receiver"]
+members = ["core", "gateway", "runtime", "ci", "test-plugins/receiver"]
 exclude = ["tests/e2e"]
 
 [workspace.package]
