@@ -1,0 +1,45 @@
+[package]
+name = "polku-fp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "FALSE Protocol plugins for POLKU — Occurrence ingestor, router, and probe"
+keywords = ["false-protocol", "event", "gateway", "observability"]
+categories = ["network-programming"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# Core types (Message, MessageId, Emitter, PluginError)
+polku-core = { path = "../core" }
+
+# Gateway types (Ingestor, Middleware, Metrics)
+polku-gateway = { path = "../gateway" }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Zero-copy buffers
+bytes = "1"
+
+# Async
+async-trait = "0.1"
+tokio = { version = "1", features = ["time"] }
+
+# Observability
+tracing = "0.1"
+prometheus = "0.13"
+
+# IDs and timestamps
+ulid = "1"
+chrono = "0.4"
+
+# Inline small collections (Routes)
+smallvec = "1.13"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time", "test-util"] }
