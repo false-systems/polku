@@ -252,6 +252,25 @@ impl Probe {
                 }),
             ));
         }
+        if !pressure_high && self.prev.pressure_high {
+            occurrences.push(self.build_occurrence(
+                "gateway.pipeline.pressure_recovered",
+                Severity::Info,
+                Outcome::Success,
+                None,
+                Some(Reasoning {
+                    summary: "Pipeline pressure returned to normal".into(),
+                    explanation: format!(
+                        "Composite pressure metric ({:.2}) dropped below threshold ({:.2}). \
+                         The pipeline is no longer at risk of overload.",
+                        snapshot.pipeline_pressure, self.pressure_threshold
+                    ),
+                    confidence: 0.95,
+                    causal_chain: vec![],
+                    patterns_matched: vec!["threshold_recovery".into()],
+                }),
+            ));
+        }
         self.prev.pressure_high = pressure_high;
 
         // 2. Buffer overflow
@@ -300,6 +319,25 @@ impl Probe {
                 None,
             ));
         }
+        if !any_unhealthy && self.prev.emitter_unhealthy {
+            occurrences.push(self.build_occurrence(
+                "gateway.emitter.recovered",
+                Severity::Info,
+                Outcome::Success,
+                None,
+                Some(Reasoning {
+                    summary: "All emitters are healthy again".into(),
+                    explanation: format!(
+                        "All {} emitters report healthy status. \
+                         Previously unhealthy emitters have recovered.",
+                        snapshot.emitter_healthy
+                    ),
+                    confidence: 0.95,
+                    causal_chain: vec![],
+                    patterns_matched: vec!["health_recovery".into()],
+                }),
+            ));
+        }
         self.prev.emitter_unhealthy = any_unhealthy;
 
         // 4. Circuit breaker
@@ -324,6 +362,25 @@ impl Probe {
                 }),
                 None,
             ));
+        }
+        if !snapshot.any_circuit_open && self.prev.circuit_open {
+            occurrences.push(
+                self.build_occurrence(
+                    "gateway.emitter.circuit_recovered",
+                    Severity::Info,
+                    Outcome::Success,
+                    None,
+                    Some(Reasoning {
+                        summary: "All circuit breakers are closed".into(),
+                        explanation: "All emitter circuit breakers have returned to closed state. \
+                         Traffic to previously affected emitters has resumed."
+                            .into(),
+                        confidence: 0.95,
+                        causal_chain: vec![],
+                        patterns_matched: vec!["circuit_recovery".into()],
+                    }),
+                ),
+            );
         }
         self.prev.circuit_open = snapshot.any_circuit_open;
 
@@ -529,10 +586,14 @@ mod tests {
         let occs = probe.evaluate(&high);
         assert!(occs.is_empty());
 
-        // Back to normal
+        // Back to normal → recovery event
         let low = idle_snapshot();
         let occs = probe.evaluate(&low);
-        assert!(occs.is_empty());
+        assert_eq!(occs.len(), 1);
+        assert_eq!(
+            occs[0].occurrence_type,
+            "gateway.pipeline.pressure_recovered"
+        );
 
         // Cross again → emit again
         let occs = probe.evaluate(&high);
@@ -568,8 +629,10 @@ mod tests {
         assert_eq!(probe.evaluate(&unhealthy).len(), 1);
         // Still unhealthy → no emit
         assert!(probe.evaluate(&unhealthy).is_empty());
-        // Recovered
-        assert!(probe.evaluate(&idle_snapshot()).is_empty());
+        // Recovered → recovery event
+        let occs = probe.evaluate(&idle_snapshot());
+        assert_eq!(occs.len(), 1);
+        assert_eq!(occs[0].occurrence_type, "gateway.emitter.recovered");
         // Unhealthy again → emit
         assert_eq!(probe.evaluate(&unhealthy).len(), 1);
     }
@@ -652,6 +715,117 @@ mod tests {
         assert!(types.contains(&"gateway.emitter.unhealthy"));
         assert!(types.contains(&"gateway.emitter.circuit_open"));
         assert!(types.contains(&"gateway.events.dropped"));
+    }
+
+    // ── Recovery event tests ────────────────────────────────────────
+
+    #[test]
+    fn test_pressure_recovery_emits() {
+        let mut probe = Probe::new("test");
+
+        // Go high
+        let high = MetricsSnapshot {
+            pipeline_pressure: 0.9,
+            ..idle_snapshot()
+        };
+        assert_eq!(probe.evaluate(&high).len(), 1); // pressure_high
+
+        // Recover
+        let low = idle_snapshot();
+        let occs = probe.evaluate(&low);
+        assert_eq!(occs.len(), 1);
+        assert_eq!(
+            occs[0].occurrence_type,
+            "gateway.pipeline.pressure_recovered"
+        );
+        assert_eq!(occs[0].severity, Severity::Info);
+        assert_eq!(occs[0].outcome, Outcome::Success);
+        assert!(occs[0].error.is_none());
+        assert!(occs[0].reasoning.is_some());
+    }
+
+    #[test]
+    fn test_emitter_recovery_emits() {
+        let mut probe = Probe::new("test");
+
+        // Go unhealthy
+        let unhealthy = MetricsSnapshot {
+            emitter_unhealthy: 1,
+            ..idle_snapshot()
+        };
+        assert_eq!(probe.evaluate(&unhealthy).len(), 1);
+
+        // Recover
+        let occs = probe.evaluate(&idle_snapshot());
+        assert_eq!(occs.len(), 1);
+        assert_eq!(occs[0].occurrence_type, "gateway.emitter.recovered");
+        assert_eq!(occs[0].severity, Severity::Info);
+        assert_eq!(occs[0].outcome, Outcome::Success);
+        assert!(occs[0].error.is_none());
+    }
+
+    #[test]
+    fn test_circuit_recovery_emits() {
+        let mut probe = Probe::new("test");
+
+        // Open circuit
+        let open = MetricsSnapshot {
+            any_circuit_open: true,
+            ..idle_snapshot()
+        };
+        assert_eq!(probe.evaluate(&open).len(), 1);
+
+        // Close circuit
+        let occs = probe.evaluate(&idle_snapshot());
+        assert_eq!(occs.len(), 1);
+        assert_eq!(occs[0].occurrence_type, "gateway.emitter.circuit_recovered");
+        assert_eq!(occs[0].severity, Severity::Info);
+        assert_eq!(occs[0].outcome, Outcome::Success);
+        assert!(occs[0].error.is_none());
+    }
+
+    #[test]
+    fn test_recovery_only_fires_once() {
+        let mut probe = Probe::new("test");
+
+        // Go high → recover
+        let high = MetricsSnapshot {
+            pipeline_pressure: 0.9,
+            ..idle_snapshot()
+        };
+        probe.evaluate(&high); // rising edge
+        let occs = probe.evaluate(&idle_snapshot()); // falling edge
+        assert_eq!(occs.len(), 1);
+
+        // Stay low → no more recovery events
+        let occs = probe.evaluate(&idle_snapshot());
+        assert!(occs.is_empty());
+    }
+
+    #[test]
+    fn test_multiple_conditions_with_recovery() {
+        let mut probe = Probe::new("test");
+
+        // Everything goes bad
+        let bad = MetricsSnapshot {
+            pipeline_pressure: 0.95,
+            buffer_overflow_total: 3.0,
+            emitter_healthy: 0,
+            emitter_unhealthy: 2,
+            any_circuit_open: true,
+            events_dropped_total: 50.0,
+        };
+        let occs = probe.evaluate(&bad);
+        assert_eq!(occs.len(), 5);
+
+        // Everything recovers (buffer_overflow and events_dropped don't have recovery)
+        let occs = probe.evaluate(&idle_snapshot());
+        assert_eq!(occs.len(), 3); // pressure, emitter, circuit
+
+        let types: Vec<&str> = occs.iter().map(|o| o.occurrence_type.as_str()).collect();
+        assert!(types.contains(&"gateway.pipeline.pressure_recovered"));
+        assert!(types.contains(&"gateway.emitter.recovered"));
+        assert!(types.contains(&"gateway.emitter.circuit_recovered"));
     }
 
     #[test]

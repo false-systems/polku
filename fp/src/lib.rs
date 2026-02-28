@@ -34,11 +34,13 @@
 //! tokio::spawn(probe.run());
 //! ```
 
+pub mod correlator;
 pub mod ingest;
 pub mod middleware;
 pub mod occurrence;
 pub mod probe;
 
+pub use correlator::OccurrenceCorrelator;
 pub use ingest::OccurrenceIngestor;
 pub use middleware::OccurrenceRouter;
 pub use occurrence::{Context, Entity, Error, Occurrence, Outcome, Reasoning, Severity};

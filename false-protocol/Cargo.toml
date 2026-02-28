@@ -1,0 +1,17 @@
+[package]
+name = "false-protocol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "FALSE Protocol types — Functional AI-native Semantic Events"
+keywords = ["false-protocol", "event", "observability", "semantic"]
+categories = ["data-structures"]
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
